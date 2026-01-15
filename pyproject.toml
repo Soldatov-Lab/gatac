@@ -1,0 +1,21 @@
+[project]
+name = "gatac"
+version = "0.1.0"
+description = "GPU-accelerated ATAC-seq fragment processing and tile matrix generation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cudf-cu12==25.12.*",
+    "polars>=1.37.1",
+    "pyarrow>=22.0.0",
+    "rapidgzip>=0.16.0",
+    "scanpy>=1.11.5",
+    "tqdm>=4.66.0",
+]
+
+[project.scripts]
+gatac = "gatac.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

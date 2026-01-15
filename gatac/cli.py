@@ -1,0 +1,173 @@
+"""
+GATAC Command Line Interface.
+
+Usage:
+    gatac convert <input.tsv.gz> [output.parquet]
+    gatac tile <input.parquet> [-o output] [-t tile_size] [-m min_frags]
+    gatac features <input.h5ad> [-n n_features] [-o output]
+"""
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+
+def setup_logging(verbose: bool = False):
+    """Configure logging level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(levelname)s: %(message)s' if not verbose else '%(levelname)s [%(name)s]: %(message)s'
+    )
+
+
+def convert_command(args):
+    """Handle 'gatac convert' subcommand."""
+    from .convert import make_parquet
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        logging.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+
+    output_path = args.output if args.output else None
+    make_parquet(input_path, output_path, progress=args.progress)
+
+
+def tile_command(args):
+    """Handle 'gatac tile' subcommand."""
+    from .process import make_tile_matrix
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        logging.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+
+    make_tile_matrix(
+        input_parquet=input_path,
+        output_path=args.output,
+        tile_size=args.tile_size,
+        min_fragments_per_cell=args.min_fragments,
+        chromosomes=args.chromosomes,
+    )
+
+
+def features_command(args):
+    """Handle 'gatac features' subcommand."""
+    import scanpy as sc
+    from .features import select_features
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        logging.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+
+    adata = sc.read_h5ad(str(input_path))
+
+    output_path = args.output
+    if output_path is None:
+        output_path = input_path.with_name(input_path.stem + '_selected.h5ad')
+
+    select_features(
+        adata,
+        n_features=args.n_features,
+        output_path=output_path,
+    )
+
+
+def main():
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        prog='gatac',
+        description='GPU-accelerated ATAC-seq processing toolkit'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose (debug) output'
+    )
+
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    # Convert subcommand
+    convert_parser = subparsers.add_parser(
+        'convert',
+        help='Convert ATAC fragments TSV.GZ to Parquet'
+    )
+    convert_parser.add_argument(
+        'input',
+        help='Input .tsv.gz file'
+    )
+    convert_parser.add_argument(
+        'output',
+        nargs='?',
+        help='Output .parquet file (default: input name with .parquet)'
+    )
+    convert_parser.add_argument(
+        '-p', '--progress',
+        action='store_true',
+        help='Show progress bar'
+    )
+    convert_parser.set_defaults(func=convert_command)
+
+    # Tile subcommand
+    tile_parser = subparsers.add_parser(
+        'tile',
+        help='Process fragments to tile matrix'
+    )
+    tile_parser.add_argument(
+        'input',
+        help='Input .parquet file'
+    )
+    tile_parser.add_argument(
+        '-o', '--output',
+        help='Output .h5ad file'
+    )
+    tile_parser.add_argument(
+        '-t', '--tile-size',
+        type=int,
+        default=5000,
+        help='Tile size in bp (default: 5000)'
+    )
+    tile_parser.add_argument(
+        '-m', '--min-fragments',
+        type=int,
+        default=100,
+        help='Min fragments per cell (default: 100)'
+    )
+    tile_parser.add_argument(
+        '-c', '--chromosomes',
+        nargs='+',
+        help='Chromosomes to include'
+    )
+    tile_parser.set_defaults(func=tile_command)
+
+    # Features subcommand
+    features_parser = subparsers.add_parser(
+        'features',
+        help='GPU-accelerated feature selection'
+    )
+    features_parser.add_argument(
+        'input',
+        help='Input .h5ad file'
+    )
+    features_parser.add_argument(
+        '-n', '--n-features',
+        type=int,
+        default=500000,
+        help='Number of features to select (default: 500000)'
+    )
+    features_parser.add_argument(
+        '-o', '--output',
+        help='Output .h5ad file'
+    )
+    features_parser.set_defaults(func=features_command)
+
+    args = parser.parse_args()
+    setup_logging(args.verbose)
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()

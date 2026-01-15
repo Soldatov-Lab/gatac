@@ -50,6 +50,7 @@ def tile_command(args):
         tile_size=args.tile_size,
         min_fragments_per_cell=args.min_fragments,
         chromosomes=args.chromosomes,
+        low_memory=args.low_memory,
     )
 
 
@@ -140,6 +141,11 @@ def main():
         '-c', '--chromosomes',
         nargs='+',
         help='Chromosomes to include'
+    )
+    tile_parser.add_argument(
+        '--low-memory',
+        action='store_true',
+        help='Use low memory mode for Parquet reading'
     )
     tile_parser.set_defaults(func=tile_command)
 

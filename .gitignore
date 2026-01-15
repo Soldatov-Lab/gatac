@@ -1,2 +1,6 @@
 data/*
 uv.lock
+*.pyc
+*.log
+AGENTS.md
+GEMINI.md

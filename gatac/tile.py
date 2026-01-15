@@ -107,27 +107,33 @@ def create_tile_matrix_gpu(
     fragments_df['global_tile_idx'] = fragments_df['tile_idx'] + fragments_df['offset']
 
     logger.debug("Building sparse matrix")
-    matrix_data = fragments_df.groupby(['cell_idx', 'global_tile_idx'])['count'].sum().reset_index()
+    try:
+        matrix_data = fragments_df.groupby(['cell_idx', 'global_tile_idx'])['count'].sum().reset_index()
 
-    row_indices = matrix_data['cell_idx'].values
-    col_indices = matrix_data['global_tile_idx'].values
-    data = matrix_data['count'].values
+        row_indices = matrix_data['cell_idx'].values
+        col_indices = matrix_data['global_tile_idx'].values
+        data = matrix_data['count'].values
 
-    n_cells = len(unique_barcodes)
-    n_tiles = len(tile_metadata)
+        n_cells = len(unique_barcodes)
+        n_tiles = len(tile_metadata)
 
-    coo_matrix = cusp.coo_matrix(
-        (data, (row_indices, col_indices)),
-        shape=(n_cells, n_tiles),
-        dtype=cp.float32
-    )
+        coo_matrix = cusp.coo_matrix(
+            (data, (row_indices, col_indices)),
+            shape=(n_cells, n_tiles),
+            dtype=cp.float32
+        )
 
-    logger.debug(f"Matrix: {n_cells} cells × {n_tiles} tiles, density: {100 * coo_matrix.nnz / (n_cells * n_tiles):.4f}%")
+        logger.debug(f"Matrix: {n_cells} cells × {n_tiles} tiles, density: {100 * coo_matrix.nnz / (n_cells * n_tiles):.4f}%")
 
-    if return_sparse:
-        matrix = coo_matrix.tocsr()
-    else:
-        matrix = coo_matrix.toarray()
+        if return_sparse:
+            matrix = coo_matrix.tocsr()
+        else:
+            matrix = coo_matrix.toarray()
+            
+    except (cp.cuda.memory.OutOfMemoryError, MemoryError) as e:
+        logger.error(f"CUDA Out of Memory during matrix construction: {e}")
+        # Re-raise as a generic error that process.py can catch and retry
+        raise RuntimeError(f"CUDA Out of Memory: {e}") from e
 
     cell_metadata = barcode_to_idx.merge(
         barcode_counts[barcode_counts['barcode'].isin(valid_barcodes)],

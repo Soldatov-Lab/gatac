@@ -121,6 +121,7 @@ def compute_metrics(
     tss_df: cudf.DataFrame,
     window_size: int = 2000,
     smooth_window: int = 11,
+    min_unique_frags: int = 100,
 ) -> cudf.DataFrame:
     """
     Compute TSS enrichment scores and quality metrics per cell using GPU acceleration 
@@ -136,6 +137,8 @@ def compute_metrics(
         Distance around TSS to consider (default: 2000)
     smooth_window : int
         Window size for smoothing the TSS signal (default: 11)
+    min_unique_frags : int
+        Minimum unique fragments per cell to include in output (default: 100)
         
     Returns
     -------
@@ -143,7 +146,7 @@ def compute_metrics(
         DataFrame with columns: ['barcode', 'tsse_score', 'n_unique', 'duplicate_fraction', 'mito_fraction']
     """
     import gc
-    logger.info("Computing metrics (TSSe, fragments, mito)")
+    logger.info(f"Computing metrics (TSSe, fragments, mito) for cells with >= {min_unique_frags} frags")
     
     # 1. Calculate cell-level QC metrics
     # Unique fragments = number of rows in fragment file
@@ -156,7 +159,27 @@ def compute_metrics(
     agg_df.columns = ['n_total', 'n_unique']
     agg_df = agg_df.reset_index()
     
-    # Calculate mitochondrial fraction
+    # Filter to cells with minimum unique fragments
+    total_barcodes = len(agg_df)
+    agg_df = agg_df[agg_df['n_unique'] >= min_unique_frags]
+    n_cells = len(agg_df)
+    logger.info(f"Filtered to {n_cells:,} cells with >= {min_unique_frags} unique fragments (from {total_barcodes:,} total)")
+    
+    if n_cells == 0:
+        logger.warning("No cells passed the minimum fragment filter!")
+        return cudf.DataFrame({
+            'barcode': [],
+            'tsse_score': [],
+            'n_unique': [],
+            'duplicate_fraction': [],
+            'mito_fraction': [],
+        })
+
+    # Filter fragments to only include valid barcodes
+    valid_barcodes = agg_df['barcode']
+    fragments_df = fragments_df[fragments_df['barcode'].isin(valid_barcodes)]
+    
+    # Calculate mitochondrial fraction (on filtered fragments)
     is_mito = fragments_df['chrom'].isin(['chrM', 'M'])
     mito_counts = fragments_df[is_mito].groupby('barcode', observed=True)['count'].sum().reset_index()
     mito_counts.columns = ['barcode', 'n_mito']
@@ -248,7 +271,7 @@ def compute_metrics(
         # Explicit cleanup
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
-
+    
     # 6. Calculate TSSe Score
     center_idx = window_size
     half_smooth = smooth_window // 2

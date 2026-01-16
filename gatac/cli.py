@@ -179,7 +179,7 @@ def metrics_command(args):
         fragments = read_fragments_parquet(input_path, low_memory=True)
         
         tss_df = load_tss_from_gtf(gtf_path)
-        results = compute_metrics(fragments, tss_df)
+        results = compute_metrics(fragments, tss_df, min_unique_frags=args.min_frags)
         
         logging.info(f"Saving results to {output_path}")
         results.to_csv(str(output_path), index=False)

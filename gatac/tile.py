@@ -73,8 +73,33 @@ def create_tile_matrix_gpu(
         cell_metadata = barcode_counts[barcode_counts['barcode'].isin(valid_barcodes)]
     else:
         logger.debug("Using provided cell metadata for filtering")
+        # 1. Apply user query if provided
         if filter_query:
             cell_metadata = cell_metadata.query(filter_query)
+        
+        # 2. Apply fragment count threshold
+        # If n_unique is present in metadata, use it.
+        # Otherwise, calculate it from fragments for the barcodes in metadata.
+        if 'n_unique' in cell_metadata.columns:
+            logger.debug(f"Applying threshold {min_fragments_per_cell} to n_unique in metadata")
+            cell_metadata = cell_metadata[cell_metadata['n_unique'] >= min_fragments_per_cell]
+        else:
+            logger.debug(f"n_unique not found in metadata. Calculating for threshold {min_fragments_per_cell}")
+            # Calculate counts only for barcodes currently in cell_metadata
+            subset_frags = fragments_df[fragments_df['barcode'].isin(cell_metadata['barcode'])]
+            barcode_counts = subset_frags.groupby('barcode', observed=True).agg({
+                'count': ['sum', 'size']
+            })
+            barcode_counts.columns = ['n_total', 'n_unique']
+            barcode_counts = barcode_counts.reset_index()
+            
+            # Filter by threshold
+            valid_bc = barcode_counts[barcode_counts['n_unique'] >= min_fragments_per_cell]['barcode']
+            cell_metadata = cell_metadata[cell_metadata['barcode'].isin(valid_bc)]
+            
+            # Optionally merge n_unique back if you want it in the final obs
+            cell_metadata = cell_metadata.merge(barcode_counts[['barcode', 'n_unique']], on='barcode', how='left')
+
         valid_barcodes = cell_metadata['barcode']
 
     fragments_df = fragments_df[fragments_df['barcode'].isin(valid_barcodes)]

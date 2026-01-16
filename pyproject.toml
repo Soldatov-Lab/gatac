@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cudf-cu12==25.12.*",
-    "polars>=1.37.1",
+    "polars>=1.0,<1.32",
     "pyarrow>=22.0.0",
     "rapidgzip>=0.16.0",
     "scanpy>=1.11.5",

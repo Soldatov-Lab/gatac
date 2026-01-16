@@ -8,3 +8,4 @@ GEMINI.md
 
 *.parquet
 *.csv
+*.h5ad

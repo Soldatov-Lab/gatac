@@ -70,6 +70,7 @@ def tile_command(args):
             exclude_chroms=args.exclude_chroms,
             metrics=args.metrics,
             filter_query=args.filter_query,
+            barcode_prefix=args.barcode_prefix,
             low_memory=args.low_memory,
         )
     except ValueError as e:
@@ -82,25 +83,56 @@ def tile_command(args):
 
 def features_command(args):
     """Handle 'gatac features' subcommand."""
+    import glob
     import scanpy as sc
-    from .features import select_features
+    from .features import select_features, select_features_multi
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        logging.error(f"Input file not found: {input_path}")
+    # Expand inputs - support glob patterns
+    input_paths = []
+    for inp in args.input:
+        if '*' in inp or '?' in inp:
+            # Glob pattern
+            expanded = sorted(glob.glob(inp))
+            if not expanded:
+                logging.warning(f"No files matched pattern: {inp}")
+            input_paths.extend(expanded)
+        else:
+            input_paths.append(inp)
+
+    # Validate inputs exist
+    input_paths = [Path(p) for p in input_paths]
+    for p in input_paths:
+        if not p.exists():
+            logging.error(f"Input file not found: {p}")
+            sys.exit(1)
+
+    if len(input_paths) == 0:
+        logging.error("No input files found")
         sys.exit(1)
 
-    adata = sc.read_h5ad(str(input_path))
-
+    # Determine output path
     output_path = args.output
-    if output_path is None:
-        output_path = input_path.with_name(input_path.stem + '_selected.h5ad')
-
-    select_features(
-        adata,
-        n_features=args.n_features,
-        output_path=output_path,
-    )
+    if len(input_paths) > 1:
+        if output_path is None:
+            logging.error("--output is required when processing multiple files")
+            sys.exit(1)
+        # Use multi-file function
+        select_features_multi(
+            input_paths,
+            output_path=output_path,
+            n_features=args.n_features,
+            binarize=not args.no_binarize,
+        )
+    else:
+        # Single file - use regular function
+        if output_path is None:
+            output_path = input_paths[0].with_name(input_paths[0].stem + '_selected.h5ad')
+        adata = sc.read_h5ad(str(input_paths[0]))
+        select_features(
+            adata,
+            n_features=args.n_features,
+            output_path=output_path,
+        )
 
 
 def metrics_command(args):
@@ -235,9 +267,8 @@ def main():
         help='Filtering query string (e.g., "tsse_score > 5")'
     )
     tile_parser.add_argument(
-        '--low-memory',
-        action='store_true',
-        help='Use low memory mode for Parquet reading'
+        '--barcode-prefix',
+        help='Prefix to add to barcodes'
     )
     tile_parser.set_defaults(func=tile_command)
 
@@ -248,7 +279,8 @@ def main():
     )
     features_parser.add_argument(
         'input',
-        help='Input .h5ad file'
+        nargs='+',
+        help='Input .h5ad file(s) or glob pattern (e.g., "path/*.h5ad")'
     )
     features_parser.add_argument(
         '-n', '--n-features',
@@ -258,7 +290,12 @@ def main():
     )
     features_parser.add_argument(
         '-o', '--output',
-        help='Output .h5ad file'
+        help='Output .h5ad file (required for multiple inputs)'
+    )
+    features_parser.add_argument(
+        '--no-binarize',
+        action='store_true',
+        help='Preserve original counts instead of binarizing (multi-file mode)'
     )
     features_parser.set_defaults(func=features_command)
 

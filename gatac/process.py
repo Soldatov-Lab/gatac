@@ -56,6 +56,8 @@ def make_tile_matrix(
     tile_size: int = 5000,
     min_fragments_per_cell: int = 100,
     exclude_chroms: Optional[list] = ["chrM", "chrY", "M", "Y"],
+    metrics: Optional[str | Path | cudf.DataFrame] = None,
+    filter_query: Optional[str] = None,
     binarize: bool = False,
     barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
@@ -77,6 +79,10 @@ def make_tile_matrix(
         Minimum fragments required per barcode (default: 100)
     exclude_chroms : list, optional
         List of chromosomes to exclude. (default: ["chrM", "chrY", "M", "Y"])
+    metrics : str, Path, or cudf.DataFrame, optional
+        Path to a CSV file or a cuDF DataFrame containing cell metrics for filtering.
+    filter_query : str, optional
+        Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
     binarize : bool
         Convert counts to binary (default: False)
     barcode_prefix : str, optional
@@ -102,6 +108,19 @@ def make_tile_matrix(
     else:
         output_path = Path(output_path)
 
+    # Load metrics if provided
+    cell_metadata_input = None
+    if metrics is not None:
+        if isinstance(metrics, cudf.DataFrame):
+            cell_metadata_input = metrics
+        else:
+            metrics_path = Path(metrics)
+            if metrics_path.exists():
+                logger.info(f"Loading cell metrics from {metrics_path}")
+                cell_metadata_input = cudf.read_csv(str(metrics_path))
+            else:
+                logger.warning(f"Metrics file {metrics_path} not found. Proceeding without it.")
+
     logger.info(f"Processing {input_parquet.name}")
 
     def _cleanup_memory():
@@ -121,6 +140,8 @@ def make_tile_matrix(
             tile_size=tile_size,
             exclude_chroms=exclude,
             min_fragments_per_cell=min_fragments_per_cell,
+            cell_metadata=cell_metadata_input,
+            filter_query=filter_query,
             return_sparse=True
         )
         return matrix, cell_metadata, tile_metadata

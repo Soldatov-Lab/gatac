@@ -68,6 +68,8 @@ def tile_command(args):
             tile_size=args.tile_size,
             min_fragments_per_cell=args.min_fragments,
             exclude_chroms=args.exclude_chroms,
+            metrics=args.metrics,
+            filter_query=args.filter_query,
             low_memory=args.low_memory,
         )
     except ValueError as e:
@@ -104,7 +106,7 @@ def features_command(args):
 def metrics_command(args):
     """Handle 'gatac metrics' subcommand."""
     import cudf
-    from .metrics import load_tss_from_gtf, compute_tsse
+    from .metrics import load_tss_from_gtf, compute_metrics
     from .process import read_fragments_parquet
 
     input_path = Path(args.input)
@@ -126,7 +128,7 @@ def metrics_command(args):
     fragments = read_fragments_parquet(input_path, low_memory=True)
     
     tss_df = load_tss_from_gtf(gtf_path)
-    results = compute_tsse(fragments, tss_df)
+    results = compute_metrics(fragments, tss_df)
     
     logging.info(f"Saving results to {output_path}")
     results.to_csv(output_path, index=False)
@@ -203,6 +205,15 @@ def main():
         nargs='+',
         default=["chrM", "chrY", "M", "Y"],
         help='Chromosomes to exclude (default: chrM chrY M Y)'
+    )
+    tile_parser.add_argument(
+        '--metrics',
+        help='Path to CSV file with quality metrics for filtering'
+    )
+    tile_parser.add_argument(
+        '--filter',
+        dest='filter_query',
+        help='Filtering query string (e.g., "tsse_score > 5")'
     )
     tile_parser.add_argument(
         '--low-memory',

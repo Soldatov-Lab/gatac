@@ -116,15 +116,15 @@ def _merge_asof_nearest(
             
     return res
 
-def compute_tsse(
+def compute_metrics(
     fragments_df: cudf.DataFrame,
     tss_df: cudf.DataFrame,
     window_size: int = 2000,
     smooth_window: int = 11,
 ) -> cudf.DataFrame:
     """
-    Compute TSS enrichment scores per cell using GPU acceleration with memory-efficient
-    chromosomal chunking.
+    Compute TSS enrichment scores and quality metrics per cell using GPU acceleration 
+    with memory-efficient chromosomal chunking.
     
     Parameters
     ----------
@@ -143,7 +143,7 @@ def compute_tsse(
         DataFrame with columns: ['barcode', 'tsse_score', 'n_unique', 'duplicate_fraction', 'mito_fraction']
     """
     import gc
-    logger.info("Computing TSSe and quality metrics")
+    logger.info("Computing metrics (TSSe, fragments, mito)")
     
     # 1. Calculate cell-level QC metrics
     # Unique fragments = number of rows in fragment file

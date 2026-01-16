@@ -14,24 +14,51 @@ uv sync
 # Convert TSV.GZ to Parquet
 gatac convert fragments.tsv.gz
 
-# Generate tile matrix
-gatac tile fragments.parquet -t 5000 -m 100
+# Compute quality metrics (TSSe, etc.)
+gatac metrics fragments.parquet -g annotations.gtf -o fragments_metrics.csv
+
+# Generate tile matrix (m=min_unique_fragments)
+gatac tile fragments.parquet -g hg38 -t 500 -m 100
+
+# Generate tile matrix with quality filtering using metrics CSV
+gatac tile fragments.parquet -g hg38 --metrics metrics.csv --filter "tsse_score > 5"
 
 # Feature selection
-gatac features tile_matrix.h5ad -n 500000
+gatac features tile_matrix.h5ad -n 50000
 ```
 
 ## Python API
 
 ```python
-from gatac import make_parquet, make_tile_matrix, select_features
+from gatac import (
+    make_parquet, 
+    make_tile_matrix, 
+    select_features, 
+    read_fragments_parquet,
+    load_tss_from_gtf, 
+    compute_metrics
+)
 
 # Convert to parquet
 make_parquet("fragments.tsv.gz")
 
-# Create tile matrix
-adata = make_tile_matrix("fragments.parquet")
+# Compute metrics
+tss = load_tss_from_gtf("annotations.gtf")
+fragments = read_fragments_parquet("fragments.parquet")
+metrics = compute_metrics(fragments, tss)
+
+# Create tile matrix (pre-filtered by unique fragments)
+adata = make_tile_matrix("fragments.parquet", chrom_sizes="hg38", min_fragments_per_cell=500)
+
+# Create tile matrix using pre-computed metrics for filtering
+# metrics can be a path to a CSV or a cuDF DataFrame
+adata = make_tile_matrix(
+    "fragments.parquet", 
+    chrom_sizes="hg38",
+    metrics=metrics, 
+    filter_query="tsse_score > 5"
+)
 
 # Select features
-select_features(adata, n_features=500000)
+select_features(adata, n_features=50000)
 ```

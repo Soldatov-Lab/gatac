@@ -19,6 +19,8 @@ def create_tile_matrix_gpu(
     tile_size: int = 5000,
     exclude_chroms: Optional[list] = ["chrM", "chrY", "M", "Y"],
     min_fragments_per_cell: int = 100,
+    cell_metadata: Optional[cudf.DataFrame] = None,
+    filter_query: Optional[str] = None,
     return_sparse: bool = True
 ) -> Tuple[cusp.csr_matrix, cudf.DataFrame, cudf.DataFrame]:
     """
@@ -37,6 +39,11 @@ def create_tile_matrix_gpu(
         List of chromosomes to exclude. (default: ["chrM", "chrY", "M", "Y"])
     min_fragments_per_cell : int
         Minimum fragments required per barcode to include (default: 100)
+    cell_metadata : cudf.DataFrame, optional
+        Optional cell metadata for filtering (e.g. from quality metrics).
+        If provided, fragment counting for initial filtering is skipped.
+    filter_query : str, optional
+        Additional query string for filtering cells based on cell_metadata.
     return_sparse : bool
         Return sparse matrix (True) or dense array (False)
 
@@ -52,15 +59,26 @@ def create_tile_matrix_gpu(
     if hasattr(chrom_sizes, 'chrom_sizes'):
         chrom_sizes = chrom_sizes.chrom_sizes
 
-    logger.debug("Filtering cells by fragment count")
-    barcode_counts = fragments_df.groupby('barcode')['count'].sum().reset_index()
-    barcode_counts.columns = ['barcode', 'total_fragments']
+    if cell_metadata is None:
+        logger.debug("Filtering cells by unique fragment count")
+        barcode_counts = fragments_df.groupby('barcode', observed=True).agg({
+            'count': ['sum', 'size']
+        })
+        barcode_counts.columns = ['n_total', 'n_unique']
+        barcode_counts = barcode_counts.reset_index()
 
-    valid_barcodes = barcode_counts[
-        barcode_counts['total_fragments'] >= min_fragments_per_cell
-    ]['barcode']
+        valid_barcodes = barcode_counts[
+            barcode_counts['n_unique'] >= min_fragments_per_cell
+        ]['barcode']
+        cell_metadata = barcode_counts[barcode_counts['barcode'].isin(valid_barcodes)]
+    else:
+        logger.debug("Using provided cell metadata for filtering")
+        if filter_query:
+            cell_metadata = cell_metadata.query(filter_query)
+        valid_barcodes = cell_metadata['barcode']
+
     fragments_df = fragments_df[fragments_df['barcode'].isin(valid_barcodes)]
-    logger.debug(f"Retained {len(valid_barcodes)} cells with >= {min_fragments_per_cell} fragments")
+    logger.debug(f"Retained {len(valid_barcodes)} cells")
 
     if exclude_chroms is not None:
         if isinstance(exclude_chroms, str):
@@ -149,7 +167,7 @@ def create_tile_matrix_gpu(
         raise RuntimeError(f"CUDA Out of Memory: {e}") from e
 
     cell_metadata = barcode_to_idx.merge(
-        barcode_counts[barcode_counts['barcode'].isin(valid_barcodes)],
+        cell_metadata,
         on='barcode',
         how='left'
     )

@@ -24,6 +24,31 @@ FRAGMENT_DTYPES = {
     'count': 'uint16'
 }
 
+def read_fragments_parquet(
+    input_path: str | Path,
+    low_memory: bool = True,
+    columns: Optional[List[str]] = None,
+) -> cudf.DataFrame:
+    """
+    Read ATAC fragments from Parquet file optimized for GPU memory.
+
+    Note: Parquet files contain intrinsic schema metadata. This function 
+    expects the file to contain columns matching FRAGMENT_DTYPES keys:
+    ['chrom', 'start', 'end', 'barcode', 'count'].
+    """
+    if columns is None:
+        columns = list(FRAGMENT_DTYPES.keys())
+        
+    with cudf.option_context("io.parquet.low_memory", low_memory):
+        df = cudf.read_parquet(str(input_path), columns=columns)
+        
+        # Ensure dtypes match our expectation to save memory
+        for col, dtype in FRAGMENT_DTYPES.items():
+            if col in df.columns and df[col].dtype != dtype:
+                df[col] = df[col].astype(dtype)
+                
+    return df
+
 def make_tile_matrix(
     input_parquet: str | Path,
     chrom_sizes: dict[str, int] | str,
@@ -84,29 +109,21 @@ def make_tile_matrix(
         cp.get_default_memory_pool().free_all_blocks()
 
     def _read_and_process(use_low_mem: bool, exclude: Optional[List[str]] = None):
-        with cudf.option_context("io.parquet.low_memory", use_low_mem):
-            # Predefining columns slows down read if not careful, but ensure dtypes
-            # cudf's read_parquet doesn't take dtype dict, so we cast immediately
-            df = cudf.read_parquet(str(input_parquet), columns=list(FRAGMENT_DTYPES.keys()))
-            
-            # Ensure dtypes match our expectation to save memory
-            for col, dtype in FRAGMENT_DTYPES.items():
-                if df[col].dtype != dtype:
-                    df[col] = df[col].astype(dtype)
-            
-            df_sorted = df.sort_values('barcode')
-            del df
-            _cleanup_memory()
+        df = read_fragments_parquet(input_parquet, low_memory=use_low_mem)
+        
+        df_sorted = df.sort_values('barcode')
+        del df
+        _cleanup_memory()
 
-            matrix, cell_metadata, tile_metadata = create_tile_matrix_gpu(
-                fragments_df=df_sorted,
-                chrom_sizes=chrom_sizes,
-                tile_size=tile_size,
-                exclude_chroms=exclude,
-                min_fragments_per_cell=min_fragments_per_cell,
-                return_sparse=True
-            )
-            return matrix, cell_metadata, tile_metadata
+        matrix, cell_metadata, tile_metadata = create_tile_matrix_gpu(
+            fragments_df=df_sorted,
+            chrom_sizes=chrom_sizes,
+            tile_size=tile_size,
+            exclude_chroms=exclude,
+            min_fragments_per_cell=min_fragments_per_cell,
+            return_sparse=True
+        )
+        return matrix, cell_metadata, tile_metadata
 
     start_time = time.perf_counter()
     try:

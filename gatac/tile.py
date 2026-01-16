@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 
 def create_tile_matrix_gpu(
     fragments_df: cudf.DataFrame,
+    chrom_sizes: dict[str, int],
     tile_size: int = 5000,
-    chromosomes: Optional[list] = None,
+    exclude_chroms: Optional[list] = ["chrM", "chrY", "M", "Y"],
     min_fragments_per_cell: int = 100,
     return_sparse: bool = True
 ) -> Tuple[cusp.csr_matrix, cudf.DataFrame, cudf.DataFrame]:
@@ -27,10 +28,13 @@ def create_tile_matrix_gpu(
     ----------
     fragments_df : cudf.DataFrame
         Fragment data with columns: 'chrom', 'start', 'end', 'barcode', 'count'
+    chrom_sizes : dict
+        Dictionary of chromosome names and their sizes. Used to ensure consistent
+        tile coordinates across different samples.
     tile_size : int
         Size of genomic bins in base pairs (default: 5000)
-    chromosomes : list, optional
-        List of chromosomes to include. If None, uses all chromosomes.
+    exclude_chroms : list, optional
+        List of chromosomes to exclude. (default: ["chrM", "chrY", "M", "Y"])
     min_fragments_per_cell : int
         Minimum fragments required per barcode to include (default: 100)
     return_sparse : bool
@@ -45,6 +49,9 @@ def create_tile_matrix_gpu(
     tile_metadata : cudf.DataFrame
         Metadata for tiles with chromosome, start, end positions
     """
+    if hasattr(chrom_sizes, 'chrom_sizes'):
+        chrom_sizes = chrom_sizes.chrom_sizes
+
     logger.debug("Filtering cells by fragment count")
     barcode_counts = fragments_df.groupby('barcode')['count'].sum().reset_index()
     barcode_counts.columns = ['barcode', 'total_fragments']
@@ -55,18 +62,28 @@ def create_tile_matrix_gpu(
     fragments_df = fragments_df[fragments_df['barcode'].isin(valid_barcodes)]
     logger.debug(f"Retained {len(valid_barcodes)} cells with >= {min_fragments_per_cell} fragments")
 
-    if chromosomes is not None:
-        fragments_df = fragments_df[fragments_df['chrom'].isin(chromosomes)]
+    if exclude_chroms is not None:
+        if isinstance(exclude_chroms, str):
+            exclude_chroms = [exclude_chroms]
+        fragments_df = fragments_df[~fragments_df['chrom'].isin(exclude_chroms)]
 
     logger.debug("Creating genomic tiles")
-    chroms = fragments_df['chrom'].unique().to_pandas().tolist()
-    chroms.sort()
+    # Use chrom_sizes to determine which chromosomes to include and ensuring consistent order
+    all_chroms = sorted(chrom_sizes.keys())
+    if exclude_chroms is not None:
+        included_chroms = [c for c in all_chroms if c not in exclude_chroms]
+    else:
+        included_chroms = all_chroms
+    
+    # Also ensure fragments only contain chromosomes we have sizes for
+    fragments_df = fragments_df[fragments_df['chrom'].isin(included_chroms)]
 
     tiles_list = []
-    for chrom in chroms:
-        chrom_frags = fragments_df[fragments_df['chrom'] == chrom]
-        max_pos = int(chrom_frags['end'].max())
-        n_tiles = (max_pos // tile_size) + 1
+    chrom_to_offset = {}
+    offset = 0
+    for chrom in included_chroms:
+        size = chrom_sizes[chrom]
+        n_tiles = (size + tile_size - 1) // tile_size
         tile_starts = cp.arange(0, n_tiles * tile_size, tile_size)
         tile_ends = tile_starts + tile_size
 
@@ -76,10 +93,13 @@ def create_tile_matrix_gpu(
             'end': cudf.Series(tile_ends)
         })
         tiles_list.append(chrom_tiles)
+        
+        chrom_to_offset[chrom] = offset
+        offset += n_tiles
 
     tile_metadata = cudf.concat(tiles_list, ignore_index=True)
     tile_metadata['tile_id'] = cp.arange(len(tile_metadata))
-    logger.debug(f"Created {len(tile_metadata)} tiles across {len(chroms)} chromosomes")
+    logger.debug(f"Created {len(tile_metadata)} tiles across {len(included_chroms)} chromosomes")
 
     logger.debug("Assigning fragments to tiles")
     unique_barcodes = fragments_df['barcode'].unique().reset_index(drop=True)
@@ -91,13 +111,6 @@ def create_tile_matrix_gpu(
     fragments_df = fragments_df.merge(barcode_to_idx, on='barcode', how='left')
     fragments_df['fragment_mid'] = (fragments_df['start'] + fragments_df['end']) // 2
     fragments_df['tile_idx'] = fragments_df['fragment_mid'] // tile_size
-
-    chrom_to_offset = {}
-    offset = 0
-    for chrom in chroms:
-        chrom_to_offset[chrom] = offset
-        n_chrom_tiles = len(tile_metadata[tile_metadata['chrom'] == chrom])
-        offset += n_chrom_tiles
 
     chrom_offset_map = cudf.DataFrame({
         'chrom': list(chrom_to_offset.keys()),

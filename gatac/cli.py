@@ -44,14 +44,37 @@ def tile_command(args):
         logging.error(f"Input file not found: {input_path}")
         sys.exit(1)
 
-    make_tile_matrix(
-        input_parquet=input_path,
-        output_path=args.output,
-        tile_size=args.tile_size,
-        min_fragments_per_cell=args.min_fragments,
-        chromosomes=args.chromosomes,
-        low_memory=args.low_memory,
-    )
+    # Resolve genome if it's a file
+    genome_arg = args.genome
+    if Path(genome_arg).exists():
+        chrom_sizes = {}
+        try:
+            with open(genome_arg, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        chrom_sizes[parts[0]] = int(parts[1])
+            genome_arg = chrom_sizes
+        except Exception as e:
+            logging.error(f"Error reading chromosome sizes file: {e}")
+            sys.exit(1)
+
+    try:
+        make_tile_matrix(
+            input_parquet=input_path,
+            chrom_sizes=genome_arg,
+            output_path=args.output,
+            tile_size=args.tile_size,
+            min_fragments_per_cell=args.min_fragments,
+            exclude_chroms=args.exclude_chroms,
+            low_memory=args.low_memory,
+        )
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Error creating tile matrix: {e}")
+        sys.exit(1)
 
 
 def features_command(args):
@@ -138,9 +161,15 @@ def main():
         help='Min fragments per cell (default: 100)'
     )
     tile_parser.add_argument(
-        '-c', '--chromosomes',
+        '-g', '--genome',
+        required=True,
+        help='Genome name (e.g., hg38, mm10) or path to chromosome sizes file'
+    )
+    tile_parser.add_argument(
+        '-e', '--exclude-chroms',
         nargs='+',
-        help='Chromosomes to include'
+        default=["chrM", "chrY", "M", "Y"],
+        help='Chromosomes to exclude (default: chrM chrY M Y)'
     )
     tile_parser.add_argument(
         '--low-memory',

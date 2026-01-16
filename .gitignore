@@ -5,3 +5,6 @@ uv.lock
 *.log
 AGENTS.md
 GEMINI.md
+
+*.parquet
+*.csv

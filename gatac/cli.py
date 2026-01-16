@@ -105,10 +105,6 @@ def features_command(args):
 
 def metrics_command(args):
     """Handle 'gatac metrics' subcommand."""
-    import cudf
-    from .metrics import load_tss_from_gtf, compute_metrics
-    from .process import read_fragments_parquet
-
     input_path = Path(args.input)
     gtf_path = Path(args.gtf)
     
@@ -123,16 +119,39 @@ def metrics_command(args):
     if output_path is None:
         output_path = input_path.with_suffix('').with_name(input_path.stem + '_metrics.csv')
 
-    logging.info(f"Loading fragments from {input_path}")
-    # Use optimized reader with specific dtypes to save GPU memory
-    fragments = read_fragments_parquet(input_path, low_memory=True)
-    
-    tss_df = load_tss_from_gtf(gtf_path)
-    results = compute_metrics(fragments, tss_df)
-    
-    logging.info(f"Saving results to {output_path}")
-    results.to_csv(output_path, index=False)
-    logging.info(f"Successfully processed {len(results):,} cells.")
+    if args.streaming:
+        # Use Polars GPU streaming for out-of-core processing
+        from .metrics_streaming import load_tss_from_gtf_polars, compute_metrics_streaming
+        
+        logging.info(f"Loading fragments from {input_path} (streaming mode)")
+        tss_lf = load_tss_from_gtf_polars(gtf_path)
+        results = compute_metrics_streaming(
+            input_path,
+            tss_lf,
+            engine_mode="streaming",
+            memory_resource=args.memory_resource,
+            min_unique_frags=args.min_frags,
+            batch_row_groups=args.batch_size,
+        )
+        
+        logging.info(f"Saving results to {output_path}")
+        results.write_csv(str(output_path))
+        logging.info(f"Successfully processed {len(results):,} cells.")
+    else:
+        # Use existing cuDF implementation (default)
+        from .metrics import load_tss_from_gtf, compute_metrics
+        from .process import read_fragments_parquet
+
+        logging.info(f"Loading fragments from {input_path}")
+        # Use optimized reader with specific dtypes to save GPU memory
+        fragments = read_fragments_parquet(input_path, low_memory=True)
+        
+        tss_df = load_tss_from_gtf(gtf_path)
+        results = compute_metrics(fragments, tss_df)
+        
+        logging.info(f"Saving results to {output_path}")
+        results.to_csv(str(output_path), index=False)
+        logging.info(f"Successfully processed {len(results):,} cells.")
 
 
 def main():
@@ -260,6 +279,29 @@ def main():
     metrics_parser.add_argument(
         '-o', '--output',
         help='Output .csv file'
+    )
+    metrics_parser.add_argument(
+        '--streaming',
+        action='store_true',
+        help='Use Polars GPU streaming for out-of-core processing (larger than VRAM datasets)'
+    )
+    metrics_parser.add_argument(
+        '--memory-resource',
+        choices=['cuda-async', 'managed', 'managed-pool', 'cuda'],
+        default='managed-pool',
+        help='GPU memory resource: managed-pool (UVM, default), cuda-async (fast), cuda (basic)'
+    )
+    metrics_parser.add_argument(
+        '--min-frags',
+        type=int,
+        default=100,
+        help='Minimum unique fragments per cell (default: 100)'
+    )
+    metrics_parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=5,
+        help='Number of parquet row groups per batch (default: 5, lower = less memory)'
     )
     metrics_parser.set_defaults(func=metrics_command)
 

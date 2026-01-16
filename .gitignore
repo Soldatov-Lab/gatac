@@ -1,4 +1,5 @@
 data/*
+refs/*
 uv.lock
 *.pyc
 *.log

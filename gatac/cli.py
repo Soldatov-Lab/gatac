@@ -5,6 +5,7 @@ Usage:
     gatac convert <input.tsv.gz> [output.parquet]
     gatac tile <input.parquet> [-o output] [-t tile_size] [-m min_frags]
     gatac features <input.h5ad> [-n n_features] [-o output]
+    gatac metrics <input.parquet> -g <annotations.gtf> [-o output]
 """
 
 import argparse
@@ -98,6 +99,38 @@ def features_command(args):
         n_features=args.n_features,
         output_path=output_path,
     )
+
+
+def metrics_command(args):
+    """Handle 'gatac metrics' subcommand."""
+    import cudf
+    from .metrics import load_tss_from_gtf, compute_tsse
+    from .process import read_fragments_parquet
+
+    input_path = Path(args.input)
+    gtf_path = Path(args.gtf)
+    
+    if not input_path.exists():
+        logging.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+    if not gtf_path.exists():
+        logging.error(f"GTF file not found: {gtf_path}")
+        sys.exit(1)
+
+    output_path = args.output
+    if output_path is None:
+        output_path = input_path.with_suffix('').with_name(input_path.stem + '_metrics.csv')
+
+    logging.info(f"Loading fragments from {input_path}")
+    # Use optimized reader with specific dtypes to save GPU memory
+    fragments = read_fragments_parquet(input_path, low_memory=True)
+    
+    tss_df = load_tss_from_gtf(gtf_path)
+    results = compute_tsse(fragments, tss_df)
+    
+    logging.info(f"Saving results to {output_path}")
+    results.to_csv(output_path, index=False)
+    logging.info(f"Successfully processed {len(results):,} cells.")
 
 
 def main():
@@ -198,6 +231,26 @@ def main():
         help='Output .h5ad file'
     )
     features_parser.set_defaults(func=features_command)
+
+    # Metrics subcommand
+    metrics_parser = subparsers.add_parser(
+        'metrics',
+        help='GPU-accelerated quality metrics (TSSe)'
+    )
+    metrics_parser.add_argument(
+        'input',
+        help='Input .parquet fragments file'
+    )
+    metrics_parser.add_argument(
+        '-g', '--gtf',
+        required=True,
+        help='Path to GTF gene annotation file'
+    )
+    metrics_parser.add_argument(
+        '-o', '--output',
+        help='Output .csv file'
+    )
+    metrics_parser.set_defaults(func=metrics_command)
 
     args = parser.parse_args()
     setup_logging(args.verbose)

@@ -176,7 +176,7 @@ def metrics_command(args):
 
         logging.info(f"Loading fragments from {input_path}")
         # Use optimized reader with specific dtypes to save GPU memory
-        fragments = read_fragments_parquet(input_path, low_memory=True)
+        fragments = read_fragments_parquet(input_path, low_memory=args.low_memory)
         
         tss_df = load_tss_from_gtf(gtf_path)
         results = compute_metrics(fragments, tss_df, min_unique_frags=args.min_frags)
@@ -270,6 +270,11 @@ def main():
         '--barcode-prefix',
         help='Prefix to add to barcodes'
     )
+    tile_parser.add_argument(
+        '--low-memory',
+        action='store_true',
+        help='Use low memory mode for Parquet reading'
+    )
     tile_parser.set_defaults(func=tile_command)
 
     # Features subcommand
@@ -339,6 +344,11 @@ def main():
         type=int,
         default=5,
         help='Number of parquet row groups per batch (default: 5, lower = less memory)'
+    )
+    metrics_parser.add_argument(
+        '--low-memory',
+        action='store_true',
+        help='Use low memory mode for Parquet reading (non-streaming mode)'
     )
     metrics_parser.set_defaults(func=metrics_command)
 

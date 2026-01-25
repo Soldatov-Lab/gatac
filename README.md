@@ -27,7 +27,7 @@ gatac tile fragments.parquet -g hg38 -t 500 -m 100
 gatac tile fragments.parquet -g hg38 --metrics metrics.csv --filter "tsse_score > 5"
 
 # Feature selection (single file)
-gatac features tile_matrix.h5ad -n 50000
+gatac features tile_matrix.h5ad -n 500000
 
 # Feature selection (multi-file streaming)
 gatac features "data/*.h5ad" -o combined.h5ad -n 500000

@@ -2,6 +2,7 @@
 GPU-accelerated feature selection for ATAC-seq tile matrices.
 """
 
+import gc
 import logging
 from pathlib import Path
 from typing import Optional, Literal
@@ -207,6 +208,7 @@ def select_features_multi(
         Whether to binarize the output matrix (default: True)
     """
     import anndata as ad
+    import pandas as pd
     import scanpy as sc
     from tqdm import tqdm
 
@@ -246,6 +248,7 @@ def select_features_multi(
     feature_counts = cp.zeros(n_vars, dtype=cp.float32)
     total_cells = 0
     total_nnz = 0
+    max_count = 0
 
     for fpath in tqdm(input_paths, desc="Counting features"):
         adata = sc.read_h5ad(str(fpath))
@@ -259,6 +262,13 @@ def select_features_multi(
         file_counts = _compute_feature_counts_gpu(adata.X)
         feature_counts += file_counts
         
+        # Track max count value for dtype optimization
+        if sp.issparse(adata.X):
+            file_max = adata.X.data.max() if adata.X.nnz > 0 else 0
+        else:
+            file_max = adata.X.max()
+        max_count = max(max_count, int(file_max))
+        
         # Count cells and estimate nnz for preallocation
         total_cells += adata.n_obs
         if sp.issparse(adata.X):
@@ -267,6 +277,7 @@ def select_features_multi(
             total_nnz += np.count_nonzero(adata.X)
         
         del adata
+        gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
 
     logger.debug(f"Total cells: {total_cells:,}, total features: {n_vars:,}")
@@ -286,91 +297,131 @@ def select_features_multi(
     n_selected = len(selected_indices)
     logger.info(f"Selected {n_selected:,} features from aggregated counts")
 
+    # Determine optimal dtype based on max count value
+    if binarize:
+        optimal_dtype = bool
+        logger.info("Using bool dtype (binarized)")
+    elif max_count <= 65535:
+        optimal_dtype = np.uint16
+        logger.info(f"Using uint16 dtype (max_count={max_count})")
+    else:
+        optimal_dtype = np.int32
+        logger.info(f"Using int32 dtype (max_count={max_count})")
+
     # =========================================================================
     # PASS 2: Build combined sparse matrix with selected features
     # =========================================================================
     logger.info("Pass 2: Building combined matrix...")
 
-    # Estimate nnz for selected features (rough approximation)
-    # We'll count actual nnz in first pass through
-    actual_nnz = 0
-    for fpath in tqdm(input_paths, desc="Counting nnz"):
-        adata = sc.read_h5ad(str(fpath))
-        X = adata.X
-        if sp.issparse(X):
-            X_sel = X[:, selected_indices_cpu]
-            actual_nnz += X_sel.nnz
-        else:
-            actual_nnz += np.count_nonzero(X[:, selected_indices_cpu])
-        del adata
-
-    # Preallocate arrays with optimal dtypes
-    dtype = bool if binarize else np.float32
-    indices_dtype = np.uint32 if n_selected > 65535 else np.uint16
-    indptr_dtype = np.uint64 if actual_nnz > 4294967295 else np.uint32
-
-    logger.debug(f"Allocating: {actual_nnz:,} nnz, indices={indices_dtype}, indptr={indptr_dtype}")
-    all_data = np.empty(actual_nnz, dtype=dtype)
-    all_indices = np.empty(actual_nnz, dtype=indices_dtype)
-    all_indptr = np.zeros(total_cells + 1, dtype=indptr_dtype)
-
-    # Collect obs metadata
-    all_obs = []
+    data_list = []
+    indices_list = []
+    indptr_list = []
+    obs_list = []
+    
     current_nnz = 0
-    current_row = 0
+    total_cells_processed = 0
 
     for fpath in tqdm(input_paths, desc="Building matrix"):
-        adata = sc.read_h5ad(str(fpath))
-        X = adata.X[:, selected_indices_cpu]
+        # Read metadata first to avoid loading data if not needed
+        adata_meta = sc.read_h5ad(str(fpath), backed='r')
+        n_obs = adata_meta.n_obs
+        
+        # Pull only selected features into memory
+        X = adata_meta[:, selected_indices_cpu].to_memory().X
         
         if not sp.issparse(X):
             X = sp.csr_matrix(X)
         elif not isinstance(X, sp.csr_matrix):
             X = X.tocsr()
 
-        n_rows = X.shape[0]
         nnz = X.nnz
-
-        if binarize:
-            all_data[current_nnz:current_nnz + nnz] = X.data.astype(bool)
+        
+        # Collect matrix components with optimal dtype
+        data_list.append(X.data.astype(optimal_dtype))
+            
+        indices_list.append(X.indices.astype(np.uint32 if n_selected > 65535 else np.uint16))
+        
+        # Adjust indptr for concatenation
+        if total_cells_processed == 0:
+            indptr_list.append(X.indptr.astype(np.uint64))
         else:
-            all_data[current_nnz:current_nnz + nnz] = X.data.astype(dtype)
+            # Drop the first 0 to append to existing indptr
+            # Cast to uint64 BEFORE addition to prevent int32 overflow
+            chunk_indptr = X.indptr[1:].astype(np.uint64)
+            indptr_list.append(chunk_indptr + current_nnz)
 
-        all_indices[current_nnz:current_nnz + nnz] = X.indices.astype(indices_dtype)
-        all_indptr[current_row + 1:current_row + n_rows + 1] = (
-            X.indptr[1:].astype(indptr_dtype) + current_nnz
-        )
-
-        # Collect obs with source file info
-        obs = adata.obs.copy()
-        obs['source_file'] = fpath.name
-        all_obs.append(obs)
+        # Collect obs metadata
+        obs_df = adata_meta.obs.copy()
+        obs_df['source_file'] = fpath.name
+        obs_list.append(obs_df)
 
         current_nnz += nnz
-        current_row += n_rows
-        del adata
+        total_cells_processed += n_obs
+        
+        # Explicit cleanup per file
+        del adata_meta, X, obs_df
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+
+    # =========================================================================
+    # Final Assembly
+    # =========================================================================
+    logger.info("Final assembly of matrix and metadata...")
+    
+    # Concatenate sparse components
+    all_data = np.concatenate(data_list)
+    del data_list
+    all_indices = np.concatenate(indices_list)
+    del indices_list
+    all_indptr = np.concatenate(indptr_list)
+    del indptr_list
+    gc.collect()
 
     # Build final sparse matrix
+    logger.info("Building final sparse matrix...")
     combined_X = sp.csr_matrix(
         (all_data, all_indices, all_indptr),
-        shape=(total_cells, n_selected)
+        shape=(total_cells_processed, n_selected)
     )
+    del all_data, all_indices, all_indptr
+    gc.collect()
 
     # Build combined obs
-    import pandas as pd
-    combined_obs = pd.concat(all_obs, axis=0)
-    combined_obs.index = combined_obs.index.astype(str)
-    # Handle duplicate indices by making them unique
-    if combined_obs.index.duplicated().any():
-        combined_obs.index = pd.Index(
-            [f"{idx}_{i}" for i, idx in enumerate(combined_obs.index)]
-        )
+    combined_obs = pd.concat(obs_list)
+    del obs_list
+    gc.collect()
+    
+    # Make barcodes unique
+    combined_obs.index.name = 'barcode'
+    if 'barcode' in combined_obs.columns:
+        combined_obs.drop(columns=['barcode'], inplace=True)
+    combined_obs.reset_index(inplace=True)
+
+    if not combined_obs['barcode'].is_unique:
+        n_dups = combined_obs['barcode'].duplicated().sum()
+        logger.warning(f"Detected {n_dups:,} duplicate barcodes. Making barcodes unique.")
+
+        # Using anndata helper for efficiency if available, or manual uniqueness
+        def make_unique(indices):
+            seen = {}
+            out = []
+            for x in indices:
+                if x in seen:
+                    seen[x] += 1
+                    out.append(f"{x}-{seen[x]}")
+                else:
+                    seen[x] = 0
+                    out.append(x)
+            return out
+        
+        combined_obs.index = make_unique(combined_obs['barcode'])
+        combined_obs.drop(columns=['barcode'], inplace=True)
 
     # Build var for selected features
     combined_var = var_df.iloc[selected_indices_cpu].copy()
     combined_var['selected'] = True
     combined_var['accessibility_count'] = feature_counts.get()[selected_indices_cpu]
-
+    logger.info("Building Anndata...")
     # Create combined AnnData
     combined_adata = ad.AnnData(
         X=combined_X,
@@ -380,4 +431,4 @@ def select_features_multi(
 
     # Save
     combined_adata.write_h5ad(str(output_path))
-    logger.info(f"Saved combined matrix ({total_cells:,} cells × {n_selected:,} features) to {output_path.name}")
+    logger.info(f"Saved combined matrix ({total_cells_processed :,} cells × {n_selected:,} features) to {output_path.name}")

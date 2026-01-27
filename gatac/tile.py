@@ -128,7 +128,7 @@ def create_tile_matrix_gpu(
         size = chrom_sizes[chrom]
         n_tiles = (size + tile_size - 1) // tile_size
         tile_starts = cp.arange(0, n_tiles * tile_size, tile_size)
-        tile_ends = tile_starts + tile_size
+        tile_ends = cp.minimum(tile_starts + tile_size, size)
 
         chrom_tiles = cudf.DataFrame({
             'chrom': chrom,

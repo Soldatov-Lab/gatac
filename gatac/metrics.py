@@ -51,9 +51,9 @@ def load_tss_from_gtf(gtf_path: str | Path) -> cudf.DataFrame:
     # Determine TSS based on strand
     # If strand is +, TSS is start. If -, TSS is end.
     # Note: GTF coordinates are 1-based.
-    df['tss'] = df['start']
+    df['tss'] = df['start'] - 1
     neg_strand = df['strand'] == '-'
-    df.loc[neg_strand, 'tss'] = df.loc[neg_strand, 'end']
+    df.loc[neg_strand, 'tss'] = df.loc[neg_strand, 'end'] - 1
     
     # Keep unique TSS positions per chromosome/strand
     tss_df = df[['chrom', 'tss', 'strand']].drop_duplicates().reset_index(drop=True)
@@ -122,6 +122,8 @@ def compute_metrics(
     window_size: int = 2000,
     smooth_window: int = 11,
     min_unique_frags: int = 100,
+    chrom_sizes: dict[str, int] | None = None,
+    exclude_chroms: list[str] | None = ['chrM', 'M'],
 ) -> cudf.DataFrame:
     """
     Compute TSS enrichment scores and quality metrics per cell using GPU acceleration 
@@ -139,6 +141,8 @@ def compute_metrics(
         Window size for smoothing the TSS signal (default: 11)
     min_unique_frags : int
         Minimum unique fragments per cell to include in output (default: 100)
+    exclude_chroms : list[str] | None
+        Chromosomes to exclude from TSS enrichment calculation (default: ["chrM", "M"])
         
     Returns
     -------
@@ -148,7 +152,21 @@ def compute_metrics(
     import gc
     logger.info(f"Computing metrics (TSSe, fragments, mito) for cells with >= {min_unique_frags} frags")
     
+    if exclude_chroms:
+        tss_df = tss_df[~tss_df['chrom'].isin(exclude_chroms)]
+    
     # 1. Calculate cell-level QC metrics
+    # Count fragments only on reference chromosomes
+    if chrom_sizes is not None:
+        valid_chroms = list(chrom_sizes.keys())
+    else:
+        valid_chroms = tss_df['chrom'].unique().to_arrow().to_pylist()
+        # Ensure mitochondrial chroms are retained even if not in GTF
+        for mito in ['chrM', 'M']:
+            if mito in fragments_df['chrom'].unique().to_arrow().to_pylist() and mito not in valid_chroms:
+                valid_chroms.append(mito)
+    fragments_df = fragments_df[fragments_df['chrom'].isin(valid_chroms)]
+
     # Unique fragments = number of rows in fragment file
     # Total fragments = sum of 'count' column (number of reads/duplicates)
     
@@ -225,38 +243,52 @@ def compute_metrics(
             
         # 2. Expand fragments to insertions (start and end) for TSSe
         df_start = f_chrom[['start', 'barcode', 'count']].rename(columns={'start': 'pos'})
-        df_end = f_chrom[['end', 'barcode', 'count']].rename(columns={'end': 'pos'})
+        f_chrom_end = f_chrom[['end', 'barcode', 'count']].copy()
+        f_chrom_end['end'] = f_chrom_end['end'] - 1  # SnapATAC2 uses end-1
+        df_end = f_chrom_end.rename(columns={'end': 'pos'})
         insertions = cudf.concat([df_start, df_end], ignore_index=True)
-        del f_chrom
+        del f_chrom, f_chrom_end
         
-        # 3. Join insertions with nearest TSS
+        # 3. Join insertions with all TSS within window
+
         insertions = insertions.sort_values('pos')
-        
-        mapped = _merge_asof_nearest(
-            insertions, 
-            t_chrom, 
-            left_on='pos', 
-            right_on='tss'
-        )
-        del insertions
-        
-        # 4. Filter and calculate offsets
-        mapped['dist'] = mapped['pos'] - mapped['tss']
-        mask = mapped['dist'].abs() <= window_size
-        mapped = mapped[mask]
-        
-        if len(mapped) > 0:
-            # Adjust for strand orientation
-            mapped['offset'] = mapped['dist']
-            neg_mask = mapped['strand'] == '-'
-            mapped.loc[neg_mask, 'offset'] = -mapped.loc[neg_mask, 'offset']
-            
+
+        # Prepare cupy arrays
+        pos_cp = insertions['pos'].values
+        tss_cp = t_chrom['tss'].values
+
+        left = tss_cp.searchsorted(pos_cp - window_size, side='left')
+        right = tss_cp.searchsorted(pos_cp + window_size + 1, side='left')  # +1 to include boundary
+        tss_counts = right - left
+
+        total_pairs = int(tss_counts.sum().get())
+        if total_pairs > 0:
+            # Build expanded indices
+            tss_counts_host = tss_counts.get()
+            rep_ins = cp.asarray(np.repeat(np.arange(len(insertions), dtype=np.int32), tss_counts_host))
+            offsets = cp.asarray(
+                np.concatenate(([0], np.cumsum(tss_counts_host)[:-1])).astype(np.int32)
+            )
+            flat_pos = cp.arange(total_pairs, dtype='int32')
+            tss_idx = left[rep_ins] + (flat_pos - offsets[rep_ins])
+
+            # Gather expanded rows
+            expanded_ins = insertions.take(rep_ins).reset_index(drop=True)
+            expanded_tss = t_chrom.take(tss_idx).reset_index(drop=True)
+            del insertions
+
+            # Calculate offsets (strand-aware)
+            expanded_ins['dist'] = expanded_ins['pos'] - expanded_tss['tss']
+            expanded_ins['offset'] = expanded_ins['dist']
+            neg_mask = expanded_tss['strand'] == '-'
+            expanded_ins.loc[neg_mask, 'offset'] = -expanded_ins.loc[neg_mask, 'offset']
+
             # Map barcodes to indices and shift offset
-            mapped['offset_idx'] = (mapped['offset'] + window_size).astype('int32')
-            
+            expanded_ins['offset_idx'] = (expanded_ins['offset'] + window_size).astype('int32')
+
             # Aggregate to Cell x Offset profiles for this chromosome
-            profiles = mapped.groupby(['barcode', 'offset_idx'], observed=True)['count'].sum().reset_index()
-            del mapped
+            profiles = expanded_ins.groupby(['barcode', 'offset_idx'], observed=True).size().reset_index(name='count')
+            del expanded_ins
             
             profiles = profiles.merge(barcode_to_idx, on='barcode')
             
@@ -276,7 +308,7 @@ def compute_metrics(
     center_idx = window_size
     half_smooth = smooth_window // 2
     
-    # Smoothed TSS signal (center 11bp)
+    # Smoothed TSS signal at center
     tss_signal = data_cp[:, (center_idx - half_smooth):(center_idx + half_smooth + 1)].mean(axis=1)
     
     # Background signal (average of first 100bp and last 100bp)

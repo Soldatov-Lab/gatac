@@ -18,7 +18,7 @@ gatac convert fragments.tsv.gz
 gatac metrics fragments.parquet -g annotations.gtf -o fragments_metrics.csv
 
 # Compute quality metrics (TSSe, etc.)
-gatac metrics fragments.parquet -g annotations.gtf --batch-size 32
+gatac metrics fragments.parquet -g annotations.gtf --batch-size 64
 
 # Generate tile matrix (m=min_unique_fragments)
 gatac tile fragments.parquet -g hg38 -t 500 -m 100

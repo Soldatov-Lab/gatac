@@ -123,7 +123,7 @@ def compute_metrics(
     min_unique_frags: int = 100,
     chrom_sizes: dict[str, int] | None = None,
     exclude_chroms: list[str] | None = ['chrM', 'M'],
-    row_groups_per_batch: int = 32,
+    row_groups_per_batch: int = 64,
 ) -> cudf.DataFrame:
     """
     Compute TSS enrichment scores using GPU-accelerated streaming via row groups.
@@ -148,7 +148,7 @@ def compute_metrics(
     exclude_chroms : list[str] | None
         Chromosomes to exclude from TSS enrichment calculation (default: ["chrM", "M"])
     row_groups_per_batch : int
-        Number of parquet row groups to process in each GPU batch (default: 32)
+        Number of parquet row groups to process in each GPU batch (default: 64)
         
     Returns
     -------

@@ -319,8 +319,8 @@ def main():
     metrics_parser.add_argument(
         '--batch-size',
         type=int,
-        default=32,
-        help='Number of parquet row groups per batch (default: 32, lower = less memory)'
+        default=64,
+        help='Number of parquet row groups per batch (default: 64, lower = less memory)'
     )
     metrics_parser.set_defaults(func=metrics_command)
 

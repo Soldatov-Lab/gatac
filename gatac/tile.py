@@ -59,10 +59,6 @@ def create_tile_matrix_gpu(
     if hasattr(chrom_sizes, 'chrom_sizes'):
         chrom_sizes = chrom_sizes.chrom_sizes
 
-    # Convert barcodes to strings early (GPU-accelerated via cudf)
-    if fragments_df['barcode'].dtype != 'object':
-        fragments_df['barcode'] = fragments_df['barcode'].astype(str)
-
     if cell_metadata is None:
         logger.debug("Filtering cells by unique fragment count")
         barcode_counts = fragments_df.groupby('barcode', observed=True).agg({
@@ -77,10 +73,6 @@ def create_tile_matrix_gpu(
         cell_metadata = barcode_counts[barcode_counts['barcode'].isin(valid_barcodes)]
     else:
         logger.debug("Using provided cell metadata for filtering")
-        # Ensure barcodes are strings in provided metadata
-        if cell_metadata['barcode'].dtype != 'object':
-            cell_metadata['barcode'] = cell_metadata['barcode'].astype(str)
-        
         # 1. Apply user query if provided
         if filter_query:
             cell_metadata = cell_metadata.query(filter_query)
@@ -205,6 +197,11 @@ def create_tile_matrix_gpu(
         how='left'
     )
     cell_metadata = cell_metadata.sort_values('cell_idx').reset_index(drop=True)
+    
+    # Convert barcodes to strings only at the end for AnnData compatibility
+    # This is done on the small cell_metadata DataFrame (unique barcodes only)
+    if cell_metadata['barcode'].dtype != 'object':
+        cell_metadata['barcode'] = cell_metadata['barcode'].astype(str)
 
     return matrix, cell_metadata, tile_metadata
 
@@ -241,7 +238,7 @@ def tile_matrix_to_anndata(
     )
 
     obs = cell_metadata.to_pandas()
-    # Barcodes are already strings from create_tile_matrix_gpu
+    # Barcodes were converted to strings at end of create_tile_matrix_gpu
     obs.index = obs['barcode'].values
 
     var = tile_metadata.to_pandas()

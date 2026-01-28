@@ -221,9 +221,14 @@ def compute_metrics(
     
     # Process chromosome by chromosome to minimize peak memory usage
     half_smooth = smooth_window // 2
-    chroms = tss_df['chrom'].unique().to_arrow().to_pylist()
     
-    for chrom in chroms:
+    # Get intersection of chromosomes to avoid Categorical ValueError in cuDF
+    # and to only process relevant data
+    tss_chroms = set(tss_df['chrom'].unique().to_arrow().to_pylist())
+    frag_chroms = set(fragments_df['chrom'].unique().to_arrow().to_pylist())
+    common_chroms = sorted(list(tss_chroms & frag_chroms))
+    
+    for chrom in common_chroms:
         # 1. Prepare TSS for this chromosome
         tss_sub = tss_df[tss_df['chrom'] == chrom].sort_values('tss')
         if len(tss_sub) == 0:

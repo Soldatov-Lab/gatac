@@ -153,21 +153,19 @@ def metrics_command(args):
 
     if args.streaming:
         # Use Polars GPU streaming for out-of-core processing
-        from .metrics_streaming import load_tss_from_gtf_polars, compute_metrics_streaming
+        from .metrics import load_tss_from_gtf_polars, compute_metrics_streaming
         
         logging.info(f"Loading fragments from {input_path} (streaming mode)")
         tss_lf = load_tss_from_gtf_polars(gtf_path)
         results = compute_metrics_streaming(
             input_path,
             tss_lf,
-            engine_mode="streaming",
-            memory_resource=args.memory_resource,
             min_unique_frags=args.min_frags,
-            batch_row_groups=args.batch_size,
+            row_groups_per_batch=args.batch_size,
         )
         
         logging.info(f"Saving results to {output_path}")
-        results.write_csv(str(output_path))
+        results.to_csv(str(output_path), index=False)
         logging.info(f"Successfully processed {len(results):,} cells.")
     else:
         # Use existing cuDF implementation (default)
@@ -342,8 +340,8 @@ def main():
     metrics_parser.add_argument(
         '--batch-size',
         type=int,
-        default=5,
-        help='Number of parquet row groups per batch (default: 5, lower = less memory)'
+        default=32,
+        help='Number of parquet row groups per batch (default: 32, lower = less memory)'
     )
     metrics_parser.add_argument(
         '--low-memory',

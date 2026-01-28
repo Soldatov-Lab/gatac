@@ -451,6 +451,9 @@ def select_features_multi(
         combined_obs.drop(columns=['barcode'], inplace=True)
     combined_obs.reset_index(inplace=True)
 
+    # Ensure barcodes are strings
+    combined_obs['barcode'] = combined_obs['barcode'].astype(str)
+
     if not combined_obs['barcode'].is_unique:
         n_dups = combined_obs['barcode'].duplicated().sum()
         logger.warning(f"Detected {n_dups:,} duplicate barcodes. Making barcodes unique.")
@@ -469,6 +472,10 @@ def select_features_multi(
             return out
         
         combined_obs.index = make_unique(combined_obs['barcode'])
+        combined_obs.drop(columns=['barcode'], inplace=True)
+    else:
+        # Use barcodes as index and drop the column
+        combined_obs.index = combined_obs['barcode'].values
         combined_obs.drop(columns=['barcode'], inplace=True)
 
     # Build var for selected features

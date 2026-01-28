@@ -233,6 +233,8 @@ def tile_matrix_to_anndata(
     )
 
     obs = cell_metadata.to_pandas()
+    # Ensure barcodes are strings to avoid categorical index issues in AnnData/H5AD
+    obs['barcode'] = obs['barcode'].astype(str)
     obs.index = obs['barcode'].values
 
     var = tile_metadata.to_pandas()

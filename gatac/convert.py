@@ -22,6 +22,7 @@ def make_parquet(
     chunk_size: int = 1024 * 1024 * 1024,
     separator: str = '\t',
     progress: bool = False,
+    barcode_prefix: Optional[str] = None,
 ) -> Path:
     """
     Convert ATAC fragments TSV.GZ file to Parquet format.
@@ -43,6 +44,8 @@ def make_parquet(
         Column separator (default: tab)
     progress : bool
         Whether to show a progress bar (default: False)
+    barcode_prefix : str, optional
+        Prefix to prepend to barcodes (e.g. "sample1#")
 
     Returns
     -------
@@ -132,6 +135,11 @@ def make_parquet(
                         truncate_ragged_lines=True
                     )
 
+                if barcode_prefix:
+                    df = df.with_columns(
+                        (pl.lit(barcode_prefix) + pl.col("barcode")).cast(pl.Categorical).alias("barcode")
+                    )
+
                 schema = df.schema
                 arrow_table = df.to_arrow()
                 writer = pq.ParquetWriter(str(output_path), arrow_table.schema)
@@ -149,6 +157,10 @@ def make_parquet(
                     truncate_ragged_lines=True
                 )
                 if df.height > 0:
+                    if barcode_prefix:
+                        df = df.with_columns(
+                            (pl.lit(barcode_prefix) + pl.col("barcode")).cast(pl.Categorical).alias("barcode")
+                        )
                     writer.write_table(df.to_arrow())
                     logger.debug(f"Chunk {chunk_count}: {df.height} rows")
 

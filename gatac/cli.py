@@ -33,7 +33,12 @@ def convert_command(args):
         sys.exit(1)
 
     output_path = args.output if args.output else None
-    make_parquet(input_path, output_path, progress=args.progress)
+    make_parquet(
+        input_path, 
+        output_path, 
+        progress=args.progress,
+        barcode_prefix=args.barcode_prefix
+    )
 
 
 def tile_command(args):
@@ -200,6 +205,10 @@ def main():
         '-p', '--progress',
         action='store_true',
         help='Show progress bar'
+    )
+    convert_parser.add_argument(
+        '--barcode-prefix',
+        help='Prefix to add to barcodes'
     )
     convert_parser.set_defaults(func=convert_command)
 

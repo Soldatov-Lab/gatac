@@ -15,25 +15,53 @@ import scipy.sparse as sp
 logger = logging.getLogger(__name__)
 
 
+def _is_binary_matrix(X) -> bool:
+    """
+    Detect if a sparse matrix is binary by checking its dtype.
+
+    Parameters
+    ----------
+    X : sparse matrix
+        Matrix to check (scipy or cupyx sparse)
+
+    Returns
+    -------
+    bool
+        True if matrix is binary (bool dtype), False otherwise
+    """
+    if isinstance(X, (cusp.csr_matrix, cusp.csc_matrix)):
+        return X.data.dtype == cp.bool_ or X.data.dtype == bool
+    elif sp.issparse(X):
+        return X.data.dtype == np.bool_ or X.data.dtype == bool
+    
+    return False
+
+
 def _find_most_accessible_features_gpu(
     feature_count: cp.ndarray,
     filter_lower_quantile: float,
     filter_upper_quantile: float,
     total_features: int,
+    is_binary: bool = False,
 ) -> cp.ndarray:
     """
-    Find most accessible features, excluding quantile tails.
+    Find most accessible features.
+
+    For binary matrices (following ArchR): select top N features by total accessibility.
+    For count matrices: select top N features excluding quantile tails.
 
     Parameters
     ----------
     feature_count : cp.ndarray
         Array of counts per feature
     filter_lower_quantile : float
-        Lower quantile to filter out
+        Lower quantile to filter out (ignored for binary matrices)
     filter_upper_quantile : float
-        Upper quantile to filter out
+        Upper quantile to filter out (ignored for binary matrices)
     total_features : int
         Number of features to select
+    is_binary : bool
+        Whether the matrix is binary (default: False)
 
     Returns
     -------
@@ -43,12 +71,18 @@ def _find_most_accessible_features_gpu(
     sorted_indices = cp.argsort(feature_count)
     n = len(feature_count)
 
-    lower_idx = int(n * filter_lower_quantile)
-    upper_idx = int(n * (1 - filter_upper_quantile))
+    if is_binary:
+        # For binary matrices: simply select top N most accessible features
+        n_to_select = min(total_features, n)
+        selected = sorted_indices[-n_to_select:]
+    else:
+        # For count matrices: apply quantile filtering
+        lower_idx = int(n * filter_lower_quantile)
+        upper_idx = int(n * (1 - filter_upper_quantile))
 
-    valid_range = sorted_indices[lower_idx:upper_idx]
-    n_to_select = min(total_features, len(valid_range))
-    selected = valid_range[-n_to_select:]
+        valid_range = sorted_indices[lower_idx:upper_idx]
+        n_to_select = min(total_features, len(valid_range))
+        selected = valid_range[-n_to_select:]
 
     return selected
 
@@ -109,8 +143,8 @@ def select_features(
     """
     GPU-accelerated feature selection for ATAC-seq tile matrices.
 
-    Select the most accessible features (tiles/bins) across all cells,
-    filtering out very rare and very common features.
+    For binary matrices: selects top N most accessible features (ArchR approach).
+    For count matrices: selects top N accessible features, excluding quantile tails.
 
     Parameters
     ----------
@@ -119,9 +153,9 @@ def select_features(
     n_features : int
         Target number of features to select (default: 500000)
     filter_lower_quantile : float
-        Lower quantile threshold for filtering (default: 0.005)
+        Lower quantile threshold for filtering (ignored for binary matrices) (default: 0.005)
     filter_upper_quantile : float
-        Upper quantile threshold for filtering (default: 0.005)
+        Upper quantile threshold for filtering (ignored for binary matrices) (default: 0.005)
     inplace : bool
         Whether to modify adata in place (default: True)
     output_path : str or Path, optional
@@ -134,6 +168,13 @@ def select_features(
     """
     logger.info(f"Selecting features from {adata.shape[1]:,} total")
 
+    # Detect if matrix is binary
+    is_binary = _is_binary_matrix(adata.X)
+    if is_binary:
+        logger.info("Detected binary matrix - using top-N selection (ArchR approach)")
+    else:
+        logger.info("Detected count matrix - using quantile-filtered selection")
+
     # Compute feature counts
     logger.debug("Computing feature accessibility")
     feature_counts = _compute_feature_counts_gpu(adata.X)
@@ -144,7 +185,8 @@ def select_features(
         feature_counts,
         filter_lower_quantile,
         filter_upper_quantile,
-        n_features
+        n_features,
+        is_binary=is_binary
     )
 
     n_selected = len(selected_indices)
@@ -282,12 +324,24 @@ def select_features_multi(
 
     logger.debug(f"Total cells: {total_cells:,}, total features: {n_vars:,}")
 
+    # Detect if matrices are binary (check first file's dtype)
+    first_adata_check = sc.read_h5ad(str(input_paths[0]))
+    is_binary = _is_binary_matrix(first_adata_check.X)
+    del first_adata_check
+    cp.get_default_memory_pool().free_all_blocks()
+    
+    if is_binary:
+        logger.info("Detected binary matrices - using top-N selection (ArchR approach)")
+    else:
+        logger.info("Detected count matrices - using quantile-filtered selection")
+
     # Select features based on aggregated counts
     selected_indices = _find_most_accessible_features_gpu(
         feature_counts,
         filter_lower_quantile,
         filter_upper_quantile,
-        n_features
+        n_features,
+        is_binary=is_binary
     )
     selected_indices_sorted = cp.sort(selected_indices)
     selected_mask = cp.zeros(n_vars, dtype=bool)

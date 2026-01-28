@@ -25,7 +25,7 @@ def setup_logging(verbose: bool = False):
 
 def convert_command(args):
     """Handle 'gatac convert' subcommand."""
-    from .convert import make_parquet
+    from .pp.convert import make_parquet
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -43,7 +43,7 @@ def convert_command(args):
 
 def tile_command(args):
     """Handle 'gatac tile' subcommand."""
-    from .process import make_tile_matrix
+    from .pp.process import make_tile_matrix
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -90,7 +90,7 @@ def features_command(args):
     """Handle 'gatac features' subcommand."""
     import glob
     import scanpy as sc
-    from .features import select_features, select_features_multi
+    from .pp.features import select_features, select_features_multi
 
     # Expand inputs - support glob patterns
     input_paths = []
@@ -157,7 +157,7 @@ def metrics_command(args):
         output_path = input_path.with_suffix('').with_name(input_path.stem + '_metrics.csv')
 
     # Use Polars GPU streaming for out-of-core processing
-    from .metrics import load_tss_from_gtf, compute_metrics
+    from .pp.metrics import load_tss_from_gtf, compute_metrics
     
     logging.info(f"Loading fragments from {input_path}")
     tss_df = load_tss_from_gtf(gtf_path)

@@ -151,37 +151,21 @@ def metrics_command(args):
     if output_path is None:
         output_path = input_path.with_suffix('').with_name(input_path.stem + '_metrics.csv')
 
-    if args.streaming:
-        # Use Polars GPU streaming for out-of-core processing
-        from .metrics import load_tss_from_gtf_polars, compute_metrics_streaming
-        
-        logging.info(f"Loading fragments from {input_path} (streaming mode)")
-        tss_lf = load_tss_from_gtf_polars(gtf_path)
-        results = compute_metrics_streaming(
-            input_path,
-            tss_lf,
-            min_unique_frags=args.min_frags,
-            row_groups_per_batch=args.batch_size,
-        )
-        
-        logging.info(f"Saving results to {output_path}")
-        results.to_csv(str(output_path), index=False)
-        logging.info(f"Successfully processed {len(results):,} cells.")
-    else:
-        # Use existing cuDF implementation (default)
-        from .metrics import load_tss_from_gtf, compute_metrics
-        from .process import read_fragments_parquet
-
-        logging.info(f"Loading fragments from {input_path}")
-        # Use optimized reader with specific dtypes to save GPU memory
-        fragments = read_fragments_parquet(input_path, low_memory=args.low_memory)
-        
-        tss_df = load_tss_from_gtf(gtf_path)
-        results = compute_metrics(fragments, tss_df, min_unique_frags=args.min_frags)
-        
-        logging.info(f"Saving results to {output_path}")
-        results.to_csv(str(output_path), index=False)
-        logging.info(f"Successfully processed {len(results):,} cells.")
+    # Use Polars GPU streaming for out-of-core processing
+    from .metrics import load_tss_from_gtf, compute_metrics
+    
+    logging.info(f"Loading fragments from {input_path}")
+    tss_df = load_tss_from_gtf(gtf_path)
+    results = compute_metrics(
+        input_path,
+        tss_df,
+        min_unique_frags=args.min_frags,
+        row_groups_per_batch=args.batch_size,
+    )
+    
+    logging.info(f"Saving results to {output_path}")
+    results.to_csv(str(output_path), index=False)
+    logging.info(f"Successfully processed {len(results):,} cells.")
 
 
 def main():
@@ -321,11 +305,6 @@ def main():
         help='Output .csv file'
     )
     metrics_parser.add_argument(
-        '--streaming',
-        action='store_true',
-        help='Use Polars GPU streaming for out-of-core processing (larger than VRAM datasets)'
-    )
-    metrics_parser.add_argument(
         '--memory-resource',
         choices=['cuda-async', 'managed', 'managed-pool', 'cuda'],
         default='managed-pool',
@@ -342,11 +321,6 @@ def main():
         type=int,
         default=32,
         help='Number of parquet row groups per batch (default: 32, lower = less memory)'
-    )
-    metrics_parser.add_argument(
-        '--low-memory',
-        action='store_true',
-        help='Use low memory mode for Parquet reading (non-streaming mode)'
     )
     metrics_parser.set_defaults(func=metrics_command)
 

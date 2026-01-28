@@ -1,11 +1,9 @@
 """
 GPU-accelerated metrics for ATAC-seq data.
 
-Provides two implementations:
-1. compute_metrics: cuDF-based, loads full dataset into GPU memory
-2. compute_metrics_streaming: Polars-based, streams data in chunks to reduce peak memory
-
-Use compute_metrics_streaming for large datasets (>100M fragments) to avoid OOM errors.
+Implementation:
+1. compute_metrics: Polars-based, streams data in chunks to reduce peak memory.
+   This is the standard implementation for both small and large datasets.
 """
 
 import logging
@@ -69,235 +67,9 @@ void compute_tsse_kernel(
 }
 ''', 'compute_tsse_kernel')
 
-def load_tss_from_gtf(gtf_path: str | Path) -> cudf.DataFrame:
+def load_tss_from_gtf(gtf_path: str | Path) -> 'pl.DataFrame':
     """
-    Load TSS locations from a GTF file using cuDF.
-    
-    Parameters
-    ----------
-    gtf_path : str or Path
-        Path to the GTF file.
-        
-    Returns
-    -------
-    tss_df : cudf.DataFrame
-        DataFrame with columns: ['chrom', 'tss', 'strand']
-    """
-    logger.info(f"Loading TSS from {gtf_path}")
-    
-    # GTF columns
-    cols = [
-        'chrom', 'source', 'feature', 'start', 'end', 
-        'score', 'strand', 'frame', 'attribute'
-    ]
-    
-    # Read GTF (tab-separated, ignore lines starting with #)
-    df = cudf.read_csv(
-        gtf_path,
-        sep='\t',
-        comment='#',
-        header=None,
-        names=cols,
-        usecols=['chrom', 'feature', 'start', 'end', 'strand']
-    )
-    
-    # Filter for transcripts
-    df = df[df['feature'] == 'transcript']
-    
-    # Determine TSS based on strand
-    # If strand is +, TSS is start. If -, TSS is end.
-    # Note: GTF coordinates are 1-based.
-    df['tss'] = df['start'] - 1
-    neg_strand = df['strand'] == '-'
-    df.loc[neg_strand, 'tss'] = df.loc[neg_strand, 'end'] - 1
-    
-    # Keep unique TSS positions per chromosome/strand
-    tss_df = df[['chrom', 'tss', 'strand']].drop_duplicates().reset_index(drop=True)
-    
-    logger.info(f"Loaded {len(tss_df):,} unique TSSs")
-    return tss_df
-
-def compute_metrics(
-    fragments_df: cudf.DataFrame,
-    tss_df: cudf.DataFrame,
-    window_size: int = 2000,
-    smooth_window: int = 11,
-    min_unique_frags: int = 100,
-    chrom_sizes: dict[str, int] | None = None,
-    exclude_chroms: list[str] | None = ['chrM', 'M'],
-) -> cudf.DataFrame:
-    """
-    Compute TSS enrichment scores and quality metrics per cell using GPU acceleration.
-    
-    Parameters
-    ----------
-    fragments_df : cudf.DataFrame
-        Fragment data with columns: ['chrom', 'start', 'end', 'barcode', 'count']
-    tss_df : cudf.DataFrame
-        TSS data from load_tss_from_gtf
-    window_size : int
-        Distance around TSS to consider (default: 2000)
-    smooth_window : int
-        Window size for smoothing the TSS signal (default: 11)
-    min_unique_frags : int
-        Minimum unique fragments per cell to include in output (default: 100)
-    exclude_chroms : list[str] | None
-        Chromosomes to exclude from TSS enrichment calculation (default: ["chrM", "M"])
-        
-    Returns
-    -------
-    results : cudf.DataFrame
-        DataFrame with columns: ['barcode', 'tsse_score', 'n_unique', 'duplicate_fraction', 'mito_fraction']
-    """
-    logger.info(f"Computing metrics (TSSe, fragments, mito) for cells with >= {min_unique_frags} frags")
-    
-    if exclude_chroms:
-        tss_df = tss_df[~tss_df['chrom'].isin(exclude_chroms)]
-    
-    # Identify mitochondrial fragments for fraction calculation
-    is_mito = fragments_df['chrom'].isin(['chrM', 'M'])
-    fragments_df['n_mito'] = is_mito.astype('uint16') * fragments_df['count']
-    
-    # 1. Calculate cell-level QC metrics
-    if chrom_sizes is not None:
-        valid_chroms = list(chrom_sizes.keys())
-        fragments_df = fragments_df[fragments_df['chrom'].isin(valid_chroms)]
-
-    # Group by barcode to get QC metrics in one pass
-    agg_df = fragments_df.groupby('barcode', observed=True).agg({
-        'count': 'sum',
-        'n_mito': 'sum',
-        'start': 'size' # size of the group = number of unique fragments
-    })
-    agg_df.columns = ['n_total', 'n_mito', 'n_unique']
-    agg_df = agg_df.reset_index()
-    
-    # Clean up the temporary mito column in fragments
-    fragments_df = fragments_df.drop(columns='n_mito')
-    
-    # Filter to cells with minimum unique fragments
-    total_barcodes = len(agg_df)
-    agg_df = agg_df[agg_df['n_unique'] >= min_unique_frags]
-    n_cells = len(agg_df)
-    logger.info(f"Filtered to {n_cells:,} cells with >= {min_unique_frags} unique fragments (from {total_barcodes:,} total)")
-    
-    if n_cells == 0:
-        logger.warning("No cells passed the minimum fragment filter!")
-        return cudf.DataFrame({
-            'barcode': [],
-            'tsse_score': [],
-            'n_unique': [],
-            'duplicate_fraction': [],
-            'mito_fraction': [],
-        })
-
-    # Prepare QC metrics result
-    qc_metrics = agg_df.copy()
-    qc_metrics['duplicate_fraction'] = (qc_metrics['n_total'] - qc_metrics['n_unique']) / (qc_metrics['n_total'] + 1e-9)
-    qc_metrics['mito_fraction'] = qc_metrics['n_mito'] / (qc_metrics['n_total'] + 1e-9)
-    final_qc = qc_metrics[['barcode', 'n_unique', 'duplicate_fraction', 'mito_fraction']]
-    
-    # Prepare barcode mapping
-    barcode_to_idx = cudf.DataFrame({
-        'barcode': agg_df['barcode'],
-        'cell_idx': cp.arange(n_cells, dtype='int32')
-    })
-    unique_barcodes = agg_df['barcode'].copy()
-    
-    # Clean up aggregation dataframes
-    del agg_df, qc_metrics
-    
-    # Map barcodes to indices and filter fragments (simultaneously)
-    fragments_df = fragments_df.merge(barcode_to_idx, on='barcode')
-    fragments_df = fragments_df.drop(columns=['barcode', 'count'])
-    
-    # Initialize dense profile matrix on GPU
-    # Optimization: Use 3 bins per cell (bg_left, center, bg_right) to save memory
-    data_cp = cp.zeros((n_cells, 3), dtype='float32')
-    
-    # =========================================================================
-    # OPTIMIZED VECTORIZED TSS ENRICHMENT COMPUTATION
-    # =========================================================================
-    
-    # Process chromosome by chromosome to minimize peak memory usage
-    half_smooth = smooth_window // 2
-    
-    # Get intersection of chromosomes to avoid Categorical ValueError in cuDF
-    # and to only process relevant data
-    tss_chroms = set(tss_df['chrom'].unique().to_arrow().to_pylist())
-    frag_chroms = set(fragments_df['chrom'].unique().to_arrow().to_pylist())
-    common_chroms = sorted(list(tss_chroms & frag_chroms))
-    
-    for chrom in common_chroms:
-        # 1. Prepare TSS for this chromosome
-        tss_sub = tss_df[tss_df['chrom'] == chrom].sort_values('tss')
-        if len(tss_sub) == 0:
-            continue
-            
-        tss_pos = tss_sub['tss'].values.astype('int32')
-        tss_strand = (tss_sub['strand'] == '-').values.astype('int8')
-        
-        # 2. Get fragments for this chromosome
-        frags_sub = fragments_df[fragments_df['chrom'] == chrom]
-        if len(frags_sub) == 0:
-            continue
-            
-        cell_idx = frags_sub['cell_idx'].values.astype('int32')
-        tpb = 256
-        
-        # 3. Process starts
-        ins_pos = frags_sub['start'].values.astype('int32')
-        lb = tss_pos.searchsorted(ins_pos - window_size, side='left').astype('int32')
-        rb = tss_pos.searchsorted(ins_pos + window_size + 1, side='left').astype('int32')
-        
-        bpg = (len(ins_pos) + tpb - 1) // tpb
-        _TSSE_KERNEL(
-            (bpg,), (tpb,),
-            (ins_pos, cell_idx, lb, rb, tss_pos, tss_strand, 
-             len(ins_pos), window_size, half_smooth, data_cp)
-        )
-        
-        # 4. Process ends
-        ins_pos = (frags_sub['end'] - 1).values.astype('int32')
-        lb = tss_pos.searchsorted(ins_pos - window_size, side='left').astype('int32')
-        rb = tss_pos.searchsorted(ins_pos + window_size + 1, side='left').astype('int32')
-        
-        bpg = (len(ins_pos) + tpb - 1) // tpb
-        _TSSE_KERNEL(
-            (bpg,), (tpb,),
-            (ins_pos, cell_idx, lb, rb, tss_pos, tss_strand, 
-             len(ins_pos), window_size, half_smooth, data_cp)
-        )
-        
-        logger.debug(f"Processed {chrom}")
-
-    # =========================================================================
-    # Phase 2: Calculate TSSe Score
-    # =========================================================================
-    # data_cp columns: 0=bg_left, 1=center_smoothed, 2=bg_right
-    tss_signal = data_cp[:, 1] / smooth_window
-    bg_signal = (data_cp[:, 0] / 100 + data_cp[:, 2] / 100) / 2
-    tsse_scores = tss_signal / (bg_signal + 0.1)
-    
-    # 7. Collect results
-    results = cudf.DataFrame({
-        'barcode': unique_barcodes,
-        'tsse_score': tsse_scores
-    })
-    
-    # Merge with QC metrics
-    results = results.merge(final_qc, on='barcode')
-    
-    return results
-
-
-# =============================================================================
-# Polars GPU Streaming Implementation
-# =============================================================================
-
-def load_tss_from_gtf_polars(gtf_path: str | Path) -> 'pl.DataFrame':
-    """
-    Load TSS locations from a GTF file using Polars (for streaming pipeline).
+    Load TSS locations from a GTF file using Polars.
     
     Parameters
     ----------
@@ -343,7 +115,7 @@ def load_tss_from_gtf_polars(gtf_path: str | Path) -> 'pl.DataFrame':
     return tss_df
 
 
-def compute_metrics_streaming(
+def compute_metrics(
     parquet_path: str | Path,
     tss_df: 'pl.DataFrame',
     window_size: int = 2000,
@@ -364,7 +136,7 @@ def compute_metrics_streaming(
     parquet_path : str or Path
         Path to the parquet file containing ATAC fragments.
     tss_df : pl.DataFrame
-        TSS data from load_tss_from_gtf_polars
+        TSS data from load_tss_from_gtf
     window_size : int
         Distance around TSS to consider (default: 2000)
     smooth_window : int

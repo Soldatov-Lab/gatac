@@ -813,65 +813,159 @@ def call_peaks(
     else:
         return peaks_dict
 
-
-def _remove_overlapping_peaks_gpu(starts_cp, ends_cp, keep_mask_cp):
+@njit(cache=True, parallel=True)
+def _iterative_merge_numba(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    p_values: np.ndarray,
+    group_ids: np.ndarray,
+    n_groups: int,
+) -> np.ndarray:
     """
-    GPU-accelerated removal of overlapping peaks.
+    Numba-accelerated iterative merge for all groups at once.
     
-    Uses vectorized operations to check if each peak overlaps with any
-    previously kept peak. Processes peaks in order of significance (p-value).
+    For each group of overlapping peaks, repeatedly select the most significant
+    peak (highest p_value = -log10(p)), remove all overlapping peaks, repeat.
     
     Parameters
     ----------
-    starts_cp : cp.ndarray
-        Peak start positions (sorted by p-value)
-    ends_cp : cp.ndarray
-        Peak end positions (sorted by p-value)
-    keep_mask_cp : cp.ndarray (bool)
-        Boolean mask, initially all True, updated to False for overlapping peaks
+    starts : np.ndarray
+        Peak start positions (sorted by position within each chromosome)
+    ends : np.ndarray
+        Peak end positions
+    p_values : np.ndarray
+        Peak p-values (-log10(p), higher = more significant)
+    group_ids : np.ndarray
+        Group ID for each peak (peaks with same ID are overlapping)
+    n_groups : int
+        Total number of groups
         
     Returns
     -------
-    cp.ndarray (bool)
-        Updated mask where True indicates peaks to keep
+    np.ndarray
+        Boolean mask where True indicates peaks to keep
     """
-    n_peaks = len(starts_cp)
+    n = len(starts)
+    keep_mask = np.zeros(n, dtype=np.bool_)
     
-    # Process in chunks to avoid memory explosion with large peak sets
-    chunk_size = min(5000, n_peaks)
+    # Pre-compute group boundaries for faster access
+    # Find first and last index of each group
+    group_start_idx = np.zeros(n_groups, dtype=np.int64)
+    group_end_idx = np.zeros(n_groups, dtype=np.int64)
     
-    for i in range(0, n_peaks, chunk_size):
-        chunk_end = min(i + chunk_size, n_peaks)
+    # Since data is sorted by position and groups are contiguous, 
+    # we can find boundaries efficiently
+    if n > 0:
+        group_start_idx[0] = 0
+        for i in range(1, n):
+            if group_ids[i] != group_ids[i-1]:
+                group_end_idx[group_ids[i-1]] = i
+                group_start_idx[group_ids[i]] = i
+        group_end_idx[group_ids[n-1]] = n
+    
+    # Process each group in parallel
+    for group_id in prange(n_groups):
+        start_i = group_start_idx[group_id]
+        end_i = group_end_idx[group_id]
+        n_group = end_i - start_i
         
-        # For each peak in this chunk, check against all previously kept peaks
-        chunk_starts = starts_cp[i:chunk_end]
-        chunk_ends = ends_cp[i:chunk_end]
-        chunk_size_actual = len(chunk_starts)
+        if n_group == 0:
+            continue
         
-        if i > 0:
-            # Get all previously kept peaks
-            prev_kept_mask = keep_mask_cp[:i]
-            prev_kept_indices = cp.where(prev_kept_mask)[0]
+        if n_group == 1:
+            keep_mask[start_i] = True
+            continue
+        
+        # Track which peaks in the group are still available
+        available = np.ones(n_group, dtype=np.bool_)
+        
+        while True:
+            # Find the best available peak (highest p_value)
+            best_local_idx = -1
+            best_pval = -np.inf
             
-            if len(prev_kept_indices) > 0:
-                prev_starts = starts_cp[prev_kept_indices]
-                prev_ends = ends_cp[prev_kept_indices]
-                
-                # Check overlap: chunk_peak overlaps prev_peak if
-                # chunk_start < prev_end AND chunk_end > prev_start
-                # Shape: (chunk_size, n_prev_kept)
-                overlaps = (
-                    (chunk_starts[:, None] < prev_ends[None, :]) &
-                    (chunk_ends[:, None] > prev_starts[None, :])
-                )
-                
-                # If any overlap exists for a peak, mark it as not kept
-                has_overlap = cp.any(overlaps, axis=1)
-                keep_mask_cp[i:chunk_end] = keep_mask_cp[i:chunk_end] & ~has_overlap
-                
-                del overlaps, has_overlap, prev_starts, prev_ends
+            for i in range(n_group):
+                if available[i]:
+                    idx = start_i + i
+                    if p_values[idx] > best_pval:
+                        best_pval = p_values[idx]
+                        best_local_idx = i
+            
+            if best_local_idx == -1:
+                break
+            
+            # Keep this peak
+            best_idx = start_i + best_local_idx
+            keep_mask[best_idx] = True
+            
+            # Remove all overlapping peaks
+            best_start = starts[best_idx]
+            best_end = ends[best_idx]
+            
+            for i in range(n_group):
+                if available[i]:
+                    idx = start_i + i
+                    # Check overlap: start < best_end AND end > best_start
+                    if starts[idx] < best_end and ends[idx] > best_start:
+                        available[i] = False
     
-    return keep_mask_cp
+    return keep_mask
+
+
+@njit(cache=True)
+def _find_overlapping_groups_with_chroms_numba(
+    starts: np.ndarray, 
+    ends: np.ndarray, 
+    chroms: np.ndarray
+) -> tuple:
+    """
+    Numba-accelerated function to find groups of overlapping intervals with chromosome awareness.
+    
+    Given sorted intervals by (chromosome, start), assigns a group ID to each interval.
+    Intervals that overlap (or are adjacent) within the same chromosome get the same group ID.
+    Chromosome changes always start a new group.
+    
+    Parameters
+    ----------
+    starts : np.ndarray
+        Start positions (must be sorted by chrom, then start)
+    ends : np.ndarray
+        End positions
+    chroms : np.ndarray
+        Chromosome codes (integers)
+        
+    Returns
+    -------
+    tuple
+        (group_ids array, number of groups)
+    """
+    n = len(starts)
+    if n == 0:
+        return np.zeros(0, dtype=np.int64), 0
+    
+    group_ids = np.zeros(n, dtype=np.int64)
+    current_group = 0
+    current_end = ends[0]
+    current_chrom = chroms[0]
+    
+    for i in range(1, n):
+        # New group if chromosome changes or no overlap
+        if chroms[i] != current_chrom:
+            # Chromosome change - start new group
+            current_group += 1
+            current_chrom = chroms[i]
+            current_end = ends[i]
+        elif starts[i] <= current_end:
+            # Same chromosome, overlapping - extend group
+            if ends[i] > current_end:
+                current_end = ends[i]
+        else:
+            # Same chromosome, no overlap - new group
+            current_group += 1
+            current_end = ends[i]
+        group_ids[i] = current_group
+    
+    return group_ids, current_group + 1
 
 
 def merge_peaks(
@@ -884,11 +978,15 @@ def merge_peaks(
 ) -> Optional[pd.DataFrame]:
     """Merge peaks from different groups into fixed-width, non-overlapping peaks.
 
-    This mirrors the behavior of SnapATAC2's `merge_peaks` by expanding each peak
-    summit by `half_width` on both sides, then iteratively keeping the most
-    significant peak (smallest p-value) and discarding any overlapping peaks.
+    This mirrors the behavior of SnapATAC2's `merge_peaks` by:
+    1. Expanding each peak summit by `half_width` on both sides (+1 for half-open intervals)
+    2. Sorting all peaks by genomic position
+    3. Grouping overlapping/adjacent peaks
+    4. Within each group, iteratively keeping the most significant peak (highest -log10 p-value)
+       and discarding any overlapping peaks
     
-    GPU-accelerated for improved performance on large peak sets.
+    This algorithm matches SnapATAC2's Rust implementation which uses merge_sorted_bed_with
+    to group overlapping intervals before applying iterative_merge.
 
     Parameters
     ----------
@@ -961,7 +1059,7 @@ def merge_peaks(
     required_cols = {"chrom", "start", "end", "p_value"}
     expanded_peaks = []
 
-    # Process each group's peaks
+    # Process each group's peaks - expand summits to fixed width
     for _, df in peaks_dict.items():
         if df is None or len(df) == 0:
             continue
@@ -969,45 +1067,23 @@ def merge_peaks(
         if missing:
             raise ValueError(f"Missing required columns in peaks: {sorted(missing)}")
 
-        # Convert to cuDF for GPU operations
-        df_gpu = cudf.DataFrame(df)
+        df_copy = df.copy()
         
-        # Calculate summit position
-        if "peak" in df_gpu.columns:
-            summit = df_gpu["start"].astype(int) + df_gpu["peak"].astype(int)
+        # Calculate summit position using numpy for speed
+        start_vals = df_copy["start"].values.astype(np.int64)
+        if "peak" in df_copy.columns:
+            peak_vals = df_copy["peak"].values.astype(np.int64)
+            summit = start_vals + peak_vals
         else:
-            summit = ((df_gpu["start"].astype(int) + df_gpu["end"].astype(int)) // 2).astype(int)
+            end_vals = df_copy["end"].values.astype(np.int64)
+            summit = (start_vals + end_vals) // 2
 
-        # Expand to fixed width
-        df_gpu["start"] = summit - half_width
-        df_gpu["end"] = summit + half_width
-        df_gpu["peak"] = half_width
+        # Expand to fixed width - match SnapATAC2's half-open interval convention
+        df_copy["start"] = summit - half_width
+        df_copy["end"] = summit + half_width + 1  # +1 for half-open interval
+        df_copy["peak"] = half_width
 
-        # Clamp to chromosome sizes on GPU
-        for chrom in df_gpu['chrom'].unique().to_pandas():
-            chrom_size = chrom_sizes.get(chrom)
-            if chrom_size is None:
-                continue
-            
-            chrom_mask = (df_gpu['chrom'] == chrom).to_cupy()
-            
-            # Work directly with cupy arrays to avoid index alignment issues
-            starts_all = df_gpu['start'].to_cupy()
-            ends_all = df_gpu['end'].to_cupy()
-            
-            # Clip only the chromosome-specific values
-            starts_all[chrom_mask] = cp.clip(starts_all[chrom_mask], 0, max(chrom_size - 1, 0))
-            ends_all[chrom_mask] = cp.clip(ends_all[chrom_mask], 1, chrom_size)
-            ends_all[chrom_mask] = cp.maximum(ends_all[chrom_mask], starts_all[chrom_mask] + 1)
-            
-            # Assign back the entire columns
-            df_gpu['start'] = cudf.Series(starts_all)
-            df_gpu['end'] = cudf.Series(ends_all)
-
-        expanded_peaks.append(df_gpu.to_pandas())
-        
-        del df_gpu
-        mempool.free_all_blocks()
+        expanded_peaks.append(df_copy)
 
     if len(expanded_peaks) == 0:
         result = pd.DataFrame()
@@ -1016,51 +1092,84 @@ def merge_peaks(
             return None
         return result
 
-    # Concatenate all peaks
+    # Concatenate all peaks and move to GPU
     all_peaks = pd.concat(expanded_peaks, ignore_index=True)
-    
-    # Convert to cuDF for GPU-accelerated merging
     all_peaks_gpu = cudf.DataFrame(all_peaks)
     
-    merged_chunks = []
+    # Get arrays on GPU
+    starts_cp = all_peaks_gpu['start'].to_cupy().astype(cp.int64)
+    ends_cp = all_peaks_gpu['end'].to_cupy().astype(cp.int64)
+    p_values_cp = all_peaks_gpu['p_value'].to_cupy().astype(cp.float64)
     
-    # Process each chromosome separately
-    for chrom in all_peaks_gpu['chrom'].unique().to_pandas():
-        chrom_df = all_peaks_gpu[all_peaks_gpu['chrom'] == chrom]
-        
-        if len(chrom_df) == 0:
+    # Create chromosome encoding on GPU
+    chrom_cat = all_peaks_gpu['chrom'].astype('category')
+    chrom_codes_cp = chrom_cat.cat.codes.to_cupy().astype(cp.int32)
+    unique_chroms = chrom_cat.cat.categories.to_pandas().tolist()
+    
+    # Clip peaks to chromosome boundaries on GPU (vectorized)
+    for i, chrom in enumerate(unique_chroms):
+        chrom_size = chrom_sizes.get(chrom)
+        if chrom_size is None:
             continue
-        
-        # Sort by p-value (descending = most significant first, since p-values are -log10)
-        chrom_df = chrom_df.sort_values("p_value", ascending=False)
-        
-        # Get GPU arrays
-        starts_cp = chrom_df['start'].to_cupy().astype(cp.int64)
-        ends_cp = chrom_df['end'].to_cupy().astype(cp.int64)
-        
-        # Initialize keep mask (all True initially)
-        keep_mask_cp = cp.ones(len(starts_cp), dtype=bool)
-        
-        # Remove overlapping peaks using GPU
-        keep_mask_cp = _remove_overlapping_peaks_gpu(starts_cp, ends_cp, keep_mask_cp)
-        
-        # Filter to kept peaks
-        keep_mask_cpu = cp.asnumpy(keep_mask_cp)
-        chrom_df_filtered = chrom_df.to_pandas()[keep_mask_cpu]
-        
-        if len(chrom_df_filtered) > 0:
-            merged_chunks.append(chrom_df_filtered)
-        
-        del starts_cp, ends_cp, keep_mask_cp, chrom_df
-        mempool.free_all_blocks()
+        mask = chrom_codes_cp == i
+        starts_cp[mask] = cp.clip(starts_cp[mask], 0, chrom_size - 1)
+        ends_cp[mask] = cp.clip(ends_cp[mask], 1, chrom_size)
     
-    if len(merged_chunks) == 0:
+    # Global sort: by chromosome code, then by start, then by end
+    # Use composite key for stable sorting on GPU
+    max_pos = int(cp.max(ends_cp)) + 1
+    sort_key = (chrom_codes_cp.astype(cp.int64) * (max_pos * max_pos) + 
+                starts_cp * max_pos + ends_cp)
+    global_sort_idx = cp.argsort(sort_key)
+    
+    # Apply sort to all arrays
+    sorted_starts = starts_cp[global_sort_idx]
+    sorted_ends = ends_cp[global_sort_idx]
+    sorted_pvals = p_values_cp[global_sort_idx]
+    sorted_chroms = chrom_codes_cp[global_sort_idx]
+    
+    # Process ALL chromosomes in ONE batch using combined approach:
+    # 1. Find overlapping groups (treating chromosome changes as group boundaries)
+    # 2. Run iterative merge on all groups in parallel
+    
+    # Find overlapping groups with chromosome boundaries
+    # A new group starts when: (a) chromosome changes OR (b) no overlap with previous
+    n = len(sorted_starts)
+    
+    # Transfer to CPU once for the grouping/merge algorithm
+    sorted_starts_np = cp.asnumpy(sorted_starts)
+    sorted_ends_np = cp.asnumpy(sorted_ends)
+    sorted_pvals_np = cp.asnumpy(sorted_pvals)
+    sorted_chroms_np = cp.asnumpy(sorted_chroms)
+    
+    # Use optimized numba function for grouping with chromosome awareness
+    group_ids_np, n_groups = _find_overlapping_groups_with_chroms_numba(
+        sorted_starts_np, sorted_ends_np, sorted_chroms_np
+    )
+    
+    # Run parallel iterative merge across all groups
+    keep_mask_np = _iterative_merge_numba(
+        sorted_starts_np, sorted_ends_np, sorted_pvals_np, group_ids_np, n_groups
+    )
+    
+    # Transfer result back to GPU
+    keep_mask_cp = cp.asarray(keep_mask_np)
+    
+    # Get kept indices in original order
+    kept_sorted_indices = cp.where(keep_mask_cp)[0]
+    kept_original_indices = global_sort_idx[kept_sorted_indices]
+    
+    # Filter on GPU and convert back
+    if len(kept_original_indices) == 0:
         result = pd.DataFrame(columns=all_peaks.columns)
     else:
-        result = pd.concat(merged_chunks, ignore_index=True)
+        # Use GPU filtering
+        result_gpu = all_peaks_gpu.iloc[cp.asnumpy(kept_original_indices)]
+        result = result_gpu.to_pandas()
     
-    # Cleanup
-    del all_peaks_gpu
+    # Cleanup GPU memory
+    del all_peaks_gpu, starts_cp, ends_cp, p_values_cp, chrom_codes_cp
+    del sorted_starts, sorted_ends, sorted_pvals, sorted_chroms, global_sort_idx
     mempool.free_all_blocks()
     pinned_mempool.free_all_blocks()
     

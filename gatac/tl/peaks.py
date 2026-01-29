@@ -66,7 +66,13 @@ def _pileup(starts, ends, chr_length, offset):
 
 
 def _compute_peaks(q_vals, thresh=0.1):
-    """Filter peaks based on q-values. Return indices where q-value >= thresh."""
+    """
+    Filter peaks based on q-values. Return indices where q-value >= thresh.
+    
+    Note: Both q_vals and thresh are in -log10 space, so higher values
+    are more significant. Returning q_vals >= thresh means returning
+    positions where the actual q-value <= 10^(-thresh).
+    """
     peaks = cp.where((q_vals >= thresh))[0]
     return peaks
 
@@ -126,9 +132,11 @@ def _calculate_peak_summits_numba(starts, ends, signal):
 
 def _calculate_peak_summits(peaks, signal):
     """
-    Compute peak summits (highest point in each peak).
+    Compute peak summits (most significant point in each peak).
     
-    The highest point corresponds to the lowest q-value (most significant).
+    The signal is expected to be log10(p-value), so more negative values
+    are more significant. This finds the position of minimum signal
+    (most significant p-value) within each peak region.
     Uses numba JIT for efficiency.
     """
     if len(peaks) == 0:
@@ -147,14 +155,17 @@ def _fdr(unique_p_values, unique_p_counts):
     Parameters
     ----------
     unique_p_values : cp.ndarray
-        Vector of unique p-values (log10 transformed)
+        Vector of unique p-values in log10 space (negative values,
+        e.g., log10(0.001) = -3). More negative = more significant.
     unique_p_counts : cp.ndarray
         Counts for each unique p-value
         
     Returns
     -------
     tuple
-        (sorted_keys, sorted_values) as cupy arrays, pre-sorted for efficient lookup
+        (sorted_keys, sorted_values) as cupy arrays, pre-sorted for efficient lookup.
+        Keys are in log10 space (negative), values are -log10(q) (positive,
+        higher = more significant).
     """
     unique_p_values = -1 * unique_p_values
     sorted_indices = cp.argsort(unique_p_values)[::-1]
@@ -334,6 +345,7 @@ def _call_peaks_chrom(
 
     p_values[p_values == -cp.inf] = -1000
     q_values[q_values == cp.inf] = 1000
+    q_values[q_values == -cp.inf] = 1000  # Handle negative infinity (very significant peaks)
 
     peaks = _compute_peaks(q_values, q_thresh_log)
 
@@ -1019,8 +1031,8 @@ def merge_peaks(
         if len(chrom_df) == 0:
             continue
         
-        # Sort by p-value (ascending = most significant first)
-        chrom_df = chrom_df.sort_values("p_value", ascending=True)
+        # Sort by p-value (descending = most significant first, since p-values are -log10)
+        chrom_df = chrom_df.sort_values("p_value", ascending=False)
         
         # Get GPU arrays
         starts_cp = chrom_df['start'].to_cupy().astype(cp.int64)
@@ -1060,7 +1072,8 @@ def merge_peaks(
         result_gpu = cudf.DataFrame(result)
         
         # Sort by p-value to ensure most significant is first in each group
-        result_gpu = result_gpu.sort_values('p_value', ascending=True)
+        # p-values are -log10(p), so higher values are MORE significant
+        result_gpu = result_gpu.sort_values('p_value', ascending=False)
         
         # Drop duplicates based on (chrom, start, end), keeping first (most significant)
         result_gpu = result_gpu.drop_duplicates(

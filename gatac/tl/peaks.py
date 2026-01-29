@@ -1052,6 +1052,31 @@ def merge_peaks(
     mempool.free_all_blocks()
     pinned_mempool.free_all_blocks()
     
+    # Deduplicate exact duplicates (same chrom, start, end) keeping most significant
+    if len(result) > 0 and 'p_value' in result.columns:
+        logger.debug(f"Deduplicating {len(result):,} peaks...")
+        
+        # Convert to cuDF for GPU-accelerated groupby
+        result_gpu = cudf.DataFrame(result)
+        
+        # Sort by p-value to ensure most significant is first in each group
+        result_gpu = result_gpu.sort_values('p_value', ascending=True)
+        
+        # Drop duplicates based on (chrom, start, end), keeping first (most significant)
+        result_gpu = result_gpu.drop_duplicates(
+            subset=['chrom', 'start', 'end'],
+            keep='first'
+        )
+        
+        # Convert back to pandas
+        result = result_gpu.to_pandas()
+        
+        del result_gpu
+        mempool.free_all_blocks()
+        pinned_mempool.free_all_blocks()
+        
+        logger.debug(f"After deduplication: {len(result):,} peaks")
+    
     # Store in AnnData if requested
     if adata is not None and inplace:
         adata.uns[key_added] = result

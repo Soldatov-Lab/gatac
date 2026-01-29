@@ -18,6 +18,7 @@ from typing import Literal, Optional, Union
 import cupy as cp
 import numpy as np
 import polars as pl
+from numba import njit
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ def _open_fasta(fasta_path: Union[str, Path]):
     if str(fasta_path).endswith('.gz'):
         # Decompress gzip file to temporary location using rapidgzip
         import rapidgzip
+        import shutil
         
         logger.info(f"Decompressing {fasta_path.name} using rapidgzip...")
         
@@ -81,7 +83,6 @@ def _open_fasta(fasta_path: Union[str, Path]):
             
         finally:
             # Cleanup temp files
-            import shutil
             try:
                 shutil.rmtree(temp_dir)
             except Exception as e:
@@ -401,6 +402,101 @@ def _reverse_complement_encoded(encoded: cp.ndarray) -> cp.ndarray:
 # =============================================================================
 
 
+@njit(cache=True)
+def _compute_score_threshold_jit(
+    pwm_log_odds: np.ndarray,
+    bg: np.ndarray,
+    pvalue: float,
+    precision: float,
+) -> float:
+    """
+    Numba JIT-compiled score threshold computation.
+    
+    This is the performance-critical inner function that uses dynamic programming
+    to compute the score distribution and find the threshold for a given p-value.
+    """
+    motif_len = pwm_log_odds.shape[0]
+    
+    # Compute score range
+    min_scores = np.empty(motif_len, dtype=np.float64)
+    max_scores = np.empty(motif_len, dtype=np.float64)
+    
+    for i in range(motif_len):
+        min_val = pwm_log_odds[i, 0]
+        max_val = pwm_log_odds[i, 0]
+        for j in range(1, 4):
+            if pwm_log_odds[i, j] < min_val:
+                min_val = pwm_log_odds[i, j]
+            if pwm_log_odds[i, j] > max_val:
+                max_val = pwm_log_odds[i, j]
+        min_scores[i] = min_val
+        max_scores[i] = max_val
+    
+    total_min = 0.0
+    total_max = 0.0
+    for i in range(motif_len):
+        total_min += min_scores[i]
+        total_max += max_scores[i]
+    
+    if total_min >= total_max:
+        return 0.0
+    
+    # Create score bins
+    num_bins_float = (total_max - total_min) / precision
+    num_bins = int(num_bins_float + 0.999999)  # ceil
+    if num_bins > 100000:
+        num_bins = 100000
+    step = (total_max - total_min) / num_bins
+    
+    # Initialize probability distribution
+    accum = np.zeros(num_bins + 1, dtype=np.float64)
+    accum[0] = 1.0
+    new_accum = np.zeros(num_bins + 1, dtype=np.float64)
+    
+    # Process each position
+    for pos in range(motif_len):
+        # Reset new_accum
+        for i in range(num_bins + 1):
+            new_accum[i] = 0.0
+        
+        pos_min = min_scores[pos]
+        
+        # For each nucleotide
+        for j in range(4):
+            score_diff = pwm_log_odds[pos, j] - pos_min
+            shift = int(score_diff / step)
+            if shift < 0:
+                shift = 0
+            elif shift > num_bins:
+                shift = num_bins
+            
+            weight = bg[j]
+            
+            if shift == 0:
+                for i in range(num_bins + 1):
+                    new_accum[i] += accum[i] * weight
+            else:
+                # Shift probabilities
+                for i in range(shift, num_bins + 1):
+                    new_accum[i] += accum[i - shift] * weight
+        
+        # Swap accumulators
+        accum, new_accum = new_accum, accum
+    
+    # Compute CDF and find threshold
+    cdf_val = 0.0
+    target = 1.0 - pvalue
+    idx = num_bins
+    
+    for i in range(num_bins + 1):
+        cdf_val += accum[i]
+        if cdf_val >= target:
+            idx = i
+            break
+    
+    return total_min + (idx + 0.5) * step
+
+
 def _compute_score_threshold(
     pwm_log_odds: np.ndarray,
     bg_probs: tuple[float, float, float, float],
@@ -408,10 +504,7 @@ def _compute_score_threshold(
     precision: float = 1e-4,
 ) -> float:
     """
-    Compute score threshold for given p-value using vectorized DP.
-    
-    This is an optimized implementation using NumPy vectorization instead
-    of Python loops for performance.
+    Compute score threshold for given p-value using optimized JIT DP.
     
     Parameters
     ----------
@@ -430,62 +523,7 @@ def _compute_score_threshold(
         Score threshold
     """
     bg = np.array(bg_probs, dtype=np.float64)
-    
-    # Compute score range
-    min_scores = pwm_log_odds.min(axis=1)
-    max_scores = pwm_log_odds.max(axis=1)
-    
-    total_min = min_scores.sum()
-    total_max = max_scores.sum()
-    
-    if total_min >= total_max:
-        return 0.0
-    
-    # Create score bins
-    num_bins = min(int(np.ceil((total_max - total_min) / precision)), 100000)
-    step = (total_max - total_min) / num_bins
-    
-    # Initialize probability distribution
-    accum = np.zeros(num_bins + 1, dtype=np.float64)
-    # Start with all probability at the minimum score position 
-    accum[0] = 1.0
-    
-    # Process each position vectorized
-    for pos in range(len(pwm_log_odds)):
-        pos_scores = pwm_log_odds[pos]
-        
-        # Compute index shifts for each nucleotide
-        # How many bins does each nucleotide score shift us?
-        shifts = ((pos_scores - min_scores[pos]) / step).astype(np.int64)
-        shifts = np.clip(shifts, 0, num_bins)
-        
-        # New accumulator
-        new_accum = np.zeros(num_bins + 1, dtype=np.float64)
-        
-        # For each nucleotide, shift and add weighted probability
-        for j in range(4):
-            shift = shifts[j]
-            weight = bg[j]
-            if shift == 0:
-                new_accum += accum * weight
-            else:
-                # Shift probabilities by 'shift' bins
-                new_accum[shift:] += accum[:-shift] * weight
-        
-        accum = new_accum
-    
-    # Compute CDF (probability of scoring <= threshold)
-    cdf = np.cumsum(accum)
-    
-    # Find threshold for p-value (1 - pvalue quantile)
-    # We want the score where CDF >= (1 - pvalue)
-    target = 1.0 - pvalue
-    idx = np.searchsorted(cdf, target)
-    if idx >= len(cdf):
-        idx = len(cdf) - 1
-    
-    # Convert bin index to score
-    return total_min + (idx + 0.5) * step
+    return _compute_score_threshold_jit(pwm_log_odds, bg, pvalue, precision)
 
 
 def _scan_motif_gpu(
@@ -878,6 +916,28 @@ def motif_enrichment(
     else:
         rc_seqs = None
     
+    # OPTIMIZATION: Precompute indices as numpy arrays once
+    bg_indices_np = None
+    if background is not None:
+        bg_indices_np = np.array([region_to_idx[r] for r in background], dtype=np.int32)
+    
+    fg_indices_dict = {}
+    for group_name, group_regions in regions.items():
+        fg_indices_dict[group_name] = np.array(
+            [region_to_idx[r] for r in group_regions], dtype=np.int32
+        )
+    
+    # OPTIMIZATION: Precompute all thresholds using Numba JIT
+    logger.info("Precomputing score thresholds for all motifs...")
+    
+    pwm_list = [motif.to_log_odds(bg_probs) for motif in motifs]
+    bg_array = np.array(bg_probs, dtype=np.float64)
+    
+    # Compute thresholds using JIT-compiled function
+    thresholds = np.empty(len(motifs), dtype=np.float64)
+    for i, pwm in enumerate(pwm_list):
+        thresholds[i] = _compute_score_threshold_jit(pwm, bg_array, pvalue, 1e-4)
+    
     # Prepare result storage
     motif_ids = []
     motif_names = []
@@ -892,10 +952,9 @@ def motif_enrichment(
     logger.info(f"Scanning {len(motifs)} motifs across {len(all_regions)} regions...")
     
     # Process each motif (sequences stay on GPU)
-    for motif in tqdm(motifs, desc="Motifs"):
-        # Compute threshold
-        pwm_log_odds = motif.to_log_odds(bg_probs)
-        threshold = _compute_score_threshold(pwm_log_odds, bg_probs, pvalue)
+    for i, motif in enumerate(tqdm(motifs, desc="Motifs")):
+        pwm_log_odds = pwm_list[i]
+        threshold = thresholds[i]
         
         # Transfer PWM to GPU
         pwm_gpu = cp.asarray(pwm_log_odds, dtype=cp.float32)
@@ -906,19 +965,18 @@ def motif_enrichment(
         )
         bound = cp.asnumpy(bound)
         
-        # Compute background statistics
+        # Compute background statistics (using precomputed indices)
         if background is None:
             total_bg = len(bound)
             bound_bg = bound.sum()
         else:
-            bg_indices = [region_to_idx[r] for r in background]
             total_bg = len(background)
-            bound_bg = bound[bg_indices].sum()
+            bound_bg = bound[bg_indices_np].sum()
         
-        # Test each region group
+        # Test each region group (using precomputed indices)
         for group_name, group_regions in regions.items():
-            fg_indices = [region_to_idx[r] for r in group_regions]
-            total_fg = len(group_regions)
+            fg_indices = fg_indices_dict[group_name]
+            total_fg = len(fg_indices)
             bound_fg = bound[fg_indices].sum()
             
             # Compute fold change

@@ -1116,7 +1116,7 @@ def _count_fragments_in_peaks_gpu(
         # - left_bound: first peak where peak_end > frag_start (overlap possible)
         
         # Process fragments in batches to manage memory
-        frag_batch_size = min(50000, n_frags)
+        frag_batch_size = min(150000, n_frags)
         
         for frag_batch_start in range(0, n_frags, frag_batch_size):
             frag_batch_end = min(frag_batch_start + frag_batch_size, n_frags)
@@ -1136,7 +1136,7 @@ def _count_fragments_in_peaks_gpu(
             
             # Use chunked broadcasting for remaining candidates
             # This is much smaller than full broadcast due to searchsorted pruning
-            peak_chunk_size = min(50000, n_chrom_peaks)
+            peak_chunk_size = min(10000, n_chrom_peaks)
             
             for peak_chunk_start in range(0, n_chrom_peaks, peak_chunk_size):
                 peak_chunk_end = min(peak_chunk_start + peak_chunk_size, n_chrom_peaks)

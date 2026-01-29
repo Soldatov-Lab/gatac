@@ -620,18 +620,20 @@ def _scan_motif_gpu(
     return forward_match | rc_match
 
 
-def _scan_motif_gpu_fast(
+def _scan_motifs_batch_gpu(
     encoded_seqs: cp.ndarray,
     seq_lengths: cp.ndarray,
-    pwm_log_odds: cp.ndarray,
-    threshold: float,
+    pwm_list: list[np.ndarray],
+    thresholds: np.ndarray,
     rc_seqs: Optional[cp.ndarray] = None,
-) -> cp.ndarray:
+    motif_batch_size: int = 32,
+    show_progress: bool = True,
+) -> np.ndarray:
     """
-    Fast GPU motif scanning with precomputed reverse complement.
+    Batch scan multiple motifs on GPU for improved throughput.
     
-    This version uses already-encoded sequences that stay on GPU across
-    multiple motif scans for better performance.
+    Groups motifs by length and processes them together to minimize
+    memory allocations and maximize GPU utilization.
     
     Parameters
     ----------
@@ -639,128 +641,142 @@ def _scan_motif_gpu_fast(
         Pre-encoded sequences on GPU, shape (n_seqs, max_len)
     seq_lengths : cp.ndarray
         Sequence lengths on GPU
-    pwm_log_odds : cp.ndarray
-        Log-odds PWM on GPU, shape (motif_len, 4)
-    threshold : float
-        Score threshold for match
+    pwm_list : list[np.ndarray]
+        List of log-odds PWM matrices (one per motif)
+    thresholds : np.ndarray
+        Score thresholds for each motif
     rc_seqs : cp.ndarray, optional
         Pre-computed reverse complement sequences. If None, RC not checked.
-        
-    Returns
-    -------
-    cp.ndarray
-        Boolean array of shape (n_seqs,) indicating motif presence
-    """
-    n_seqs, max_len = encoded_seqs.shape
-    motif_len = pwm_log_odds.shape[0]
-    
-    if max_len < motif_len:
-        return cp.zeros(n_seqs, dtype=cp.bool_)
-    
-    n_positions = max_len - motif_len + 1
-    
-    # Forward scan
-    scores = cp.zeros((n_seqs, n_positions), dtype=cp.float32)
-    valid_mask = cp.ones((n_seqs, n_positions), dtype=cp.bool_)
-    
-    for pos_in_motif in range(motif_len):
-        nucs = encoded_seqs[:, pos_in_motif:pos_in_motif + n_positions]
-        valid_mask &= (nucs >= 0)
-        nucs_safe = cp.clip(nucs, 0, 3)
-        scores += pwm_log_odds[pos_in_motif, nucs_safe]
-    
-    # Apply masks
-    scores = cp.where(valid_mask, scores, -cp.inf)
-    position_indices = cp.arange(n_positions, dtype=cp.int32)[None, :]
-    seq_len_mask = (position_indices + motif_len) <= seq_lengths[:, None]
-    scores = cp.where(seq_len_mask, scores, -cp.inf)
-    
-    forward_match = (scores >= threshold).any(axis=1)
-    
-    if rc_seqs is None:
-        return forward_match
-    
-    # Reverse complement scan (using precomputed RC)
-    rc_scores = cp.zeros((n_seqs, n_positions), dtype=cp.float32)
-    rc_valid_mask = cp.ones((n_seqs, n_positions), dtype=cp.bool_)
-    
-    for pos_in_motif in range(motif_len):
-        nucs = rc_seqs[:, pos_in_motif:pos_in_motif + n_positions]
-        rc_valid_mask &= (nucs >= 0)
-        nucs_safe = cp.clip(nucs, 0, 3)
-        rc_scores += pwm_log_odds[pos_in_motif, nucs_safe]
-    
-    rc_scores = cp.where(rc_valid_mask, rc_scores, -cp.inf)
-    rc_scores = cp.where(seq_len_mask, rc_scores, -cp.inf)
-    
-    return forward_match | (rc_scores >= threshold).any(axis=1)
-
-
-def _scan_motif_batch(
-    sequences: list[str],
-    motif: DNAMotif,
-    bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
-    pvalue: float = 1e-5,
-    check_rc: bool = True,
-    batch_size: int = 50000,
-) -> np.ndarray:
-    """
-    Scan sequences for motif matches with batching for memory efficiency.
-    
-    Parameters
-    ----------
-    sequences : list[str]
-        List of DNA sequences
-    motif : DNAMotif
-        Motif to scan for
-    bg_probs : tuple
-        Background nucleotide probabilities
-    pvalue : float
-        P-value threshold for match
-    check_rc : bool
-        Whether to check reverse complement
-    batch_size : int
-        Number of sequences per GPU batch
+    motif_batch_size : int
+        Number of motifs to process together per length group
+    show_progress : bool
+        Whether to show progress bar
         
     Returns
     -------
     np.ndarray
-        Boolean array indicating motif presence in each sequence
+        Boolean array of shape (n_motifs, n_seqs) indicating motif presence
     """
-    n_seqs = len(sequences)
-    if n_seqs == 0:
-        return np.zeros(0, dtype=np.bool_)
+    from tqdm.auto import tqdm
     
-    # Compute log-odds PWM and threshold on CPU
-    pwm_log_odds = motif.to_log_odds(bg_probs)
-    threshold = _compute_score_threshold(pwm_log_odds, bg_probs, pvalue)
+    n_seqs, max_len = encoded_seqs.shape
+    n_motifs = len(pwm_list)
     
-    # Transfer PWM to GPU
-    pwm_gpu = cp.asarray(pwm_log_odds, dtype=cp.float32)
+    # Pre-allocate result array
+    all_bound = np.zeros((n_motifs, n_seqs), dtype=np.bool_)
     
-    # Process in batches
-    results = []
-    for start in range(0, n_seqs, batch_size):
-        end = min(start + batch_size, n_seqs)
-        batch_seqs = sequences[start:end]
+    # Group motifs by length for efficient batch processing
+    length_to_motifs = {}
+    for i, pwm in enumerate(pwm_list):
+        motif_len = pwm.shape[0]
+        if motif_len not in length_to_motifs:
+            length_to_motifs[motif_len] = []
+        length_to_motifs[motif_len].append(i)
+    
+    # Create progress bar for motif processing
+    pbar = tqdm(total=n_motifs, desc="Motifs", disable=not show_progress)
+    
+    # Process each length group
+    for motif_len, motif_indices in length_to_motifs.items():
+        if max_len < motif_len:
+            pbar.update(len(motif_indices))
+            continue
         
-        # Encode batch
-        encoded, lengths = _encode_sequences_batch(batch_seqs)
+        n_positions = max_len - motif_len + 1
         
-        # Scan on GPU
-        matches = _scan_motif_gpu(encoded, lengths, pwm_gpu, threshold, check_rc)
+        # Precompute position indices and length mask for this motif length
+        position_indices = cp.arange(n_positions, dtype=cp.int32)[None, :]
+        seq_len_mask = (position_indices + motif_len) <= seq_lengths[:, None]
         
-        # Transfer result to CPU
-        results.append(cp.asnumpy(matches))
+        # Precompute valid nucleotide masks and safe nucleotide slices for forward strand
+        fw_valid_mask = cp.ones((n_seqs, n_positions), dtype=cp.bool_)
+        fw_nucs_safe_list = []
+        for pos_in_motif in range(motif_len):
+            nucs = encoded_seqs[:, pos_in_motif:pos_in_motif + n_positions]
+            fw_valid_mask &= (nucs >= 0)
+            fw_nucs_safe_list.append(cp.clip(nucs, 0, 3))
         
-        # Free GPU memory
-        del encoded, lengths, matches
-        mempool.free_all_blocks()
+        # Combine masks once
+        fw_combined_mask = fw_valid_mask & seq_len_mask
+        del fw_valid_mask
+        
+        # Precompute for reverse complement
+        rc_nucs_safe_list = None
+        rc_combined_mask = None
+        if rc_seqs is not None:
+            rc_valid_mask = cp.ones((n_seqs, n_positions), dtype=cp.bool_)
+            rc_nucs_safe_list = []
+            for pos_in_motif in range(motif_len):
+                nucs = rc_seqs[:, pos_in_motif:pos_in_motif + n_positions]
+                rc_valid_mask &= (nucs >= 0)
+                rc_nucs_safe_list.append(cp.clip(nucs, 0, 3))
+            rc_combined_mask = rc_valid_mask & seq_len_mask
+            del rc_valid_mask
+        
+        # Process motifs in batches within this length group
+        for batch_start in range(0, len(motif_indices), motif_batch_size):
+            batch_end = min(batch_start + motif_batch_size, len(motif_indices))
+            batch_motif_indices = motif_indices[batch_start:batch_end]
+            batch_size = len(batch_motif_indices)
+            
+            # Stack PWMs for this batch - shape: (batch_size, motif_len, 4)
+            batch_pwms = np.stack([pwm_list[i] for i in batch_motif_indices])
+            batch_pwms_gpu = cp.asarray(batch_pwms, dtype=cp.float32)
+            batch_thresholds = cp.asarray(thresholds[batch_motif_indices], dtype=cp.float32)
+            
+            # Forward scan - compute scores for all motifs in batch
+            # Shape: (batch_size, n_seqs, n_positions)
+            fw_scores = cp.zeros((batch_size, n_seqs, n_positions), dtype=cp.float32)
+            
+            for pos_in_motif in range(motif_len):
+                nucs_safe = fw_nucs_safe_list[pos_in_motif]
+                # batch_pwms_gpu[:, pos_in_motif, :] has shape (batch_size, 4)
+                # nucs_safe has shape (n_seqs, n_positions)
+                # Use advanced indexing for vectorized lookup
+                pos_scores = batch_pwms_gpu[:, pos_in_motif, :][:, nucs_safe]
+                fw_scores += pos_scores
+            
+            # Apply masks
+            fw_scores = cp.where(fw_combined_mask[None, :, :], fw_scores, -cp.inf)
+            
+            # Check threshold - shape: (batch_size, n_seqs)
+            fw_match = (fw_scores >= batch_thresholds[:, None, None]).any(axis=2)
+            
+            if rc_seqs is not None:
+                # Reverse complement scan
+                rc_scores = cp.zeros((batch_size, n_seqs, n_positions), dtype=cp.float32)
+                
+                for pos_in_motif in range(motif_len):
+                    nucs_safe = rc_nucs_safe_list[pos_in_motif]
+                    pos_scores = batch_pwms_gpu[:, pos_in_motif, :][:, nucs_safe]
+                    rc_scores += pos_scores
+                
+                rc_scores = cp.where(rc_combined_mask[None, :, :], rc_scores, -cp.inf)
+                rc_match = (rc_scores >= batch_thresholds[:, None, None]).any(axis=2)
+                
+                batch_bound = fw_match | rc_match
+                del rc_scores, rc_match
+            else:
+                batch_bound = fw_match
+            
+            # Transfer batch results to CPU
+            batch_bound_cpu = cp.asnumpy(batch_bound)
+            for local_idx, global_idx in enumerate(batch_motif_indices):
+                all_bound[global_idx] = batch_bound_cpu[local_idx]
+            
+            # Update progress bar
+            pbar.update(batch_size)
+            
+            del batch_pwms_gpu, fw_scores, fw_match, batch_bound
+        
+        # Free memory after processing this length group
+        del fw_nucs_safe_list, fw_combined_mask
+        if rc_nucs_safe_list is not None:
+            del rc_nucs_safe_list, rc_combined_mask
     
-    del pwm_gpu
-    mempool.free_all_blocks()
-    
-    return np.concatenate(results)
+    pbar.close()
+    return all_bound
+
 
 
 # =============================================================================
@@ -818,7 +834,7 @@ def motif_enrichment(
     pvalue: float = 1e-5,
     check_rc: bool = True,
     bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
-    batch_size: int = 50000,
+    motif_batch_size: int = 16,
 ) -> dict[str, pl.DataFrame]:
     """
     Identify enriched transcription factor motifs using GPU acceleration.
@@ -847,8 +863,9 @@ def motif_enrichment(
         Whether to check both strands (forward and reverse complement)
     bg_probs : tuple, default (0.25, 0.25, 0.25, 0.25)
         Background nucleotide probabilities (A, C, G, T)
-    batch_size : int, default 50000
-        Number of sequences to process per GPU batch
+    motif_batch_size : int, default 16
+        Number of motifs of the same length to process together on GPU.
+        Higher values increase GPU parallelism but use more memory.
         
     Returns
     -------
@@ -933,95 +950,100 @@ def motif_enrichment(
     pwm_list = [motif.to_log_odds(bg_probs) for motif in motifs]
     bg_array = np.array(bg_probs, dtype=np.float64)
     
-    # Compute thresholds using JIT-compiled function
+    # Compute thresholds using JIT-compiled function (parallelizable)
     thresholds = np.empty(len(motifs), dtype=np.float64)
     for i, pwm in enumerate(pwm_list):
         thresholds[i] = _compute_score_threshold_jit(pwm, bg_array, pvalue, 1e-4)
     
-    # Prepare result storage
+    logger.info(f"Scanning {len(motifs)} motifs across {len(all_regions)} regions...")
+    
+    # OPTIMIZATION: Batch scan all motifs at once using GPU
+    # This reduces GPU memory transfers and enables better parallelism
+    # Larger batch size = more GPU parallelism but more memory usage
+    all_bound = _scan_motifs_batch_gpu(
+        encoded_seqs, seq_lengths, pwm_list, thresholds, rc_seqs,
+        motif_batch_size=motif_batch_size
+    )
+    
+    # Free GPU memory after scanning
+    del encoded_seqs, seq_lengths, rc_seqs
+    mempool.free_all_blocks()
+    
+    # Compute statistics for all motifs at once using vectorized operations
+    n_motifs = len(motifs)
+    n_groups = len(regions)
+    n_seqs = all_bound.shape[1]
+    
+    # Precompute background statistics for all motifs at once
+    if background is None:
+        total_bg = n_seqs
+        bound_bg = all_bound.sum(axis=1)  # Shape: (n_motifs,)
+    else:
+        total_bg = len(background)
+        bound_bg = all_bound[:, bg_indices_np].sum(axis=1)  # Shape: (n_motifs,)
+    
+    # Preallocate result arrays
+    total_results = n_motifs * n_groups
     motif_ids = []
     motif_names = []
     motif_families = []
-    group_names = []
-    fold_changes = []
-    n_fg_list = []
-    N_fg_list = []
-    n_bg_list = []
-    N_bg_list = []
+    group_names_list = []
+    fold_changes = np.empty(total_results, dtype=np.float64)
+    n_fg_arr = np.empty(total_results, dtype=np.int32)
+    N_fg_arr = np.empty(total_results, dtype=np.int32)
+    n_bg_arr = np.empty(total_results, dtype=np.int32)
+    N_bg_arr = np.empty(total_results, dtype=np.int32)
     
-    logger.info(f"Scanning {len(motifs)} motifs across {len(all_regions)} regions...")
-    
-    # Process each motif (sequences stay on GPU)
-    for i, motif in enumerate(tqdm(motifs, desc="Motifs")):
-        pwm_log_odds = pwm_list[i]
-        threshold = thresholds[i]
+    result_idx = 0
+    for group_name, group_regions in regions.items():
+        fg_indices = fg_indices_dict[group_name]
+        total_fg = len(fg_indices)
         
-        # Transfer PWM to GPU
-        pwm_gpu = cp.asarray(pwm_log_odds, dtype=cp.float32)
+        # Vectorized foreground computation for all motifs
+        bound_fg = all_bound[:, fg_indices].sum(axis=1)  # Shape: (n_motifs,)
         
-        # Scan (sequences already on GPU)
-        bound = _scan_motif_gpu_fast(
-            encoded_seqs, seq_lengths, pwm_gpu, threshold, rc_seqs
-        )
-        bound = cp.asnumpy(bound)
-        
-        # Compute background statistics (using precomputed indices)
-        if background is None:
-            total_bg = len(bound)
-            bound_bg = bound.sum()
-        else:
-            total_bg = len(background)
-            bound_bg = bound[bg_indices_np].sum()
-        
-        # Test each region group (using precomputed indices)
-        for group_name, group_regions in regions.items():
-            fg_indices = fg_indices_dict[group_name]
-            total_fg = len(fg_indices)
-            bound_fg = bound[fg_indices].sum()
+        for i, motif in enumerate(motifs):
+            bf = bound_fg[i]
+            bb = bound_bg[i]
             
             # Compute fold change
-            if bound_fg == 0:
-                log_fc = 0.0 if bound_bg == 0 else float("-inf")
-            elif bound_bg == 0:
+            if bf == 0:
+                log_fc = 0.0 if bb == 0 else float("-inf")
+            elif bb == 0:
                 log_fc = float("inf")
             else:
-                fc = (bound_fg / total_fg) / (bound_bg / total_bg)
+                fc = (bf / total_fg) / (bb / total_bg)
                 log_fc = np.log2(fc) if fc > 0 else float("-inf")
             
-            # Store results
             motif_ids.append(motif.id)
             motif_names.append(motif.name)
             motif_families.append(motif.family)
-            group_names.append(group_name)
-            fold_changes.append(log_fc)
-            n_fg_list.append(int(bound_fg))
-            N_fg_list.append(total_fg)
-            n_bg_list.append(int(bound_bg))
-            N_bg_list.append(total_bg)
+            group_names_list.append(group_name)
+            fold_changes[result_idx] = log_fc
+            n_fg_arr[result_idx] = int(bf)
+            N_fg_arr[result_idx] = total_fg
+            n_bg_arr[result_idx] = int(bb)
+            N_bg_arr[result_idx] = total_bg
+            result_idx += 1
     
-    # Compute p-values
-    fold_changes = np.array(fold_changes)
-    p_values = np.zeros(len(fold_changes))
-    n_fg = np.array(n_fg_list)
-    N_fg = np.array(N_fg_list)
-    n_bg = np.array(n_bg_list)
-    N_bg = np.array(N_bg_list)
+    # Compute p-values (vectorized)
+    p_values = np.zeros(total_results)
     
     up_idx = fold_changes >= 0
     down_idx = fold_changes < 0
     
     if method == "binomial":
         # Binomial test
-        bg_prob = np.clip(n_bg / N_bg, 1e-10, 1 - 1e-10)
-        p_values[up_idx] = binom.sf(n_fg[up_idx] - 1, N_fg[up_idx], bg_prob[up_idx])
-        p_values[down_idx] = binom.cdf(n_fg[down_idx], N_fg[down_idx], bg_prob[down_idx])
+        bg_prob = np.clip(n_bg_arr / N_bg_arr, 1e-10, 1 - 1e-10)
+        p_values[up_idx] = binom.sf(n_fg_arr[up_idx] - 1, N_fg_arr[up_idx], bg_prob[up_idx])
+        p_values[down_idx] = binom.cdf(n_fg_arr[down_idx], N_fg_arr[down_idx], bg_prob[down_idx])
     elif method == "hypergeometric":
         # Hypergeometric test
         p_values[up_idx] = hypergeom.sf(
-            n_fg[up_idx] - 1, N_bg[up_idx], n_bg[up_idx], N_fg[up_idx]
+            n_fg_arr[up_idx] - 1, N_bg_arr[up_idx], n_bg_arr[up_idx], N_fg_arr[up_idx]
         )
         p_values[down_idx] = hypergeom.cdf(
-            n_fg[down_idx], N_bg[down_idx], n_bg[down_idx], N_fg[down_idx]
+            n_fg_arr[down_idx], N_bg_arr[down_idx], n_bg_arr[down_idx], N_fg_arr[down_idx]
         )
     else:
         raise ValueError(f"Unknown method: {method}. Use 'binomial' or 'hypergeometric'")
@@ -1033,7 +1055,7 @@ def motif_enrichment(
     unique_groups = list(regions.keys())
     
     for group in unique_groups:
-        group_mask = np.array([g == group for g in group_names])
+        group_mask = np.array([g == group for g in group_names_list])
         group_pvals = p_values[group_mask]
         adjusted_pvals = _p_adjust_bh(group_pvals)
         

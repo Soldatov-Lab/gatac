@@ -1062,10 +1062,10 @@ def merge_peaks(
 
 def _count_fragments_in_peaks_gpu(
     fragments_df: cudf.DataFrame,
-    peaks_gpu: cudf.DataFrame,
-    barcode_to_idx: dict,
+    peaks_by_chrom: dict,
+    barcode_mapping: cudf.DataFrame,
     n_peaks: int,
-) -> tuple[list, list, list]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Count fragment overlaps with peaks using GPU-accelerated operations.
     
@@ -1076,43 +1076,35 @@ def _count_fragments_in_peaks_gpu(
     ----------
     fragments_df : cudf.DataFrame
         Fragments with 'chrom', 'start', 'end', 'barcode' columns
-    peaks_gpu : cudf.DataFrame
-        Peaks with 'chrom', 'start', 'end', 'peak_idx' columns, sorted by chrom/start
-    barcode_to_idx : dict
-        Mapping from barcode to cell index
+    peaks_by_chrom : dict
+        Pre-grouped peaks dict: {chrom: (starts_cp, ends_cp, peak_indices_cp)}
+    barcode_mapping : cudf.DataFrame
+        Pre-created mapping with 'barcode' and 'cell_idx' columns
     n_peaks : int
         Total number of peaks
         
     Returns
     -------
-    tuple[list, list, list]
-        (rows, cols, data) for sparse matrix construction
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+        (rows, cols, data) as numpy arrays for sparse matrix construction
     """
-    # Pre-create barcode -> cell_idx mapping on GPU
-    barcode_mapping = cudf.DataFrame({
-        'barcode': list(barcode_to_idx.keys()),
-        'cell_idx': list(barcode_to_idx.values()),
-    })
-    
     all_results = []
     
     # Process each chromosome
     chroms = fragments_df['chrom'].unique().to_pandas()
     
     for chrom in chroms:
+        if chrom not in peaks_by_chrom:
+            continue
+            
         chrom_frags = fragments_df[fragments_df['chrom'] == chrom]
-        chrom_peaks = peaks_gpu[peaks_gpu['chrom'] == chrom]
+        peak_starts, peak_ends, peak_indices = peaks_by_chrom[chrom]
         
-        if len(chrom_peaks) == 0 or len(chrom_frags) == 0:
+        if len(chrom_frags) == 0:
             continue
         
         n_frags = len(chrom_frags)
-        n_chrom_peaks = len(chrom_peaks)
-        
-        # Get peak arrays on GPU (peaks are sorted by start)
-        peak_starts = chrom_peaks['start'].to_cupy()
-        peak_ends = chrom_peaks['end'].to_cupy()
-        peak_indices = chrom_peaks['peak_idx'].to_cupy()
+        n_chrom_peaks = len(peak_starts)
         
         # Get fragment arrays on GPU
         frag_starts = chrom_frags['start'].to_cupy()
@@ -1194,7 +1186,7 @@ def _count_fragments_in_peaks_gpu(
         mempool.free_all_blocks()
     
     if len(all_results) == 0:
-        return [], [], []
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
     
     # Concatenate all overlap results
     all_overlaps = cudf.concat(all_results, ignore_index=True)
@@ -1214,15 +1206,13 @@ def _count_fragments_in_peaks_gpu(
     # Aggregate by (cell_idx, peak_idx) using GPU groupby
     counts = all_overlaps.groupby(['cell_idx', 'peak_idx']).size().reset_index(name='count')
     
-    # Convert to CPU for sparse matrix construction
-    rows = counts['cell_idx'].to_pandas().tolist()
-    cols = counts['peak_idx'].to_pandas().tolist()
-    data = counts['count'].to_pandas().tolist()
+    # Convert to numpy arrays (not lists) for faster processing
+    rows = counts['cell_idx'].to_pandas().values
+    cols = counts['peak_idx'].to_pandas().values
+    data = counts['count'].to_pandas().values
     
     del all_overlaps, counts, frag_barcodes
     mempool.free_all_blocks()
-    
-    return rows, cols, data
     
     return rows, cols, data
 
@@ -1234,7 +1224,7 @@ def _read_and_count_fragments_batched(
     barcode_to_idx: dict,
     n_peaks: int,
     batch_size: int = 10,
-) -> tuple[list, list, list]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Read fragments from parquet in batches and count overlaps with peaks.
     
@@ -1257,8 +1247,8 @@ def _read_and_count_fragments_batched(
         
     Returns
     -------
-    tuple[list, list, list]
-        (rows, cols, data) for sparse matrix construction
+    tuple[np.ndarray, np.ndarray, np.ndarray]
+        (rows, cols, data) as numpy arrays for sparse matrix construction
     """
     import pyarrow.parquet as pq
     
@@ -1269,6 +1259,25 @@ def _read_and_count_fragments_batched(
     n_row_groups = pf.metadata.num_row_groups
     
     logger.debug(f"Reading {parquet_path.name}: {n_row_groups} row groups")
+    
+    # Pre-create barcode mapping on GPU (once)
+    barcode_mapping = cudf.DataFrame({
+        'barcode': list(barcode_to_idx.keys()),
+        'cell_idx': list(barcode_to_idx.values()),
+    })
+    
+    # Pre-create barcode Series for filtering (once)
+    barcodes_series = cudf.Series(list(barcodes))
+    
+    # Pre-group peaks by chromosome (once)
+    peaks_by_chrom = {}
+    for chrom in peaks_gpu['chrom'].unique().to_pandas():
+        chrom_peaks = peaks_gpu[peaks_gpu['chrom'] == chrom]
+        peaks_by_chrom[chrom] = (
+            chrom_peaks['start'].to_cupy(),
+            chrom_peaks['end'].to_cupy(),
+            chrom_peaks['peak_idx'].to_cupy(),
+        )
     
     all_rows = []
     all_cols = []
@@ -1294,33 +1303,34 @@ def _read_and_count_fragments_batched(
                 columns=['chrom', 'start', 'end', 'barcode'],
             )
             # Filter to target barcodes
-            barcodes_series = cudf.Series(list(barcodes))
             filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
             
             if len(filtered) > 0:
                 rows, cols, data = _count_fragments_in_peaks_gpu(
-                    filtered, peaks_gpu, barcode_to_idx, n_peaks
+                    filtered, peaks_by_chrom, barcode_mapping, n_peaks
                 )
                 return rows, cols, data
-            return [], [], []
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
         
         # Filter to target barcodes
-        barcodes_series = cudf.Series(list(barcodes))
         filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
         
         if len(filtered) > 0:
             rows, cols, data = _count_fragments_in_peaks_gpu(
-                filtered, peaks_gpu, barcode_to_idx, n_peaks
+                filtered, peaks_by_chrom, barcode_mapping, n_peaks
             )
-            all_rows.extend(rows)
-            all_cols.extend(cols)
-            all_data.extend(data)
+            all_rows.append(rows)
+            all_cols.append(cols)
+            all_data.append(data)
         
         del chunk_df, filtered
         mempool.free_all_blocks()
         pinned_mempool.free_all_blocks()
     
-    return all_rows, all_cols, all_data
+    # Concatenate all batches
+    if len(all_rows) > 0:
+        return np.concatenate(all_rows), np.concatenate(all_cols), np.concatenate(all_data)
+    return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
 
 def make_peak_matrix(
@@ -1519,43 +1529,41 @@ def make_peak_matrix(
             batch_size=batch_size,
         )
         
-        all_rows.extend(rows)
-        all_cols.extend(cols)
-        all_data.extend(data)
+        all_rows.append(rows)
+        all_cols.append(cols)
+        all_data.append(data)
         
         # Cleanup
         gc.collect()
         mempool.free_all_blocks()
         pinned_mempool.free_all_blocks()
     
-    # Aggregate duplicate (row, col) entries by summing
-    # This handles cases where same cell-peak pair appears in multiple batches
+    # Concatenate arrays and create sparse matrix
+    # scipy's coo_matrix + tocsr() will automatically aggregate duplicates (much faster than Counter)
     if len(all_rows) > 0:
-        from collections import Counter
-        aggregated = Counter()
-        for r, c, d in zip(all_rows, all_cols, all_data):
-            aggregated[(r, c)] += d
-        
-        all_rows = [k[0] for k in aggregated.keys()]
-        all_cols = [k[1] for k in aggregated.keys()]
-        all_data = list(aggregated.values())
+        all_rows = np.concatenate(all_rows)
+        all_cols = np.concatenate(all_cols)
+        all_data = np.concatenate(all_data)
+    else:
+        all_rows = np.array([], dtype=np.int32)
+        all_cols = np.array([], dtype=np.int32)
+        all_data = np.array([], dtype=np.int32)
     
-    # Create sparse matrix
-    count_matrix = sp.csr_matrix(
+    # Create sparse matrix (coo_matrix handles duplicates, tocsr() aggregates them)
+    count_matrix = sp.coo_matrix(
         (all_data, (all_rows, all_cols)),
         shape=(n_cells, n_peaks),
         dtype=np.int32,
-    )
+    ).tocsr()
     
     logger.info(f"Peak matrix: {n_cells:,} cells × {n_peaks:,} peaks")
     if n_cells * n_peaks > 0:
         logger.info(f"Sparsity: {100 * (1 - count_matrix.nnz / (n_cells * n_peaks)):.2f}%")
     
-    # Create peak names
-    peak_names = [
-        f"{row.chrom}:{row.start}-{row.end}"
-        for row in peaks_df.itertuples(index=False)
-    ]
+    # Create peak names (vectorized)
+    peak_names = (peaks_df['chrom'].astype(str) + ':' + 
+                  peaks_df['start'].astype(str) + '-' + 
+                  peaks_df['end'].astype(str)).tolist()
     
     if inplace:
         # Replace .X with peak matrix (not recommended)

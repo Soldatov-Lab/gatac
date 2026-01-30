@@ -6,6 +6,7 @@ Usage:
     gatac tile <input.parquet> [-o output] [-t tile_size] [-m min_frags]
     gatac features <input.h5ad> [-n n_features] [-o output]
     gatac metrics <input.parquet> -g <annotations.gtf> [-o output]
+    gatac filter <input.parquet> [--metrics metrics.csv] [--filter "query"]
 """
 
 import argparse
@@ -173,6 +174,69 @@ def metrics_command(args):
     logging.info(f"Successfully processed {len(results):,} cells.")
 
 
+def filter_command(args):
+    """Handle 'gatac filter' subcommand."""
+    import glob
+    
+    # Expand inputs - support glob patterns
+    input_paths = []
+    for inp in args.input:
+        if '*' in inp or '?' in inp:
+            expanded = sorted(glob.glob(inp))
+            if not expanded:
+                logging.warning(f"No files matched pattern: {inp}")
+            input_paths.extend(expanded)
+        else:
+            input_paths.append(inp)
+
+    # Validate inputs exist
+    input_paths = [Path(p) for p in input_paths]
+    for p in input_paths:
+        if not p.exists():
+            logging.error(f"Input file not found: {p}")
+            sys.exit(1)
+
+    if len(input_paths) == 0:
+        logging.error("No input files found")
+        sys.exit(1)
+
+    # Handle metrics file
+    metrics_path = None
+    if args.metrics:
+        metrics_path = Path(args.metrics)
+        if not metrics_path.exists():
+            logging.error(f"Metrics file not found: {metrics_path}")
+            sys.exit(1)
+
+    # Determine output paths
+    if args.output:
+        if len(input_paths) > 1:
+            logging.error("Cannot specify single output for multiple input files")
+            sys.exit(1)
+        output_paths = Path(args.output)
+    else:
+        output_paths = None
+
+    from .pp.filter import filter_fragments
+
+    try:
+        filter_fragments(
+            input_parquet=input_paths if len(input_paths) > 1 else input_paths[0],
+            output_parquet=output_paths,
+            metrics_csv=metrics_path,
+            min_fragments_per_cell=args.min_fragments,
+            filter_query=args.filter_query,
+            barcode_prefix=args.barcode_prefix,
+            row_groups_per_batch=args.batch_size,
+        )
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Error filtering fragments: {e}")
+        sys.exit(1)
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -332,6 +396,47 @@ def main():
         help='Number of parquet row groups per batch (default: 64, lower = less memory)'
     )
     metrics_parser.set_defaults(func=metrics_command)
+
+    # Filter subcommand
+    filter_parser = subparsers.add_parser(
+        'filter',
+        help='GPU-accelerated filtering of fragment parquet files'
+    )
+    filter_parser.add_argument(
+        'input',
+        nargs='+',
+        help='Input .parquet file(s) or glob pattern'
+    )
+    filter_parser.add_argument(
+        '-o', '--output',
+        help='Output .parquet file (only for single input, default: <input>_filtered.parquet)'
+    )
+    filter_parser.add_argument(
+        '--metrics',
+        help='Path to CSV file with quality metrics (e.g., from gatac metrics)'
+    )
+    filter_parser.add_argument(
+        '-m', '--min-fragments',
+        type=int,
+        default=100,
+        help='Min unique fragments per cell (default: 100)'
+    )
+    filter_parser.add_argument(
+        '--filter',
+        dest='filter_query',
+        help='Filtering query string (e.g., "tsse_score > 5 and n_unique > 1000")'
+    )
+    filter_parser.add_argument(
+        '--barcode-prefix',
+        help='Prefix to add to barcodes before filtering'
+    )
+    filter_parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=64,
+        help='Number of parquet row groups per batch (default: 64)'
+    )
+    filter_parser.set_defaults(func=filter_command)
 
     args = parser.parse_args()
     setup_logging(args.verbose)

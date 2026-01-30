@@ -6,6 +6,7 @@ from .metrics import (
     compute_metrics,
     cleanup_gpu_memory
 )
+from .filter import filter_fragments
 from .genome import HG38, HG19, MM10, MM39
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "load_tss_from_gtf", 
     "compute_metrics",
     "cleanup_gpu_memory",
+    "filter_fragments",
     "HG38",
     "HG19",
     "MM10",

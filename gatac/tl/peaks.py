@@ -1504,7 +1504,7 @@ def make_peak_matrix(
     genome: Union[str, dict] = "hg38",
     inplace: bool = False,
     batch_size: int = 50,
-    verbose: bool = True,
+    verbose: Union[bool, str] = True,
 ) -> Optional["AnnData"]:
     """Generate cell by peak count matrix.
 
@@ -1539,7 +1539,10 @@ def make_peak_matrix(
         Number of parquet row groups to load at once (default: 50).
         Larger values are faster but use more GPU memory.
     verbose
-        If True, show progress bars.
+        Controls progress reporting:
+        - False: no output
+        - True or "tqdm": show tqdm progress bar
+        - "log": print one line per file with ETA (useful for non-interactive environments)
 
     Returns
     -------
@@ -1663,13 +1666,17 @@ def make_peak_matrix(
     all_data = []
     
     # Process each parquet file
-    if verbose:
+    n_files = len(parquet_files)
+    if verbose == "tqdm" or verbose is True:
         from tqdm.auto import tqdm
         file_iter = tqdm(parquet_files, desc="Parquet files")
     else:
         file_iter = parquet_files
     
-    for parquet_file in file_iter:
+    import time
+    start_time = time.time()
+    
+    for file_idx, parquet_file in enumerate(file_iter):
         if not parquet_file.exists():
             logger.warning(f"Parquet file not found: {parquet_file}")
             continue
@@ -1678,6 +1685,20 @@ def make_peak_matrix(
         
         if len(barcodes_for_file) == 0:
             continue
+        
+        # Log progress if verbose="log"
+        if verbose == "log":
+            elapsed = time.time() - start_time
+            if file_idx > 0:
+                eta = elapsed / file_idx * (n_files - file_idx)
+                eta_str = f", ETA: {eta:.1f}s"
+            else:
+                eta_str = ""
+            print(
+                f"[{file_idx + 1}/{n_files}] Processing {parquet_file.name}: "
+                f"{len(barcodes_for_file):,} barcodes{eta_str}",
+                flush=True,
+            )
         
         logger.debug(f"Processing {parquet_file.name}: {len(barcodes_for_file):,} barcodes")
         

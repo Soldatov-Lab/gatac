@@ -445,6 +445,12 @@ def _gmacs_core(
         chrom_df = result_df[result_df['chrom'] == chrom]
         chrom_groups[chrom] = (chrom_df['start'].to_cupy(), chrom_df['end'].to_cupy())
     
+    # Free the input DataFrame now that we've extracted per-chromosome arrays
+    del result_df
+    gc.collect()
+    mempool.free_all_blocks()
+    pinned_mempool.free_all_blocks()
+    
     logger.debug("Computing PQ table...")
     pq_table = _make_pq_table_from_groups(
         chrom_groups,
@@ -561,7 +567,8 @@ def _read_fragments_for_barcodes_chunked(
             # Filter and return immediately
             barcodes_series = cudf.Series(list(barcodes))
             filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
-            return filtered[['chrom', 'start', 'end']].sort_values(['chrom', 'start'])
+            # Note: No sorting needed - _gmacs_core groups by chromosome internally
+            return filtered[['chrom', 'start', 'end']]
         
         # Filter to target barcodes
         barcodes_series = cudf.Series(list(barcodes))
@@ -578,7 +585,10 @@ def _read_fragments_for_barcodes_chunked(
         return cudf.DataFrame({'chrom': [], 'start': [], 'end': []})
     
     result = cudf.concat(chunks, ignore_index=True)
-    result = result.sort_values(['chrom', 'start'])
+    # Free memory from individual chunks immediately
+    del chunks
+    mempool.free_all_blocks()
+    # Note: No sorting needed - _gmacs_core groups by chromosome internally
     
     logger.debug(f"Extracted {total_frags:,} fragments for {len(barcodes):,} barcodes")
     
@@ -772,7 +782,12 @@ def call_peaks(
                 continue
             
             fragments_df = cudf.concat(all_fragments, ignore_index=True)
-            fragments_df = fragments_df.sort_values(['chrom', 'start'])
+            # Free memory from individual fragment chunks immediately
+            del all_fragments
+            gc.collect()
+            mempool.free_all_blocks()
+            pinned_mempool.free_all_blocks()
+            # Note: No need to sort here - _gmacs_core groups by chromosome internally
         else:
             # Single file mode
             fragments_df = _read_fragments_for_barcodes_chunked(parquet_path, group_barcodes, batch_size=batch_size)

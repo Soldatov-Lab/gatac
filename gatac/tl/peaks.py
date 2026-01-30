@@ -1696,11 +1696,26 @@ def make_peak_matrix(
         all_cols = np.array([], dtype=np.int32)
         all_data = np.array([], dtype=np.int32)
     
+    # Auto-select optimal dtype based on max count value
+    if len(all_data) > 0:
+        max_count = np.max(all_data)
+        if max_count <= np.iinfo(np.uint8).max:
+            matrix_dtype = np.uint8
+            logger.info(f"Using uint8 dtype (max count: {max_count})")
+        elif max_count <= np.iinfo(np.uint16).max:
+            matrix_dtype = np.uint16
+            logger.info(f"Using uint16 dtype (max count: {max_count})")
+        else:
+            matrix_dtype = np.int32
+            logger.info(f"Using int32 dtype (max count: {max_count})")
+    else:
+        matrix_dtype = np.int32
+    
     # Create sparse matrix (coo_matrix handles duplicates, tocsr() aggregates them)
     count_matrix = sp.coo_matrix(
         (all_data, (all_rows, all_cols)),
         shape=(n_cells, n_peaks),
-        dtype=np.int32,
+        dtype=matrix_dtype,
     ).tocsr()
     
     logger.info(f"Peak matrix: {n_cells:,} cells × {n_peaks:,} peaks")

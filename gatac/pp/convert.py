@@ -115,25 +115,17 @@ def make_parquet(
             # Process chunk
             chunk_count += 1
             if is_first_chunk:
+                # Always read with has_header=False because fragment files don't have headers
+                # (comment lines are already filtered by comment_prefix='#')
                 df = pl.read_csv(
                     io.BytesIO(current_chunk_data),
                     separator=separator,
-                    has_header=True,
+                    has_header=False,
                     new_columns=column_names,
                     schema_overrides=schema_overrides,
                     comment_prefix='#',
                     truncate_ragged_lines=True
                 )
-                if df.columns != column_names:
-                    df = pl.read_csv(
-                        io.BytesIO(current_chunk_data),
-                        separator=separator,
-                        has_header=False,
-                        new_columns=column_names,
-                        schema_overrides=schema_overrides,
-                        comment_prefix='#',
-                        truncate_ragged_lines=True
-                    )
 
                 if barcode_prefix:
                     df = df.with_columns(

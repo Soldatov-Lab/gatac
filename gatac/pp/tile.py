@@ -59,9 +59,22 @@ def create_tile_matrix_gpu(
     if hasattr(chrom_sizes, 'chrom_sizes'):
         chrom_sizes = chrom_sizes.chrom_sizes
 
+    # Get valid chromosomes (those in chrom_sizes, minus excluded ones)
+    all_chroms = sorted(chrom_sizes.keys())
+    if exclude_chroms is not None:
+        if isinstance(exclude_chroms, str):
+            exclude_chroms = [exclude_chroms]
+        valid_chroms_for_counting = [c for c in all_chroms if c not in exclude_chroms]
+    else:
+        valid_chroms_for_counting = all_chroms
+    
+    # Filter fragments to valid chromosomes BEFORE counting
+    # This matches SnapATAC2 behavior: only fragments on chromosomes in chrom_sizes are counted
+    fragments_for_counting = fragments_df[fragments_df['chrom'].isin(valid_chroms_for_counting)]
+
     if cell_metadata is None:
         logger.debug("Filtering cells by unique fragment count")
-        barcode_counts = fragments_df.groupby('barcode', observed=True).agg({
+        barcode_counts = fragments_for_counting.groupby('barcode', observed=True).agg({
             'count': ['sum', 'size']
         })
         barcode_counts.columns = ['n_total', 'n_unique']
@@ -85,8 +98,8 @@ def create_tile_matrix_gpu(
             cell_metadata = cell_metadata[cell_metadata['n_unique'] >= min_fragments_per_cell]
         else:
             logger.debug(f"n_unique not found in metadata. Calculating for threshold {min_fragments_per_cell}")
-            # Calculate counts only for barcodes currently in cell_metadata
-            subset_frags = fragments_df[fragments_df['barcode'].isin(cell_metadata['barcode'])]
+            # Calculate counts only for barcodes currently in cell_metadata, using valid chromosomes
+            subset_frags = fragments_for_counting[fragments_for_counting['barcode'].isin(cell_metadata['barcode'])]
             barcode_counts = subset_frags.groupby('barcode', observed=True).agg({
                 'count': ['sum', 'size']
             })
@@ -102,6 +115,7 @@ def create_tile_matrix_gpu(
 
         valid_barcodes = cell_metadata['barcode']
 
+    # Now use all fragments for actual matrix construction (will be filtered by included_chroms below)
     fragments_df = fragments_df[fragments_df['barcode'].isin(valid_barcodes)]
     logger.debug(f"Retained {len(valid_barcodes)} cells")
 
@@ -112,7 +126,6 @@ def create_tile_matrix_gpu(
 
     logger.debug("Creating genomic tiles")
     # Use chrom_sizes to determine which chromosomes to include and ensuring consistent order
-    all_chroms = sorted(chrom_sizes.keys())
     if exclude_chroms is not None:
         included_chroms = [c for c in all_chroms if c not in exclude_chroms]
     else:

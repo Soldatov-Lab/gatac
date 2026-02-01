@@ -32,6 +32,7 @@ def filter_fragments(
     barcode_column: str = "barcode",
     barcode_prefix: Optional[str] = None,
     row_groups_per_batch: int = 64,
+    chrom_sizes: Optional[Union[dict, object]] = None,
 ) -> Union[Path, List[Path]]:
     """
     Filter ATAC fragment parquet file(s) based on cell quality metrics.
@@ -60,6 +61,14 @@ def filter_fragments(
         Prefix to add to barcodes before filtering.
     row_groups_per_batch : int, default 64
         Number of parquet row groups to process per batch.
+    chrom_sizes : dict, str, or genome object, optional
+        Chromosome sizes for filtering. Can be:
+        - String genome name (e.g., 'hg38', 'mm10') - will use built-in genome
+        - Dictionary of chromosome names to sizes
+        - Genome object with chrom_sizes attribute
+        Only fragments on these chromosomes will be counted. If None, all 
+        chromosomes are included. This matches SnapATAC2's behavior of 
+        excluding non-standard contigs (GL*, KI*).
 
     Returns
     -------
@@ -87,6 +96,23 @@ def filter_fragments(
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
+    from .genome import get_chrom_sizes
+
+    # Get valid chromosomes from chrom_sizes
+    valid_chroms = None
+    if chrom_sizes is not None:
+        if isinstance(chrom_sizes, str):
+            # String genome name (e.g., 'hg38')
+            chrom_sizes_dict = get_chrom_sizes(chrom_sizes)
+            valid_chroms = set(chrom_sizes_dict.keys())
+        elif hasattr(chrom_sizes, 'chrom_sizes'):
+            # Genome object with chrom_sizes attribute
+            valid_chroms = set(chrom_sizes.chrom_sizes.keys())
+        elif isinstance(chrom_sizes, dict):
+            valid_chroms = set(chrom_sizes.keys())
+        else:
+            raise ValueError("chrom_sizes must be a string (genome name), dict, or object with chrom_sizes attribute")
+        logger.info(f"Filtering to {len(valid_chroms)} chromosomes: {sorted(list(valid_chroms))[:5]}...")
 
     # Handle single vs multiple inputs
     if isinstance(input_parquet, (str, Path)):
@@ -150,6 +176,7 @@ def filter_fragments(
             barcode_column=barcode_column,
             barcode_prefix=barcode_prefix,
             row_groups_per_batch=row_groups_per_batch,
+            valid_chroms=valid_chroms,
         )
         logger.info(f"Wrote filtered fragments to {output_path}")
 
@@ -168,6 +195,7 @@ def _filter_single_file_streaming(
     barcode_column: str = "barcode",
     barcode_prefix: Optional[str] = None,
     row_groups_per_batch: int = 64,
+    valid_chroms: Optional[set] = None,
 ) -> None:
     """
     Filter a single parquet file using streaming writes.
@@ -188,6 +216,9 @@ def _filter_single_file_streaming(
         Prefix to add to barcodes.
     row_groups_per_batch : int
         Batch size for processing.
+    valid_chroms : set, optional
+        Set of valid chromosome names. Fragments on other chromosomes
+        will not be counted toward min_fragments_per_cell threshold.
     """
     import pyarrow.parquet as pq
 
@@ -204,7 +235,13 @@ def _filter_single_file_streaming(
             batch_end = min(batch_start + row_groups_per_batch, n_row_groups)
             row_groups = list(range(batch_start, batch_end))
             
-            df = cudf.read_parquet(input_path, row_groups=row_groups, columns=[barcode_column])
+            # Read chrom column too if we need to filter by chromosome
+            if valid_chroms is not None:
+                df = cudf.read_parquet(input_path, row_groups=row_groups, columns=[barcode_column, 'chrom'])
+                # Filter to valid chromosomes only
+                df = df[df['chrom'].isin(list(valid_chroms))]
+            else:
+                df = cudf.read_parquet(input_path, row_groups=row_groups, columns=[barcode_column])
             
             if barcode_prefix:
                 df[barcode_column] = barcode_prefix + df[barcode_column].astype(str)

@@ -228,6 +228,7 @@ def filter_command(args):
             filter_query=args.filter_query,
             barcode_prefix=args.barcode_prefix,
             row_groups_per_batch=args.batch_size,
+            chrom_sizes=args.genome if hasattr(args, 'genome') and args.genome else None,
         )
     except ValueError as e:
         logging.error(str(e))
@@ -425,6 +426,10 @@ def main():
         '--filter',
         dest='filter_query',
         help='Filtering query string (e.g., "tsse_score > 5 and n_unique > 1000")'
+    )
+    filter_parser.add_argument(
+        '-g', '--genome',
+        help='Genome name for chromosome filtering (e.g., hg38, mm10). Matches SnapATAC2 behavior by excluding non-standard contigs.'
     )
     filter_parser.add_argument(
         '--barcode-prefix',

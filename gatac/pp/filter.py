@@ -24,15 +24,15 @@ def cleanup_gpu_memory():
 
 
 def filter_fragments(
-    input_parquet: Union[str, Path],
-    output_parquet: Optional[Union[str, Path]] = None,
-    metrics_csv: Optional[Union[str, Path]] = None,
+    input_parquet: Union[str, Path, List[Union[str, Path]]],
+    output_parquet: Optional[Union[str, Path, List[Union[str, Path]]]] = None,
+    metrics: Optional[Union[str, Path, pd.DataFrame, cudf.DataFrame]] = None,
     min_fragments_per_cell: int = 100,
     filter_query: Optional[str] = None,
     barcode_column: str = "barcode",
     barcode_prefix: Optional[str] = None,
     row_groups_per_batch: int = 64,
-    chrom_sizes: Optional[Union[dict, object]] = None,
+    chrom_sizes: Optional[Union[dict, object, str]] = None,
 ) -> Union[Path, List[Path]]:
     """
     Filter ATAC fragment parquet file(s) based on cell quality metrics.
@@ -49,8 +49,9 @@ def filter_fragments(
         Path for output filtered parquet file(s). If None, will use
         input name with '_filtered' suffix. For multiple inputs, can be
         None or a list of same length.
-    metrics_csv : str or Path, optional
-        Path to CSV file containing cell quality metrics.
+    metrics : str, Path, pandas.DataFrame, or cudf.DataFrame, optional
+        Cell quality metrics to use for filtering. Can be a path to a
+        CSV file, or a pre-loaded DataFrame.
     min_fragments_per_cell : int, default 100
         Minimum number of unique fragments required per cell.
     filter_query : str, optional
@@ -83,14 +84,14 @@ def filter_fragments(
     >>> # Filter using metrics CSV with quality threshold
     >>> filter_fragments(
     ...     "fragments.parquet",
-    ...     metrics_csv="metrics.csv",
+    ...     metrics="metrics.csv",
     ...     filter_query="tsse_score > 5 and n_unique > 1000"
     ... )
 
     >>> # Filter multiple samples
     >>> filter_fragments(
     ...     ["sample1.parquet", "sample2.parquet"],
-    ...     metrics_csv="combined_metrics.csv",
+    ...     metrics=combined_metrics_df,
     ...     filter_query="tsse_score > 5"
     ... )
     """
@@ -142,12 +143,17 @@ def filter_fragments(
 
     # Load metrics if provided
     valid_barcodes = None
-    if metrics_csv is not None:
-        logger.info(f"Loading metrics from {metrics_csv}")
-        metrics_df = pd.read_csv(metrics_csv)
+    if metrics is not None:
+        if isinstance(metrics, (str, Path)):
+            logger.info(f"Loading metrics from {metrics}")
+            metrics_df = pd.read_csv(metrics)
+        elif isinstance(metrics, (pd.DataFrame, cudf.DataFrame)):
+            metrics_df = metrics.copy()
+        else:
+            raise ValueError("metrics must be a path to a CSV file or a pandas/cudf DataFrame")
         
         if barcode_column not in metrics_df.columns:
-            raise ValueError(f"Barcode column '{barcode_column}' not found in metrics CSV")
+            raise ValueError(f"Barcode column '{barcode_column}' not found in metrics")
         
         if filter_query:
             logger.info(f"Applying filter: {filter_query}")
@@ -158,11 +164,13 @@ def filter_fragments(
             logger.info(f"Retained {len(metrics_df):,} cells after query filter")
         
         if 'n_unique' in metrics_df.columns:
-            before_count = len(metrics_df)
             metrics_df = metrics_df[metrics_df['n_unique'] >= min_fragments_per_cell]
             logger.info(f"Retained {len(metrics_df):,} cells after min_fragments filter")
         
-        valid_barcodes = set(metrics_df[barcode_column].astype(str).values)
+        if isinstance(metrics_df, cudf.DataFrame):
+            valid_barcodes = set(metrics_df[barcode_column].astype(str).to_arrow().to_pylist())
+        else:
+            valid_barcodes = set(metrics_df[barcode_column].astype(str).values)
         logger.info(f"Total valid barcodes from metrics: {len(valid_barcodes):,}")
 
     # Process each input file

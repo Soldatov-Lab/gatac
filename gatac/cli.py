@@ -223,7 +223,7 @@ def filter_command(args):
         filter_fragments(
             input_parquet=input_paths if len(input_paths) > 1 else input_paths[0],
             output_parquet=output_paths,
-            metrics_csv=metrics_path,
+            metrics=metrics_path,
             min_fragments_per_cell=args.min_fragments,
             filter_query=args.filter_query,
             barcode_prefix=args.barcode_prefix,

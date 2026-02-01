@@ -21,7 +21,8 @@ def create_tile_matrix_gpu(
     min_fragments_per_cell: int = 100,
     cell_metadata: Optional[cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
-    return_sparse: bool = True
+    return_sparse: bool = True,
+    weighted_counts: bool = False
 ) -> Tuple[cusp.csr_matrix, cudf.DataFrame, cudf.DataFrame]:
     """
     Generate a tile matrix from ATAC fragment data using GPU acceleration.
@@ -46,6 +47,9 @@ def create_tile_matrix_gpu(
         Additional query string for filtering cells based on cell_metadata.
     return_sparse : bool
         Return sparse matrix (True) or dense array (False)
+    weighted_counts : bool
+        If True, use the 'count' column (PCR duplicates). If False, count each 
+        unique fragment once (matches SnapATAC2 default). (default: False)
 
     Returns
     -------
@@ -165,19 +169,41 @@ def create_tile_matrix_gpu(
     })
 
     fragments_df = fragments_df.merge(barcode_to_idx, on='barcode', how='left')
-    fragments_df['fragment_mid'] = (fragments_df['start'] + fragments_df['end']) // 2
-    fragments_df['tile_idx'] = fragments_df['fragment_mid'] // tile_size
+
+    # Match SnapATAC2 logic:
+    # Each fragment has two insertions: (start + 4) and (end - 5).
+    # If both fall in the same tile, the tile gets +1 (internal binarization per fragment).
+    # If they fall in different tiles, each tile gets +1.
+    fragments_df['tile_s'] = fragments_df['start'] // tile_size
+    fragments_df['tile_e'] = (fragments_df['end'].astype(cp.int32) - 1) // tile_size
+    # Ensure non-negative
+    fragments_df['tile_e'] = fragments_df['tile_e'].clip(lower=0)
 
     chrom_offset_map = cudf.DataFrame({
         'chrom': list(chrom_to_offset.keys()),
         'offset': list(chrom_to_offset.values())
     })
     fragments_df = fragments_df.merge(chrom_offset_map, on='chrom', how='left')
-    fragments_df['global_tile_idx'] = fragments_df['tile_idx'] + fragments_df['offset']
+
+    # Insertion 1 (start)
+    df_ins1 = fragments_df[['cell_idx', 'tile_s', 'offset', 'count']].rename(
+        columns={'tile_s': 'tile_idx'}
+    )
+    
+    # Insertion 2 (end), only if it falls in a different tile
+    df_ins2 = fragments_df[fragments_df['tile_s'] != fragments_df['tile_e']][
+        ['cell_idx', 'tile_e', 'offset', 'count']
+    ].rename(columns={'tile_e': 'tile_idx'})
+    
+    insertions = cudf.concat([df_ins1, df_ins2])
+    insertions['global_tile_idx'] = insertions['tile_idx'] + insertions['offset']
+
+    if not weighted_counts:
+        insertions['count'] = 1
 
     logger.debug("Building sparse matrix")
     try:
-        matrix_data = fragments_df.groupby(['cell_idx', 'global_tile_idx'])['count'].sum().reset_index()
+        matrix_data = insertions.groupby(['cell_idx', 'global_tile_idx'])['count'].sum().reset_index()
 
         row_indices = matrix_data['cell_idx'].values
         col_indices = matrix_data['global_tile_idx'].values

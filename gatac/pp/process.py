@@ -59,6 +59,7 @@ def make_tile_matrix(
     metrics: Optional[str | Path | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     binarize: bool = False,
+    weighted_counts: bool = False,
     barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
 ) -> 'sc.AnnData':
@@ -84,7 +85,10 @@ def make_tile_matrix(
     filter_query : str, optional
         Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
     binarize : bool
-        Convert counts to binary (default: False)
+        If True, convert final counts in tile matrix to binary (0 or 1). (default: False)
+    weighted_counts : bool
+        If True, use the 'count' column (PCR duplicates). If False, count each 
+        unique fragment once (matches SnapATAC2 default). (default: False)
     barcode_prefix : str, optional
         Prefix to add to barcodes
     low_memory : bool
@@ -142,7 +146,8 @@ def make_tile_matrix(
             min_fragments_per_cell=min_fragments_per_cell,
             cell_metadata=cell_metadata_input,
             filter_query=filter_query,
-            return_sparse=True
+            return_sparse=True,
+            weighted_counts=weighted_counts
         )
         return matrix, cell_metadata, tile_metadata
 
@@ -163,6 +168,11 @@ def make_tile_matrix(
                 raise e
         else:
             raise e
+
+    # Apply binarization if requested
+    if binarize:
+        logger.info("Binarizing tile matrix")
+        matrix.data = (matrix.data > 0).astype(cp.float32)
 
     # Convert to AnnData
     adata = tile_matrix_to_anndata(matrix, cell_metadata, tile_metadata)

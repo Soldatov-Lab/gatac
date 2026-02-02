@@ -168,7 +168,9 @@ class DNAMotif:
     
     def to_log_odds(
         self, 
-        bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25)
+        bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
+        mode: Literal["gatac", "motifmatchr"] = "gatac",
+        pseudocount: float = 0.8,
     ) -> np.ndarray:
         """
         Convert PWM to log-odds scores.
@@ -177,6 +179,13 @@ class DNAMotif:
         ----------
         bg_probs : tuple
             Background nucleotide probabilities (A, C, G, T)
+        mode : {"gatac", "motifmatchr"}, default "gatac"
+            - "gatac": Natural log-odds with minimal pseudocount
+            - "motifmatchr": Log2-odds matching MOODS/motifmatchr scoring
+        pseudocount : float, default 0.8
+            Pseudocount for preventing log(0). Only used when PWM has zeros.
+            Note: For normalized PWMs (like from MEME files), pseudocount is
+            already baked into the probabilities, so this is just for safety.
             
         Returns
         -------
@@ -184,7 +193,20 @@ class DNAMotif:
             Log-odds matrix of shape (length, 4)
         """
         bg = np.array(bg_probs, dtype=np.float64)
-        return np.log(self.pwm / bg)
+        
+        if mode == "motifmatchr":
+            even = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
+            
+            # Use log2 for motifmatchr compatibility
+            log_odds = np.log2(self.pwm / even)
+            
+            # Apply motifmatchr adjustment for non-uniform background:
+            # final = log2(prob/0.25) - (log2(0.25) - log2(bg))
+            adj = np.log2(bg) - np.log2(even)
+            return log_odds + adj
+        else:
+            # Original GATAC mode: simple natural log-odds
+            return np.log(self.pwm / bg)
     
     def reverse_complement(self) -> "DNAMotif":
         """

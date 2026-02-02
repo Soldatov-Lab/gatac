@@ -1,6 +1,7 @@
 data/*
 refs/*
 uv.lock
+pixi.lock
 *.pyc
 *.log
 AGENTS.md
@@ -9,5 +10,6 @@ GEMINI.md
 *.parquet
 *.csv
 *.h5ad
+.venv
 
 __pycache__/

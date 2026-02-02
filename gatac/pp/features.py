@@ -50,6 +50,9 @@ def _find_most_accessible_features_gpu(
     For binary matrices (following ArchR): select top N features by total accessibility.
     For count matrices: select top N features excluding quantile tails.
 
+    Note: Zero-count features are always excluded before quantile filtering,
+    matching SnapATAC2's behavior.
+
     Parameters
     ----------
     feature_count : cp.ndarray
@@ -76,11 +79,23 @@ def _find_most_accessible_features_gpu(
         n_to_select = min(total_features, n)
         selected = sorted_indices[-n_to_select:]
     else:
-        # For count matrices: apply quantile filtering
-        lower_idx = int(n * filter_lower_quantile)
-        upper_idx = int(n * (1 - filter_upper_quantile))
-
-        valid_range = sorted_indices[lower_idx:upper_idx]
+        # For count matrices: first exclude zero-count features (matching SnapATAC2)
+        # Find the first non-zero index in sorted order
+        sorted_counts = feature_count[sorted_indices]
+        nonzero_mask = sorted_counts > 0
+        first_nonzero_idx = int(cp.argmax(nonzero_mask))
+        
+        # Filter to non-zero features only
+        nonzero_indices = sorted_indices[first_nonzero_idx:]
+        n_nonzero = len(nonzero_indices)
+        
+        # Apply quantile filtering on non-zero features only
+        n_lower = int(filter_lower_quantile * n_nonzero)
+        n_upper = int(filter_upper_quantile * n_nonzero)
+        
+        valid_range = nonzero_indices[n_lower:n_nonzero - n_upper]
+        
+        # Select top N from valid range (reversed to get highest counts first)
         n_to_select = min(total_features, len(valid_range))
         selected = valid_range[-n_to_select:]
 
@@ -223,7 +238,6 @@ def select_features_multi(
     n_features: int = 500000,
     filter_lower_quantile: float = 0.005,
     filter_upper_quantile: float = 0.005,
-    chunk_size: int = 6000,
     binarize: bool = True,
 ):
     """

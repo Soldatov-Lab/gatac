@@ -1232,10 +1232,7 @@ def _count_fragments_in_peaks_gpu(
     """
     Count fragment insertions overlapping with peaks using GPU-accelerated operations.
     
-    Uses the paired-insertion counting strategy (default) which matches SnapATAC2:
-    - Each fragment generates insertions at positions `start` and `end-1`
-    - An insertion overlaps a peak if it falls within [peak_start, peak_end)
-    - For "paired-insertion", deduplicate so one fragment counts max 1 per peak
+    Uses optimized searchsorted for O(N log M) overlap detection.
     
     Parameters
     ----------
@@ -1274,115 +1271,92 @@ def _count_fragments_in_peaks_gpu(
         if len(chrom_frags) == 0:
             continue
         
-        n_frags = len(chrom_frags)
-        n_chrom_peaks = len(peak_starts)
-        
-        # Get fragment arrays on GPU, including GLOBAL indices
+        # Get fragment arrays on GPU
         frag_starts = chrom_frags['start'].to_cupy()
         frag_ends = chrom_frags['end'].to_cupy()
         global_frag_indices = chrom_frags['_global_frag_idx'].to_cupy()
         
-        # Use searchsorted for efficient overlap detection
-        # For each fragment, find candidate peaks using binary search:
-        # - right_bound: first peak where peak_start >= frag_end (no overlap possible)
-        # - left_bound: first peak where peak_end > frag_start (overlap possible)
-        
-        # Process fragments in batches to manage memory
-        frag_batch_size = min(150000, n_frags)
-        
-        for frag_batch_start in range(0, n_frags, frag_batch_size):
-            frag_batch_end = min(frag_batch_start + frag_batch_size, n_frags)
-            batch_starts = frag_starts[frag_batch_start:frag_batch_end]
-            batch_ends = frag_ends[frag_batch_start:frag_batch_end]
+        if counting_strategy == "fragment":
+            # Frag overlaps peak if: frag_start < peak_end AND frag_end > peak_start
+            # Find all peaks that could overlap with this fragment:
+            # First peak with peak_end > frag_start
+            left_indices = cp.searchsorted(peak_ends, frag_starts, side='right')
+            # First peak with peak_start >= frag_end
+            right_indices = cp.searchsorted(peak_starts, frag_ends, side='left')
             
-            # Use GLOBAL fragment indices (not local batch indices)
-            batch_frag_indices = global_frag_indices[frag_batch_start:frag_batch_end]
+            # For each fragment i, its overlapping peaks are in range [left_indices[i], right_indices[i])
+            counts_per_frag = right_indices - left_indices
+            valid_frags = cp.where(counts_per_frag > 0)[0]
             
-            # Use chunked broadcasting for peaks
-            peak_chunk_size = min(10000, n_chrom_peaks)
-            
-            for peak_chunk_start in range(0, n_chrom_peaks, peak_chunk_size):
-                peak_chunk_end = min(peak_chunk_start + peak_chunk_size, n_chrom_peaks)
-                chunk_peak_starts = peak_starts[peak_chunk_start:peak_chunk_end]
-                chunk_peak_ends = peak_ends[peak_chunk_start:peak_chunk_end]
-                chunk_peak_indices = peak_indices[peak_chunk_start:peak_chunk_end]
+            if len(valid_frags) > 0:
+                # Expand ranges into (fragment_idx, peak_idx) pairs
+                # This could be expensive if many peaks per fragment, but typically 1-2
+                repeat_counts = counts_per_frag[valid_frags]
+                f_indices = cp.repeat(valid_frags, repeat_counts)
                 
-                if counting_strategy == "fragment":
-                    # Legacy behavior: check if fragment overlaps peak
-                    # Fragment overlaps peak if: frag_start < peak_end AND frag_end > peak_start
-                    overlaps = (
-                        (batch_starts[:, None] < chunk_peak_ends[None, :]) &
-                        (batch_ends[:, None] > chunk_peak_starts[None, :])
-                    )
-                else:
-                    # Insertion-based counting (paired-insertion or insertion)
-                    # Insertions at positions: start and end-1
-                    # An insertion at position p is in peak if: peak_start <= p < peak_end
-                    
-                    # Check insertion 1 (at start): start >= peak_start AND start < peak_end
-                    ins1_overlaps = (
-                        (batch_starts[:, None] >= chunk_peak_starts[None, :]) &
-                        (batch_starts[:, None] < chunk_peak_ends[None, :])
-                    )
-                    
-                    # Check insertion 2 (at end-1): (end-1) >= peak_start AND (end-1) < peak_end
-                    ins2_pos = batch_ends - 1
-                    ins2_overlaps = (
-                        (ins2_pos[:, None] >= chunk_peak_starts[None, :]) &
-                        (ins2_pos[:, None] < chunk_peak_ends[None, :])
-                    )
-                    
-                    if counting_strategy == "paired-insertion":
-                        # Count if either insertion overlaps (dedupe per peak later)
-                        overlaps = ins1_overlaps | ins2_overlaps
-                    else:  # counting_strategy == "insertion"
-                        # Count each insertion separately
-                        # Process insertion 1 hits
-                        ins1_frag_idx, ins1_peak_idx = cp.where(ins1_overlaps)
-                        if len(ins1_frag_idx) > 0:
-                            overlap_df = cudf.DataFrame({
-                                'frag_idx': cudf.Series(batch_frag_indices[ins1_frag_idx]),
-                                'peak_idx': cudf.Series(chunk_peak_indices[ins1_peak_idx]),
-                            })
-                            all_results.append(overlap_df)
-                        
-                        # Process insertion 2 hits
-                        ins2_frag_idx, ins2_peak_idx = cp.where(ins2_overlaps)
-                        if len(ins2_frag_idx) > 0:
-                            overlap_df = cudf.DataFrame({
-                                'frag_idx': cudf.Series(batch_frag_indices[ins2_frag_idx]),
-                                'peak_idx': cudf.Series(chunk_peak_indices[ins2_peak_idx]),
-                            })
-                            all_results.append(overlap_df)
-                        
-                        del ins1_overlaps, ins2_overlaps
-                        continue  # Skip the common overlap processing below
-                    
-                    del ins1_overlaps, ins2_overlaps
+                # Offset indices into the peak array
+                offsets = cp.cumsum(repeat_counts) - repeat_counts
+                p_indices_local = cp.arange(len(f_indices)) - cp.repeat(offsets, repeat_counts) + cp.repeat(left_indices[valid_frags], repeat_counts)
                 
-                # Find overlapping pairs
-                frag_local_idx, peak_local_idx = cp.where(overlaps)
-                
-                if len(frag_local_idx) == 0:
-                    del overlaps
-                    continue
-                
-                # Map to global fragment indices
-                global_frag_idx = batch_frag_indices[frag_local_idx]
-                global_peak_idx = chunk_peak_indices[peak_local_idx]
-                
-                # Store overlap pairs (will aggregate later)
                 overlap_df = cudf.DataFrame({
-                    'frag_idx': cudf.Series(global_frag_idx),
-                    'peak_idx': cudf.Series(global_peak_idx),
+                    'frag_idx': global_frag_indices[f_indices],
+                    'peak_idx': peak_indices[p_indices_local],
                 })
                 all_results.append(overlap_df)
                 
-                del overlaps, frag_local_idx, peak_local_idx
+        else:
+            # Insertion-based counting (paired-insertion or insertion)
+            # Find peaks containing insertion 1 (at start)
+            # Insertion at p is in peak if: peak_start <= p < peak_end
+            # Use searchsorted to find candidate peak (since peaks are sorted and non-overlapping)
+            # Find first peak where peak_start > p, then candidate is index-1
             
-            del batch_starts, batch_ends
+            # Find peaks for insertion 1 (start)
+            idx1 = cp.searchsorted(peak_starts, frag_starts, side='right') - 1
+            valid1 = (idx1 >= 0) & (frag_starts < peak_ends[idx1])
+            
+            # Find peaks for insertion 2 (end-1)
+            ins2_pos = frag_ends - 1
+            idx2 = cp.searchsorted(peak_starts, ins2_pos, side='right') - 1
+            valid2 = (idx2 >= 0) & (ins2_pos < peak_ends[idx2])
+            
+            if counting_strategy == "paired-insertion":
+                # For paired-insertion, we want to count once per fragment AND peak
+                # If both insertions are in the SAME peak, count once
+                # If both are in DIFFERENT peaks, count once for each peak
+                
+                # Case 1: Ins 1 is valid
+                v1_indices = cp.where(valid1)[0]
+                if len(v1_indices) > 0:
+                    all_results.append(cudf.DataFrame({
+                        'frag_idx': global_frag_indices[v1_indices],
+                        'peak_idx': peak_indices[idx1[v1_indices]],
+                    }))
+                
+                # Case 2: Ins 2 is valid AND (either ins 1 is invalid OR ins 1 is in a different peak)
+                v2_extra = valid2 & (~valid1 | (idx1 != idx2))
+                v2_indices = cp.where(v2_extra)[0]
+                if len(v2_indices) > 0:
+                    all_results.append(cudf.DataFrame({
+                        'frag_idx': global_frag_indices[v2_indices],
+                        'peak_idx': peak_indices[idx2[v2_indices]],
+                    }))
+            else:  # "insertion" strategy
+                # Count both separately
+                v1_indices = cp.where(valid1)[0]
+                if len(v1_indices) > 0:
+                    all_results.append(cudf.DataFrame({
+                        'frag_idx': global_frag_indices[v1_indices],
+                        'peak_idx': peak_indices[idx1[v1_indices]],
+                    }))
+                
+                v2_indices = cp.where(valid2)[0]
+                if len(v2_indices) > 0:
+                    all_results.append(cudf.DataFrame({
+                        'frag_idx': global_frag_indices[v2_indices],
+                        'peak_idx': peak_indices[idx2[v2_indices]],
+                    }))
         
-        del frag_starts, frag_ends, global_frag_indices, peak_starts, peak_ends, peak_indices
         mempool.free_all_blocks()
     
     if len(all_results) == 0:
@@ -1393,9 +1367,9 @@ def _count_fragments_in_peaks_gpu(
     del all_results
     
     # Get barcodes for overlapping fragments (GPU join)
-    # Create a temporary column for join
-    frag_barcodes = fragments_df[['barcode']].reset_index(drop=True)
-    frag_barcodes['frag_idx'] = cp.arange(len(frag_barcodes))
+    # Create a temporary mapping for fragments to barcodes
+    # We only need the columns barcode and _global_frag_idx
+    frag_barcodes = fragments_df[['barcode', '_global_frag_idx']].rename(columns={'_global_frag_idx': 'frag_idx'})
     
     # Join to get barcodes
     all_overlaps = all_overlaps.merge(frag_barcodes, on='frag_idx', how='left')
@@ -1404,14 +1378,16 @@ def _count_fragments_in_peaks_gpu(
     all_overlaps = all_overlaps.merge(barcode_mapping, on='barcode', how='inner')
     
     # For paired-insertion, deduplicate (frag_idx, peak_idx) pairs
-    # This ensures one fragment counts max 1 per peak even if both insertions overlap
+    # (Note: my optimized logic for paired-insertion already handles same-peak case, 
+    # but a fragment could potentially overlap two peaks if they were contiguous.
+    # However, merge_peaks ensures they are non-overlapping with a gap of at least 1.)
     if counting_strategy == "paired-insertion":
         all_overlaps = all_overlaps.drop_duplicates(subset=['frag_idx', 'peak_idx'])
     
     # Aggregate by (cell_idx, peak_idx) using GPU groupby
     counts = all_overlaps.groupby(['cell_idx', 'peak_idx']).size().reset_index(name='count')
     
-    # Convert to numpy arrays (not lists) for faster processing
+    # Convert to numpy arrays
     rows = counts['cell_idx'].to_pandas().values
     cols = counts['peak_idx'].to_pandas().values
     data = counts['count'].to_pandas().values

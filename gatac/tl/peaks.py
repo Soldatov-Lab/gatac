@@ -1227,12 +1227,15 @@ def _count_fragments_in_peaks_gpu(
     peaks_by_chrom: dict,
     barcode_mapping: cudf.DataFrame,
     n_peaks: int,
+    counting_strategy: str = "paired-insertion",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Count fragment overlaps with peaks using GPU-accelerated operations.
+    Count fragment insertions overlapping with peaks using GPU-accelerated operations.
     
-    Uses binary search for efficient interval overlap detection and
-    GPU-native aggregation with cudf groupby.
+    Uses the paired-insertion counting strategy (default) which matches SnapATAC2:
+    - Each fragment generates insertions at positions `start` and `end-1`
+    - An insertion overlaps a peak if it falls within [peak_start, peak_end)
+    - For "paired-insertion", deduplicate so one fragment counts max 1 per peak
     
     Parameters
     ----------
@@ -1244,6 +1247,8 @@ def _count_fragments_in_peaks_gpu(
         Pre-created mapping with 'barcode' and 'cell_idx' columns
     n_peaks : int
         Total number of peaks
+    counting_strategy : str
+        Counting strategy: 'paired-insertion' (default), 'insertion', or 'fragment'
         
     Returns
     -------
@@ -1251,6 +1256,10 @@ def _count_fragments_in_peaks_gpu(
         (rows, cols, data) as numpy arrays for sparse matrix construction
     """
     all_results = []
+    
+    # Add global fragment index column to preserve indices through chromosome filtering
+    fragments_df = fragments_df.reset_index(drop=True)
+    fragments_df['_global_frag_idx'] = cp.arange(len(fragments_df), dtype=cp.int64)
     
     # Process each chromosome
     chroms = fragments_df['chrom'].unique().to_pandas()
@@ -1268,9 +1277,10 @@ def _count_fragments_in_peaks_gpu(
         n_frags = len(chrom_frags)
         n_chrom_peaks = len(peak_starts)
         
-        # Get fragment arrays on GPU
+        # Get fragment arrays on GPU, including GLOBAL indices
         frag_starts = chrom_frags['start'].to_cupy()
         frag_ends = chrom_frags['end'].to_cupy()
+        global_frag_indices = chrom_frags['_global_frag_idx'].to_cupy()
         
         # Use searchsorted for efficient overlap detection
         # For each fragment, find candidate peaks using binary search:
@@ -1284,20 +1294,11 @@ def _count_fragments_in_peaks_gpu(
             frag_batch_end = min(frag_batch_start + frag_batch_size, n_frags)
             batch_starts = frag_starts[frag_batch_start:frag_batch_end]
             batch_ends = frag_ends[frag_batch_start:frag_batch_end]
-            batch_size = len(batch_starts)
             
-            # Pre-create batch fragment indices (once per batch, not per chunk)
-            batch_frag_indices = cp.arange(frag_batch_start, frag_batch_end, dtype=cp.int64)
+            # Use GLOBAL fragment indices (not local batch indices)
+            batch_frag_indices = global_frag_indices[frag_batch_start:frag_batch_end]
             
-            # Binary search to find candidate peak ranges
-            # right_bounds[i] = first peak where peak_start >= frag_end[i]
-            right_bounds = cp.searchsorted(peak_starts, batch_ends, side='left')
-            
-            # For each fragment, we only need to check peaks in [0, right_bound)
-            # But we still need to verify peak_end > frag_start
-            
-            # Use chunked broadcasting for remaining candidates
-            # This is much smaller than full broadcast due to searchsorted pruning
+            # Use chunked broadcasting for peaks
             peak_chunk_size = min(10000, n_chrom_peaks)
             
             for peak_chunk_start in range(0, n_chrom_peaks, peak_chunk_size):
@@ -1306,21 +1307,58 @@ def _count_fragments_in_peaks_gpu(
                 chunk_peak_ends = peak_ends[peak_chunk_start:peak_chunk_end]
                 chunk_peak_indices = peak_indices[peak_chunk_start:peak_chunk_end]
                 
-                # Only check fragments where right_bound > peak_chunk_start
-                # This prunes fragments that can't overlap this peak chunk
-                frag_mask = right_bounds > peak_chunk_start
-                if not cp.any(frag_mask):
-                    continue
-                
-                masked_starts = batch_starts[frag_mask]
-                masked_ends = batch_ends[frag_mask]
-                masked_frag_indices = batch_frag_indices[frag_mask]
-                
-                # Compute overlap matrix (smaller due to masking)
-                overlaps = (
-                    (masked_starts[:, None] < chunk_peak_ends[None, :]) &
-                    (masked_ends[:, None] > chunk_peak_starts[None, :])
-                )
+                if counting_strategy == "fragment":
+                    # Legacy behavior: check if fragment overlaps peak
+                    # Fragment overlaps peak if: frag_start < peak_end AND frag_end > peak_start
+                    overlaps = (
+                        (batch_starts[:, None] < chunk_peak_ends[None, :]) &
+                        (batch_ends[:, None] > chunk_peak_starts[None, :])
+                    )
+                else:
+                    # Insertion-based counting (paired-insertion or insertion)
+                    # Insertions at positions: start and end-1
+                    # An insertion at position p is in peak if: peak_start <= p < peak_end
+                    
+                    # Check insertion 1 (at start): start >= peak_start AND start < peak_end
+                    ins1_overlaps = (
+                        (batch_starts[:, None] >= chunk_peak_starts[None, :]) &
+                        (batch_starts[:, None] < chunk_peak_ends[None, :])
+                    )
+                    
+                    # Check insertion 2 (at end-1): (end-1) >= peak_start AND (end-1) < peak_end
+                    ins2_pos = batch_ends - 1
+                    ins2_overlaps = (
+                        (ins2_pos[:, None] >= chunk_peak_starts[None, :]) &
+                        (ins2_pos[:, None] < chunk_peak_ends[None, :])
+                    )
+                    
+                    if counting_strategy == "paired-insertion":
+                        # Count if either insertion overlaps (dedupe per peak later)
+                        overlaps = ins1_overlaps | ins2_overlaps
+                    else:  # counting_strategy == "insertion"
+                        # Count each insertion separately
+                        # Process insertion 1 hits
+                        ins1_frag_idx, ins1_peak_idx = cp.where(ins1_overlaps)
+                        if len(ins1_frag_idx) > 0:
+                            overlap_df = cudf.DataFrame({
+                                'frag_idx': cudf.Series(batch_frag_indices[ins1_frag_idx]),
+                                'peak_idx': cudf.Series(chunk_peak_indices[ins1_peak_idx]),
+                            })
+                            all_results.append(overlap_df)
+                        
+                        # Process insertion 2 hits
+                        ins2_frag_idx, ins2_peak_idx = cp.where(ins2_overlaps)
+                        if len(ins2_frag_idx) > 0:
+                            overlap_df = cudf.DataFrame({
+                                'frag_idx': cudf.Series(batch_frag_indices[ins2_frag_idx]),
+                                'peak_idx': cudf.Series(chunk_peak_indices[ins2_peak_idx]),
+                            })
+                            all_results.append(overlap_df)
+                        
+                        del ins1_overlaps, ins2_overlaps
+                        continue  # Skip the common overlap processing below
+                    
+                    del ins1_overlaps, ins2_overlaps
                 
                 # Find overlapping pairs
                 frag_local_idx, peak_local_idx = cp.where(overlaps)
@@ -1330,7 +1368,7 @@ def _count_fragments_in_peaks_gpu(
                     continue
                 
                 # Map to global fragment indices
-                global_frag_idx = masked_frag_indices[frag_local_idx]
+                global_frag_idx = batch_frag_indices[frag_local_idx]
                 global_peak_idx = chunk_peak_indices[peak_local_idx]
                 
                 # Store overlap pairs (will aggregate later)
@@ -1342,9 +1380,9 @@ def _count_fragments_in_peaks_gpu(
                 
                 del overlaps, frag_local_idx, peak_local_idx
             
-            del batch_starts, batch_ends, right_bounds
+            del batch_starts, batch_ends
         
-        del frag_starts, frag_ends, peak_starts, peak_ends, peak_indices
+        del frag_starts, frag_ends, global_frag_indices, peak_starts, peak_ends, peak_indices
         mempool.free_all_blocks()
     
     if len(all_results) == 0:
@@ -1364,6 +1402,11 @@ def _count_fragments_in_peaks_gpu(
     
     # Join to get cell indices
     all_overlaps = all_overlaps.merge(barcode_mapping, on='barcode', how='inner')
+    
+    # For paired-insertion, deduplicate (frag_idx, peak_idx) pairs
+    # This ensures one fragment counts max 1 per peak even if both insertions overlap
+    if counting_strategy == "paired-insertion":
+        all_overlaps = all_overlaps.drop_duplicates(subset=['frag_idx', 'peak_idx'])
     
     # Aggregate by (cell_idx, peak_idx) using GPU groupby
     counts = all_overlaps.groupby(['cell_idx', 'peak_idx']).size().reset_index(name='count')
@@ -1386,9 +1429,10 @@ def _read_and_count_fragments_batched(
     barcode_to_idx: dict,
     n_peaks: int,
     batch_size: int = 10,
+    counting_strategy: str = "paired-insertion",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Read fragments from parquet in batches and count overlaps with peaks.
+    Read fragments from parquet in batches and count insertions in peaks.
     
     Uses chunked row group reading to avoid OOM when processing large files.
     
@@ -1406,6 +1450,8 @@ def _read_and_count_fragments_batched(
         Total number of peaks
     batch_size : int
         Number of row groups to load at once
+    counting_strategy : str
+        Counting strategy: 'paired-insertion' (default), 'insertion', or 'fragment'
         
     Returns
     -------
@@ -1469,7 +1515,7 @@ def _read_and_count_fragments_batched(
             
             if len(filtered) > 0:
                 rows, cols, data = _count_fragments_in_peaks_gpu(
-                    filtered, peaks_by_chrom, barcode_mapping, n_peaks
+                    filtered, peaks_by_chrom, barcode_mapping, n_peaks, counting_strategy
                 )
                 return rows, cols, data
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -1479,7 +1525,7 @@ def _read_and_count_fragments_batched(
         
         if len(filtered) > 0:
             rows, cols, data = _count_fragments_in_peaks_gpu(
-                filtered, peaks_by_chrom, barcode_mapping, n_peaks
+                filtered, peaks_by_chrom, barcode_mapping, n_peaks, counting_strategy
             )
             all_rows.append(rows)
             all_cols.append(cols)
@@ -1502,13 +1548,14 @@ def make_peak_matrix(
     use_rep: str = "peaks",
     peak_file: Optional[Path] = None,
     genome: Union[str, dict] = "hg38",
+    counting_strategy: str = "paired-insertion",
     inplace: bool = False,
     batch_size: int = 50,
     verbose: Union[bool, str] = True,
 ) -> Optional["AnnData"]:
     """Generate cell by peak count matrix.
 
-    This function counts fragments overlapping with peak regions to create
+    This function counts fragment insertions overlapping with peak regions to create
     a cell × peak count matrix. Efficiently processes multiple parquet files
     using batched row group reading to minimize memory usage.
 
@@ -1532,6 +1579,15 @@ def make_peak_matrix(
     genome
         Genome name (e.g., 'hg38', 'mm10') or dict of chromosome sizes.
         Used for validation.
+    counting_strategy
+        Counting strategy for peak matrix generation. Options are:
+        - 'paired-insertion' (default): Count TN5 insertions at fragment ends
+          (start and end-1 positions). If both insertions fall in the same peak,
+          count only once. This matches SnapATAC2's default behavior.
+        - 'insertion': Count each insertion separately. A fragment overlapping
+          a peak with both ends counts as 2.
+        - 'fragment': Legacy behavior. Count if any part of the fragment overlaps
+          the peak.
     inplace
         Whether to add the peak matrix to the AnnData object (not recommended,
         will replace .X). If False, returns a new AnnData object.
@@ -1710,6 +1766,7 @@ def make_peak_matrix(
             barcode_to_idx,
             n_peaks,
             batch_size=batch_size,
+            counting_strategy=counting_strategy,
         )
         
         all_rows.append(rows)

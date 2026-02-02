@@ -58,8 +58,7 @@ def make_tile_matrix(
     exclude_chroms: Optional[list] = ["chrM", "chrY", "M", "Y"],
     metrics: Optional[str | Path | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
-    binarize: bool = False,
-    weighted_counts: bool = False,
+    count_strategy: str = "unique",
     barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
 ) -> 'sc.AnnData':
@@ -84,11 +83,12 @@ def make_tile_matrix(
         Path to a CSV file or a cuDF DataFrame containing cell metrics for filtering.
     filter_query : str, optional
         Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
-    binarize : bool
-        If True, convert final counts in tile matrix to binary (0 or 1). (default: False)
-    weighted_counts : bool
-        If True, use the 'count' column (PCR duplicates). If False, count each 
-        unique fragment once (matches SnapATAC2 default). (default: False)
+    count_strategy : str
+        Strategy for counting fragments in tiles. Options:
+        - "unique": Count each unique fragment once (SnapATAC2 default)
+        - "count": Use PCR duplicate counts from the 'count' column
+        - "binarize": Convert counts to binary (0/1) per tile
+        (default: "unique")
     barcode_prefix : str, optional
         Prefix to add to barcodes
     low_memory : bool
@@ -147,7 +147,7 @@ def make_tile_matrix(
             cell_metadata=cell_metadata_input,
             filter_query=filter_query,
             return_sparse=True,
-            weighted_counts=weighted_counts
+            count_strategy=count_strategy
         )
         return matrix, cell_metadata, tile_metadata
 
@@ -168,11 +168,6 @@ def make_tile_matrix(
                 raise e
         else:
             raise e
-
-    # Apply binarization if requested
-    if binarize:
-        logger.info("Binarizing tile matrix")
-        matrix.data = (matrix.data > 0).astype(cp.float32)
 
     # Convert to AnnData
     adata = tile_matrix_to_anndata(matrix, cell_metadata, tile_metadata)

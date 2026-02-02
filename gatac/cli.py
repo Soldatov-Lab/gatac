@@ -76,6 +76,7 @@ def tile_command(args):
             exclude_chroms=args.exclude_chroms,
             metrics=args.metrics,
             filter_query=args.filter_query,
+            count_strategy=args.count_strategy,
             barcode_prefix=args.barcode_prefix,
             low_memory=args.low_memory,
         )
@@ -330,6 +331,12 @@ def main():
         '--low-memory',
         action='store_true',
         help='Use low memory mode for Parquet reading'
+    )
+    tile_parser.add_argument(
+        '--count-strategy',
+        choices=['unique', 'count', 'binarize'],
+        default='unique',
+        help='Counting strategy: unique (SnapATAC2 default), count (PCR duplicates), or binarize (binary 0/1)'
     )
     tile_parser.set_defaults(func=tile_command)
 

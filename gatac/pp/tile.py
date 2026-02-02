@@ -22,7 +22,7 @@ def create_tile_matrix_gpu(
     cell_metadata: Optional[cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     return_sparse: bool = True,
-    weighted_counts: bool = False
+    count_strategy: str = "unique"
 ) -> Tuple[cusp.csr_matrix, cudf.DataFrame, cudf.DataFrame]:
     """
     Generate a tile matrix from ATAC fragment data using GPU acceleration.
@@ -47,9 +47,12 @@ def create_tile_matrix_gpu(
         Additional query string for filtering cells based on cell_metadata.
     return_sparse : bool
         Return sparse matrix (True) or dense array (False)
-    weighted_counts : bool
-        If True, use the 'count' column (PCR duplicates). If False, count each 
-        unique fragment once (matches SnapATAC2 default). (default: False)
+    count_strategy : str
+        Strategy for counting fragments in tiles. Options:
+        - "unique": Count each unique fragment once (SnapATAC2 default)
+        - "count": Use PCR duplicate counts from the 'count' column
+        - "binarize": Convert counts to binary (0/1) per tile
+        (default: "unique")
 
     Returns
     -------
@@ -198,12 +201,22 @@ def create_tile_matrix_gpu(
     insertions = cudf.concat([df_ins1, df_ins2])
     insertions['global_tile_idx'] = insertions['tile_idx'] + insertions['offset']
 
-    if not weighted_counts:
+    # Apply counting strategy
+    if count_strategy not in ["unique", "count", "binarize"]:
+        raise ValueError(f"Invalid count_strategy: {count_strategy}. Must be 'unique', 'count', or 'binarize'")
+    
+    if count_strategy in ["unique", "binarize"]:
+        # For unique and binarize, treat each fragment as 1 initially
         insertions['count'] = 1
 
     logger.debug("Building sparse matrix")
     try:
+        # Aggregate counts per tile
         matrix_data = insertions.groupby(['cell_idx', 'global_tile_idx'])['count'].sum().reset_index()
+        
+        # Apply binarization if requested
+        if count_strategy == "binarize":
+            matrix_data['count'] = (matrix_data['count'] > 0).astype(cp.uint8)
 
         row_indices = matrix_data['cell_idx'].values
         col_indices = matrix_data['global_tile_idx'].values

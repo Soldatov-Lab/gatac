@@ -276,6 +276,9 @@ def _filter_single_file_streaming(
     total_frags_out = 0
     writer = None
 
+    # Convert valid_chroms to cudf Series for efficient filtering if needed
+    valid_chrom_series = cudf.Series(list(valid_chroms)) if valid_chroms else None
+
     try:
         for batch_start in range(0, n_row_groups, row_groups_per_batch):
             batch_end = min(batch_start + row_groups_per_batch, n_row_groups)
@@ -287,8 +290,14 @@ def _filter_single_file_streaming(
             if barcode_prefix:
                 df[barcode_column] = barcode_prefix + df[barcode_column].astype(str)
             
+            # Filter by barcode
             mask = df[barcode_column].isin(valid_bc_series)
             df_filtered = df[mask]
+            
+            # Also filter by chromosome if valid_chroms is specified
+            if valid_chrom_series is not None:
+                chrom_mask = df_filtered['chrom'].isin(valid_chrom_series)
+                df_filtered = df_filtered[chrom_mask]
             total_frags_out += len(df_filtered)
             
             if len(df_filtered) > 0:

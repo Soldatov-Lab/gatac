@@ -616,6 +616,7 @@ def call_peaks(
     inplace: bool = True,
     verbose: bool = True,
     batch_size: int = 10,
+    filter_chromosomes: bool = True,
 ) -> Optional[dict]:
     """
     GPU-accelerated peak calling per cluster using gmacs algorithm.
@@ -660,6 +661,9 @@ def call_peaks(
     batch_size : int
         Number of parquet row groups to load at once (default: 10).
         Increase for faster processing, decrease to reduce memory usage.
+    filter_chromosomes : bool
+        If True, only keep fragments from chromosomes present in the 
+        provided genome (default: True).
         
     Returns
     -------
@@ -796,6 +800,16 @@ def call_peaks(
             logger.warning(f"  No fragments found for group {group_str}")
             peaks_dict[group_str] = pd.DataFrame()
             continue
+        
+        # Filter to classical chromosomes if genome was provided
+        if filter_chromosomes:
+            chrom_names = list(chrom_sizes.keys())
+            fragments_df = fragments_df[fragments_df['chrom'].isin(chrom_names)]
+            
+            if len(fragments_df) == 0:
+                logger.warning(f"  No fragments found for group {group_str} after filtering chromosomes")
+                peaks_dict[group_str] = pd.DataFrame()
+                continue
         
         num_reads = len(fragments_df)
         logger.info(f"  {num_reads:,} fragments, calling peaks...")

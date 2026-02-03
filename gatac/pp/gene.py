@@ -329,7 +329,7 @@ def create_gene_matrix_gpu(
         cell_indices = chrom_frags['cell_idx'].values
         
         # Find overlapping genes for BOTH insertions, then deduplicate per fragment
-        pairs = _find_fragment_gene_pairs_chunked(
+        pairs = _find_fragment_gene_pairs_vectorized(
             frag_starts, frag_ends, cell_indices,
             gene_starts, gene_ends, gene_indices
         )
@@ -397,18 +397,19 @@ def create_gene_matrix_gpu(
     return matrix, cell_metadata, gene_metadata
 
 
-def _find_fragment_gene_pairs_chunked(
+def _find_fragment_gene_pairs_vectorized(
     frag_starts: cp.ndarray,
     frag_ends: cp.ndarray,
     cell_indices: cp.ndarray,
     gene_starts: cp.ndarray,
     gene_ends: cp.ndarray,
     gene_indices: cp.ndarray,
-    chunk_size: int = 2000000,
+    chunk_size: int = 500_000,
 ) -> Optional[cudf.DataFrame]:
     """
     Find all (cell, fragment, gene) pairs where either insertion overlaps the gene.
-    Uses chunking and optimized memory usage.
+    
+    Fully vectorized with small 2D window. Gene overlaps if: gene_start <= position < gene_end
     """
     n_fragments = len(frag_starts)
     n_genes = len(gene_starts)
@@ -420,62 +421,54 @@ def _find_fragment_gene_pairs_chunked(
     all_pairs_frags = []
     all_pairs_genes = []
     
-    # Process both insertions: starts and ends
-    insertions = cp.zeros(2 * n_fragments, dtype=frag_starts.dtype)
-    insertions[:n_fragments] = frag_starts
-    insertions[n_fragments:] = frag_ends
+    # Small window - SnapATAC2 uses 100
+    max_check = 100
+    offsets = cp.arange(max_check, dtype=cp.int32)
     
-    # Map back to cell and fragment indices
-    ins_cell_indices = cp.concatenate([cell_indices, cell_indices])
-    ins_frag_indices = cp.concatenate([cp.arange(n_fragments, dtype=cp.int32), 
-                                      cp.arange(n_fragments, dtype=cp.int32)])
-    
-    n_ins = len(insertions)
-    for i in range(0, n_ins, chunk_size):
-        end_idx = min(i + chunk_size, n_ins)
-        pos_chunk = insertions[i:end_idx]
-        cell_chunk = ins_cell_indices[i:end_idx]
-        frag_chunk = ins_frag_indices[i:end_idx]
+    for chunk_start in range(0, n_fragments, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, n_fragments)
         
-        # Use searchsorted to find potential overlapping genes
-        right_idx = cp.searchsorted(gene_starts, pos_chunk, side='right')
+        starts = frag_starts[chunk_start:chunk_end]
+        ends = frag_ends[chunk_start:chunk_end]
+        cells = cell_indices[chunk_start:chunk_end]
+        frag_idxs = cp.arange(chunk_start, chunk_end, dtype=cp.int32)
         
-        # Check genes in a window before right_idx
-        # SnapATAC2 handles up to 95 transcripts in dense regions
-        max_check = 100 
-        check_range = cp.arange(max_check, dtype=cp.int32)
+        # Both insertions
+        positions = cp.concatenate([starts, ends])
+        pos_cells = cp.concatenate([cells, cells])
+        pos_frags = cp.concatenate([frag_idxs, frag_idxs])
+        n_pos = len(positions)
         
-        # Candidate gene indices
-        candidate_gene_idx = right_idx[:, None] - max_check + check_range[None, :]
-        candidate_gene_idx = cp.clip(candidate_gene_idx, 0, n_genes - 1)
+        # searchsorted on gene_starts: index of first gene with start > position
+        right_idx = cp.searchsorted(gene_starts, positions, side='right')
         
-        # Get gene boundaries for candidates
-        cand_starts = gene_starts[candidate_gene_idx]
-        cand_ends = gene_ends[candidate_gene_idx]
-        cand_gene_ids = gene_indices[candidate_gene_idx]
+        # Create 2D candidate indices: (n_pos, max_check)
+        # candidate[i,j] = right_idx[i] - 1 - j
+        cand_idx = right_idx[:, None] - 1 - offsets[None, :]  # (n_pos, max_check)
         
-        # Check overlap: gene_start <= position < gene_end
-        overlaps = (cand_starts <= pos_chunk[:, None]) & (pos_chunk[:, None] < cand_ends)
+        # Clip to valid range and mark invalid
+        valid = (cand_idx >= 0) & (cand_idx < n_genes)
+        cand_idx_safe = cp.clip(cand_idx, 0, n_genes - 1)
         
-        # Extract valid pairs
-        overlap_idx = cp.where(overlaps)
-        if len(overlap_idx[0]) > 0:
-            row_idx = overlap_idx[0]
-            col_idx = overlap_idx[1]
-            
-            all_pairs_cells.append(cell_chunk[row_idx])
-            all_pairs_frags.append(frag_chunk[row_idx])
-            all_pairs_genes.append(cand_gene_ids[row_idx, col_idx])
-            
-        # Free memory within loop
-        del pos_chunk, cell_chunk, frag_chunk, right_idx, candidate_gene_idx, cand_starts, cand_ends, cand_gene_ids, overlaps, overlap_idx
+        # Look up gene ends for candidates
+        cand_ends = gene_ends[cand_idx_safe]
+        
+        # Overlap: gene_start <= pos (guaranteed by searchsorted) AND gene_end > pos
+        overlaps = valid & (cand_ends > positions[:, None])
+        
+        # Extract overlapping pairs
+        row_idx, col_idx = cp.where(overlaps)
+        if len(row_idx) > 0:
+            all_pairs_cells.append(pos_cells[row_idx])
+            all_pairs_frags.append(pos_frags[row_idx])
+            all_pairs_genes.append(gene_indices[cand_idx_safe[row_idx, col_idx]])
+        
+        del positions, pos_cells, pos_frags, right_idx, cand_idx, cand_idx_safe, cand_ends, overlaps
         cp._default_memory_pool.free_all_blocks()
     
     if len(all_pairs_cells) == 0:
         return None
     
-    # Combine all pairs and deduplicate (frag_idx, gene_idx) within chunked results
-    # so we return a reasonably sized DataFrame
     return cudf.DataFrame({
         'cell_idx': cp.concatenate(all_pairs_cells),
         'frag_idx': cp.concatenate(all_pairs_frags),

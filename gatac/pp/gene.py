@@ -304,8 +304,12 @@ def create_gene_matrix_gpu(
     logger.debug(f"Computing matrix: {n_cells} cells × {n_genes} genes")
 
     # Process each chromosome separately to manage memory
-    all_cell_gene_pairs = []
-    frag_offset = 0  # Global offset to ensure unique frag_idx across chromosomes
+    all_transcript_counts = []
+    
+    # Create gene index mapping (unique gene_names)
+    unique_genes = gene_df[['gene_name']].drop_duplicates().reset_index(drop=True)
+    unique_genes['final_gene_idx'] = cp.arange(len(unique_genes))
+    n_final_genes = len(unique_genes)
 
     for chrom in valid_chroms:
         chrom_frags = fragments_df[fragments_df['chrom'] == chrom]
@@ -313,8 +317,6 @@ def create_gene_matrix_gpu(
         
         if len(chrom_frags) == 0 or len(chrom_genes) == 0:
             continue
-        
-        n_chrom_frags = len(chrom_frags)
         
         # Get gene boundaries as cupy arrays for searchsorted
         gene_starts = chrom_genes['start'].values
@@ -325,55 +327,47 @@ def create_gene_matrix_gpu(
         frag_starts = chrom_frags['start'].values
         frag_ends = (chrom_frags['end'] - 1).values
         cell_indices = chrom_frags['cell_idx'].values
-        frag_indices = cp.arange(n_chrom_frags) + frag_offset  # Globally unique fragment index
         
         # Find overlapping genes for BOTH insertions, then deduplicate per fragment
-        # This matches SnapATAC2's paired-insertion counting strategy:
-        # For each fragment, count each gene at most once (even if both insertions overlap it)
-        
-        pairs = _find_fragment_gene_pairs(
-            frag_starts, frag_ends, cell_indices, frag_indices,
+        pairs = _find_fragment_gene_pairs_chunked(
+            frag_starts, frag_ends, cell_indices,
             gene_starts, gene_ends, gene_indices
         )
+        
         if pairs is not None:
-            all_cell_gene_pairs.append(pairs)
-        
-        frag_offset += n_chrom_frags
+            # Aggregate per chromosome to save memory
+            # 1. Deduplicate: each (fragment, transcript) pair counts as 1
+            pairs = pairs.drop_duplicates()
+            
+            # 2. Count per (cell, transcript) 
+            transcript_counts = pairs.groupby(['cell_idx', 'gene_idx']).size().reset_index(name='count')
+            all_transcript_counts.append(transcript_counts)
+            
+            # Clear intermediate data
+            del pairs, transcript_counts
+            cp._default_memory_pool.free_all_blocks()
 
-    # Build sparse matrix - first at transcript level, then MAX aggregate to gene level
-    if len(all_cell_gene_pairs) > 0:
-        all_pairs = cudf.concat(all_cell_gene_pairs, ignore_index=True)
+    # Build sparse matrix
+    if len(all_transcript_counts) > 0:
+        transcript_counts = cudf.concat(all_transcript_counts, ignore_index=True)
         
-        # Deduplicate: each (fragment, transcript) pair counts as 1
-        # (handles case where both insertions overlap same transcript)
-        all_pairs = all_pairs.drop_duplicates(subset=['frag_idx', 'gene_idx'])
-        
-        # Count per (cell, transcript) - this is transcript-level counting
-        transcript_counts = all_pairs.groupby(['cell_idx', 'gene_idx']).size().reset_index(name='count')
-        
-        # MAX aggregation: for each cell, take max count across all transcripts of same gene
-        # First, add gene_name to transcript_counts
+        # Add gene_name for MAX aggregation
         transcript_counts = transcript_counts.merge(
             gene_df[['gene_idx', 'gene_name']],
             on='gene_idx',
             how='left'
         )
         
-        # Group by (cell_idx, gene_name) and take MAX count
+        # MAX aggregation: for each (cell, gene_name), take max count across transcripts
         gene_counts = transcript_counts.groupby(['cell_idx', 'gene_name'])['count'].max().reset_index()
         
-        # Create gene index mapping (unique genes)
-        unique_genes = gene_df[['gene_name']].drop_duplicates().reset_index(drop=True)
-        unique_genes['final_gene_idx'] = cp.arange(len(unique_genes))
-        
+        # Map to final gene index
         gene_counts = gene_counts.merge(unique_genes, on='gene_name', how='left')
-        
-        n_genes = len(unique_genes)
         
         coo_matrix = cusp.coo_matrix(
             (gene_counts['count'].values.astype(cp.float32), 
              (gene_counts['cell_idx'].values, gene_counts['final_gene_idx'].values)),
-            shape=(n_cells, n_genes),
+            shape=(n_cells, n_final_genes),
             dtype=cp.float32
         )
         matrix = coo_matrix.tocsr()
@@ -385,15 +379,14 @@ def create_gene_matrix_gpu(
         gene_metadata = gene_metadata[['chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name', 'final_gene_idx']]
         gene_metadata = gene_metadata.rename(columns={'final_gene_idx': 'gene_idx'})
     else:
-        # Get unique genes for empty matrix
-        unique_genes = gene_df[['gene_name']].drop_duplicates()
-        n_genes = len(unique_genes)
-        matrix = cusp.csr_matrix((n_cells, n_genes), dtype=cp.float32)
+        matrix = cusp.csr_matrix((n_cells, n_final_genes), dtype=cp.float32)
         gene_metadata = gene_df.groupby('gene_name').first().reset_index()
-        gene_metadata['gene_idx'] = cp.arange(len(gene_metadata))
-        gene_metadata = gene_metadata[['chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name', 'gene_idx']]
+        gene_metadata = gene_metadata.merge(unique_genes, on='gene_name', how='left')
+        gene_metadata = gene_metadata.sort_values('final_gene_idx').reset_index(drop=True)
+        gene_metadata = gene_metadata[['chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name', 'final_gene_idx']]
+        gene_metadata = gene_metadata.rename(columns={'final_gene_idx': 'gene_idx'})
 
-    logger.debug(f"Matrix: {n_cells} cells × {n_genes} genes, nnz: {matrix.nnz:,}")
+    logger.debug(f"Matrix: {n_cells} cells × {n_final_genes} genes, nnz: {matrix.nnz:,}")
 
     # Prepare cell metadata
     cell_metadata = barcode_to_idx.merge(cell_metadata, on='barcode', how='left')
@@ -404,23 +397,18 @@ def create_gene_matrix_gpu(
     return matrix, cell_metadata, gene_metadata
 
 
-def _find_fragment_gene_pairs(
+def _find_fragment_gene_pairs_chunked(
     frag_starts: cp.ndarray,
     frag_ends: cp.ndarray,
     cell_indices: cp.ndarray,
-    frag_indices: cp.ndarray,
     gene_starts: cp.ndarray,
     gene_ends: cp.ndarray,
     gene_indices: cp.ndarray,
+    chunk_size: int = 2000000,
 ) -> Optional[cudf.DataFrame]:
     """
     Find all (cell, fragment, gene) pairs where either insertion overlaps the gene.
-    
-    For paired-insertion counting matching SnapATAC2:
-    - Find all genes overlapped by either the start or end insertion
-    - Return DataFrame with cell_idx, frag_idx, gene_idx
-    - Caller will deduplicate (frag_idx, gene_idx) pairs to ensure each gene
-      is counted at most once per fragment
+    Uses chunking and optimized memory usage.
     """
     n_fragments = len(frag_starts)
     n_genes = len(gene_starts)
@@ -428,20 +416,36 @@ def _find_fragment_gene_pairs(
     if n_fragments == 0 or n_genes == 0:
         return None
     
-    # Process both insertions together
     all_pairs_cells = []
     all_pairs_frags = []
     all_pairs_genes = []
     
-    for positions in [frag_starts, frag_ends]:
-        # Use searchsorted to find potential overlapping genes
-        right_idx = cp.searchsorted(gene_starts, positions, side='right')
+    # Process both insertions: starts and ends
+    insertions = cp.zeros(2 * n_fragments, dtype=frag_starts.dtype)
+    insertions[:n_fragments] = frag_starts
+    insertions[n_fragments:] = frag_ends
+    
+    # Map back to cell and fragment indices
+    ins_cell_indices = cp.concatenate([cell_indices, cell_indices])
+    ins_frag_indices = cp.concatenate([cp.arange(n_fragments, dtype=cp.int32), 
+                                      cp.arange(n_fragments, dtype=cp.int32)])
+    
+    n_ins = len(insertions)
+    for i in range(0, n_ins, chunk_size):
+        end_idx = min(i + chunk_size, n_ins)
+        pos_chunk = insertions[i:end_idx]
+        cell_chunk = ins_cell_indices[i:end_idx]
+        frag_chunk = ins_frag_indices[i:end_idx]
         
-        # For each insertion, check genes in a window before right_idx
-        max_check = 100  # Max overlapping genes to check per insertion (handles dense regions with up to 95 transcripts)
+        # Use searchsorted to find potential overlapping genes
+        right_idx = cp.searchsorted(gene_starts, pos_chunk, side='right')
+        
+        # Check genes in a window before right_idx
+        # SnapATAC2 handles up to 95 transcripts in dense regions
+        max_check = 100 
         check_range = cp.arange(max_check, dtype=cp.int32)
         
-        # Candidate gene indices for each position
+        # Candidate gene indices
         candidate_gene_idx = right_idx[:, None] - max_check + check_range[None, :]
         candidate_gene_idx = cp.clip(candidate_gene_idx, 0, n_genes - 1)
         
@@ -451,23 +455,27 @@ def _find_fragment_gene_pairs(
         cand_gene_ids = gene_indices[candidate_gene_idx]
         
         # Check overlap: gene_start <= position < gene_end
-        positions_expanded = positions[:, None]
-        overlaps = (cand_starts <= positions_expanded) & (positions_expanded < cand_ends)
+        overlaps = (cand_starts <= pos_chunk[:, None]) & (pos_chunk[:, None] < cand_ends)
         
         # Extract valid pairs
         overlap_idx = cp.where(overlaps)
         if len(overlap_idx[0]) > 0:
-            insert_idx = overlap_idx[0]
-            gene_local_idx = overlap_idx[1]
+            row_idx = overlap_idx[0]
+            col_idx = overlap_idx[1]
             
-            all_pairs_cells.append(cell_indices[insert_idx])
-            all_pairs_frags.append(frag_indices[insert_idx])
-            all_pairs_genes.append(cand_gene_ids[insert_idx, gene_local_idx])
+            all_pairs_cells.append(cell_chunk[row_idx])
+            all_pairs_frags.append(frag_chunk[row_idx])
+            all_pairs_genes.append(cand_gene_ids[row_idx, col_idx])
+            
+        # Free memory within loop
+        del pos_chunk, cell_chunk, frag_chunk, right_idx, candidate_gene_idx, cand_starts, cand_ends, cand_gene_ids, overlaps, overlap_idx
+        cp._default_memory_pool.free_all_blocks()
     
     if len(all_pairs_cells) == 0:
         return None
     
-    # Combine all pairs
+    # Combine all pairs and deduplicate (frag_idx, gene_idx) within chunked results
+    # so we return a reasonably sized DataFrame
     return cudf.DataFrame({
         'cell_idx': cp.concatenate(all_pairs_cells),
         'frag_idx': cp.concatenate(all_pairs_frags),

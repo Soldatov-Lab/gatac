@@ -4,6 +4,7 @@ GATAC Command Line Interface.
 Usage:
     gatac convert <input.tsv.gz> [output.parquet]
     gatac tile <input.parquet> [-o output] [-t tile_size] [-m min_frags]
+    gatac gene <input.parquet> -g <annotations.gtf> [-o output]
     gatac features <input.h5ad> [-n n_features] [-o output]
     gatac metrics <input.parquet> -g <annotations.gtf> [-o output]
     gatac filter <input.parquet> [--metrics metrics.csv] [--filter "query"]
@@ -173,6 +174,44 @@ def metrics_command(args):
     logging.info(f"Saving results to {output_path}")
     results.to_csv(str(output_path), index=False)
     logging.info(f"Successfully processed {len(results):,} cells.")
+
+
+def gene_command(args):
+    """Handle 'gatac gene' subcommand."""
+    from .pp.process import make_gene_matrix
+
+    input_path = Path(args.input)
+    gtf_path = Path(args.gtf)
+    
+    if not input_path.exists():
+        logging.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+    if not gtf_path.exists():
+        logging.error(f"GTF file not found: {gtf_path}")
+        sys.exit(1)
+
+    try:
+        make_gene_matrix(
+            input_parquet=input_path,
+            gene_anno=gtf_path,
+            output_path=args.output,
+            id_type=args.id_type,
+            upstream=args.upstream,
+            downstream=args.downstream,
+            include_gene_body=args.include_gene_body,
+            min_fragments_per_cell=args.min_fragments,
+            exclude_chroms=args.exclude_chroms,
+            metrics=args.metrics,
+            filter_query=args.filter_query,
+            barcode_prefix=args.barcode_prefix,
+            low_memory=args.low_memory,
+        )
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Error creating gene matrix: {e}")
+        sys.exit(1)
 
 
 def filter_command(args):
@@ -449,6 +488,85 @@ def main():
         help='Number of parquet row groups per batch (default: 64)'
     )
     filter_parser.set_defaults(func=filter_command)
+
+    # Gene subcommand
+    gene_parser = subparsers.add_parser(
+        'gene',
+        help='Generate gene activity matrix from fragments'
+    )
+    gene_parser.add_argument(
+        'input',
+        help='Input .parquet file'
+    )
+    gene_parser.add_argument(
+        '-g', '--gtf',
+        required=True,
+        help='Path to GTF/GFF gene annotation file'
+    )
+    gene_parser.add_argument(
+        '-o', '--output',
+        help='Output .h5ad file'
+    )
+    gene_parser.add_argument(
+        '--id-type',
+        choices=['gene', 'transcript'],
+        default='gene',
+        help='Feature type to use (default: gene)'
+    )
+    gene_parser.add_argument(
+        '--upstream',
+        type=int,
+        default=2000,
+        help='Base pairs upstream of TSS (default: 2000)'
+    )
+    gene_parser.add_argument(
+        '--downstream',
+        type=int,
+        default=0,
+        help='Base pairs downstream (default: 0)'
+    )
+    gene_parser.add_argument(
+        '--include-gene-body',
+        action='store_true',
+        default=True,
+        help='Include gene body in regulatory domain (default: True)'
+    )
+    gene_parser.add_argument(
+        '--no-gene-body',
+        action='store_false',
+        dest='include_gene_body',
+        help='Exclude gene body from regulatory domain'
+    )
+    gene_parser.add_argument(
+        '-m', '--min-fragments',
+        type=int,
+        default=100,
+        help='Min fragments per cell (default: 100)'
+    )
+    gene_parser.add_argument(
+        '-e', '--exclude-chroms',
+        nargs='+',
+        help='Chromosomes to exclude'
+    )
+    gene_parser.add_argument(
+        '--metrics',
+        help='Path to CSV file with quality metrics for filtering'
+    )
+    gene_parser.add_argument(
+        '--filter',
+        dest='filter_query',
+        help='Filtering query string (e.g., "tsse_score > 5")'
+    )
+    gene_parser.add_argument(
+        '--barcode-prefix',
+        help='Prefix to add to barcodes'
+    )
+    gene_parser.add_argument(
+        '--low-memory',
+        action='store_true',
+        help='Use low memory mode for Parquet reading'
+    )
+    gene_parser.set_defaults(func=gene_command)
 
     args = parser.parse_args()
     setup_logging(args.verbose)

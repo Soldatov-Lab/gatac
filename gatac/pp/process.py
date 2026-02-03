@@ -198,6 +198,7 @@ def make_gene_matrix(
     filter_query: Optional[str] = None,
     barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
+    cell_batch_size: int = 500,
     gene_name_key: str = "gene_name",
     gene_id_key: str = "gene_id",
     transcript_name_key: str = "transcript_name",
@@ -239,6 +240,9 @@ def make_gene_matrix(
         Prefix to add to barcodes
     low_memory : bool
         Use low memory mode for Parquet reading (default: False)
+    cell_batch_size : int
+        Number of cells to process per batch (default: 500). Lower values
+        reduce GPU memory usage but may be slower.
     gene_name_key : str
         Key for gene name in GTF attributes (default: "gene_name").
     gene_id_key : str
@@ -309,6 +313,7 @@ def make_gene_matrix(
             min_fragments_per_cell=min_fragments_per_cell,
             cell_metadata=cell_metadata_input,
             filter_query=filter_query,
+            cell_batch_size=cell_batch_size,
         )
         return matrix, cell_metadata, gene_metadata
 

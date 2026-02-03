@@ -21,6 +21,7 @@ from cupyx.scipy.special import pdtr, pdtrc
 from numba import njit, prange
 
 from ..pp.genome import get_chrom_sizes
+from ..pp.gene import optimize_sparse_matrix_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -1819,22 +1820,12 @@ def make_peak_matrix(
     if count_matrix is None:
         count_matrix = sp.csr_matrix((n_cells, n_peaks), dtype=np.int32)
     
-    # Auto-select optimal dtype based on max count value
+    # Optimize dtype to save memory
     if count_matrix.nnz > 0:
-        max_count = count_matrix.data.max()
-        if max_count <= np.iinfo(np.uint8).max:
-            matrix_dtype = np.uint8
-            logger.info(f"Using uint8 dtype (max count: {max_count})")
-        elif max_count <= np.iinfo(np.uint16).max:
-            matrix_dtype = np.uint16
-            logger.info(f"Using uint16 dtype (max count: {max_count})")
-        else:
-            matrix_dtype = np.int32
-            logger.info(f"Using int32 dtype (max count: {max_count})")
-        
-        # Convert to optimal dtype if different
-        if matrix_dtype != count_matrix.dtype:
-            count_matrix = count_matrix.astype(matrix_dtype)
+        max_count = int(count_matrix.data.max())
+        target_dtype = optimize_sparse_matrix_dtype(max_count)
+        if target_dtype != count_matrix.dtype:
+            count_matrix = count_matrix.astype(target_dtype)
     
     logger.info(f"Peak matrix: {n_cells:,} cells × {n_peaks:,} peaks")
     if n_cells * n_peaks > 0:

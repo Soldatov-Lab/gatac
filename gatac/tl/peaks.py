@@ -637,7 +637,8 @@ def call_peaks(
         If directory, uses `source_file` obs to find specific files.
     genome : str or dict
         Genome name (e.g., 'hg38', 'mm10') or dict of chromosome sizes.
-        Used to compute genome_length for significance calculations.
+        Used to compute genome_length for significance calculations and for 
+        chromosome filtering.
     q_thresh : float
         Q-value threshold for peak calling (default: 0.05)
     d_treat : int
@@ -662,9 +663,10 @@ def call_peaks(
         Number of parquet row groups to load at once (default: 10).
         Increase for faster processing, decrease to reduce memory usage.
     filter_chromosomes : bool
-        If True, only keep fragments from chromosomes present in the 
-        provided genome (default: True).
-        
+        If True, only keep fragments from chromosomes recognized by the 
+        provided genome (keys if genome is a dict, or standard chromosomes 
+        for the named genome) (default: True).
+    
     Returns
     -------
     dict[str, pd.DataFrame] or None
@@ -1420,6 +1422,8 @@ def _read_and_count_fragments_batched(
     n_peaks: int,
     batch_size: int = 10,
     counting_strategy: str = "paired-insertion",
+    filter_chromosomes: bool = True,
+    chrom_names: Optional[list[str]] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Read fragments from parquet in batches and count insertions in peaks.
@@ -1442,6 +1446,10 @@ def _read_and_count_fragments_batched(
         Number of row groups to load at once
     counting_strategy : str
         Counting strategy: 'paired-insertion' (default), 'insertion', or 'fragment'
+    filter_chromosomes : bool
+        If True, only keep fragments from chromosomes present in `chrom_names` (default: True).
+    chrom_names : list[str], optional
+        List of allowed chromosome names for filtering.
         
     Returns
     -------
@@ -1503,6 +1511,10 @@ def _read_and_count_fragments_batched(
             # Filter to target barcodes
             filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
             
+            # Filter chromosomes if requested
+            if filter_chromosomes and chrom_names is not None:
+                filtered = filtered[filtered['chrom'].isin(chrom_names)]
+            
             if len(filtered) > 0:
                 rows, cols, data = _count_fragments_in_peaks_gpu(
                     filtered, peaks_by_chrom, barcode_mapping, n_peaks, counting_strategy
@@ -1512,6 +1524,10 @@ def _read_and_count_fragments_batched(
         
         # Filter to target barcodes
         filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
+        
+        # Filter chromosomes if requested
+        if filter_chromosomes and chrom_names is not None:
+            filtered = filtered[filtered['chrom'].isin(chrom_names)]
         
         if len(filtered) > 0:
             rows, cols, data = _count_fragments_in_peaks_gpu(
@@ -1542,6 +1558,7 @@ def make_peak_matrix(
     inplace: bool = False,
     batch_size: int = 50,
     verbose: Union[bool, str] = True,
+    filter_chromosomes: bool = True,
 ) -> Optional["AnnData"]:
     """Generate cell by peak count matrix.
 
@@ -1568,7 +1585,7 @@ def make_peak_matrix(
         from this file instead of `use_rep`.
     genome
         Genome name (e.g., 'hg38', 'mm10') or dict of chromosome sizes.
-        Used for validation.
+        Used for validation and chromosome filtering.
     counting_strategy
         Counting strategy for peak matrix generation. Options are:
         - 'paired-insertion' (default): Count TN5 insertions at fragment ends
@@ -1589,6 +1606,10 @@ def make_peak_matrix(
         - False: no output
         - True or "tqdm": show tqdm progress bar
         - "log": print one line per file with ETA (useful for non-interactive environments)
+    filter_chromosomes : bool
+        If True, only keep fragments from chromosomes recognized by the 
+        provided genome (keys if genome is a dict, or standard chromosomes 
+        for the named genome) (default: True).
 
     Returns
     -------
@@ -1650,6 +1671,13 @@ def make_peak_matrix(
         peaks_df = peaks_df[['chrom', 'start', 'end']].copy()
     else:
         raise ValueError("Must specify either peak_file or use_rep")
+    
+    # Get chrom sizes for filtering
+    if isinstance(genome, str):
+        chrom_sizes = get_chrom_sizes(genome)
+    else:
+        chrom_sizes = genome
+    chrom_names = list(chrom_sizes.keys()) if chrom_sizes is not None else None
     
     logger.info(f"Counting fragments in {len(peaks_df):,} peaks")
     
@@ -1757,6 +1785,8 @@ def make_peak_matrix(
             n_peaks,
             batch_size=batch_size,
             counting_strategy=counting_strategy,
+            filter_chromosomes=filter_chromosomes,
+            chrom_names=chrom_names,
         )
         
         all_rows.append(rows)

@@ -1734,10 +1734,10 @@ def make_peak_matrix(
             file_to_barcodes = {parquet_path: all_barcodes}
             logger.info("Processing single parquet file")
     
-    # Collect sparse matrix components
-    all_rows = []
-    all_cols = []
-    all_data = []
+    # Build CSR matrix incrementally to avoid OOM from holding COO + CSR simultaneously
+    # Initialize accumulator as None (will be created with first batch)
+    count_matrix = None
+    matrix_dtype = np.int32  # Will be refined later
     
     # Process each parquet file
     n_files = len(parquet_files)
@@ -1789,29 +1789,39 @@ def make_peak_matrix(
             chrom_names=chrom_names,
         )
         
-        all_rows.append(rows)
-        all_cols.append(cols)
-        all_data.append(data)
+        # Convert batch to CSR immediately and add to accumulator
+        # This avoids holding all COO data in memory until the end
+        if len(rows) > 0:
+            # Create CSR for this batch (coo -> csr aggregates duplicates)
+            batch_matrix = sp.coo_matrix(
+                (data, (rows, cols)),
+                shape=(n_cells, n_peaks),
+                dtype=np.int32,
+            ).tocsr()
+            
+            # Free the COO data immediately
+            del rows, cols, data
+            
+            if count_matrix is None:
+                count_matrix = batch_matrix
+            else:
+                # CSR addition is efficient and in-place friendly
+                count_matrix = count_matrix + batch_matrix
+            
+            del batch_matrix
         
         # Cleanup
         gc.collect()
         mempool.free_all_blocks()
         pinned_mempool.free_all_blocks()
     
-    # Concatenate arrays and create sparse matrix
-    # scipy's coo_matrix + tocsr() will automatically aggregate duplicates (much faster than Counter)
-    if len(all_rows) > 0:
-        all_rows = np.concatenate(all_rows)
-        all_cols = np.concatenate(all_cols)
-        all_data = np.concatenate(all_data)
-    else:
-        all_rows = np.array([], dtype=np.int32)
-        all_cols = np.array([], dtype=np.int32)
-        all_data = np.array([], dtype=np.int32)
+    # Handle empty case
+    if count_matrix is None:
+        count_matrix = sp.csr_matrix((n_cells, n_peaks), dtype=np.int32)
     
     # Auto-select optimal dtype based on max count value
-    if len(all_data) > 0:
-        max_count = np.max(all_data)
+    if count_matrix.nnz > 0:
+        max_count = count_matrix.data.max()
         if max_count <= np.iinfo(np.uint8).max:
             matrix_dtype = np.uint8
             logger.info(f"Using uint8 dtype (max count: {max_count})")
@@ -1821,15 +1831,10 @@ def make_peak_matrix(
         else:
             matrix_dtype = np.int32
             logger.info(f"Using int32 dtype (max count: {max_count})")
-    else:
-        matrix_dtype = np.int32
-    
-    # Create sparse matrix (coo_matrix handles duplicates, tocsr() aggregates them)
-    count_matrix = sp.coo_matrix(
-        (all_data, (all_rows, all_cols)),
-        shape=(n_cells, n_peaks),
-        dtype=matrix_dtype,
-    ).tocsr()
+        
+        # Convert to optimal dtype if different
+        if matrix_dtype != count_matrix.dtype:
+            count_matrix = count_matrix.astype(matrix_dtype)
     
     logger.info(f"Peak matrix: {n_cells:,} cells × {n_peaks:,} peaks")
     if n_cells * n_peaks > 0:

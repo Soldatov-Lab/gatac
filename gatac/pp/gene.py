@@ -264,12 +264,8 @@ def create_gene_matrix_gpu(
     # Convert gene regions to cudf for GPU processing
     gene_df = cudf.from_pandas(gene_regions.to_pandas())
     
-    # Get chromosomes present in both gene annotation AND fragment data
-    gene_chroms = set(gene_df['chrom'].unique().to_arrow().to_pylist())
-    frag_chroms = set(fragments_df['chrom'].unique().to_arrow().to_pylist())
-    
-    # Intersect: only chromosomes in both datasets
-    valid_chroms = gene_chroms & frag_chroms
+    # Get valid chromosomes (those in gene annotation, minus excluded ones)
+    valid_chroms = set(gene_df['chrom'].unique().to_arrow().to_pylist())
     
     if exclude_chroms is not None:
         if isinstance(exclude_chroms, str):
@@ -279,10 +275,13 @@ def create_gene_matrix_gpu(
     valid_chroms = sorted(list(valid_chroms))  # Sort for reproducibility
     
     if len(valid_chroms) == 0:
-        raise ValueError("No common chromosomes between gene annotation and fragment data")
+        raise ValueError("No valid chromosomes in gene annotation after exclusion")
     
     # Filter fragments to valid chromosomes
-    fragments_for_counting = fragments_df[fragments_df['chrom'].isin(valid_chroms)]
+    # Use categories to avoid ValueError in cudf if some valid_chroms are missing from fragments
+    cats = fragments_df['chrom'].dtype.categories.to_arrow().to_pylist()
+    fetch_chroms = [c for c in valid_chroms if c in cats]
+    fragments_for_counting = fragments_df[fragments_df['chrom'].isin(fetch_chroms)]
     
     # Cell filtering (same logic as tile matrix)
     if cell_metadata is None:
@@ -319,8 +318,14 @@ def create_gene_matrix_gpu(
         valid_barcodes = cell_metadata['barcode']
 
     # Filter fragments to valid barcodes and chromosomes  
-    fragments_df = fragments_df[fragments_df['barcode'].isin(valid_barcodes)]
-    fragments_df = fragments_df[fragments_df['chrom'].isin(valid_chroms)]
+    # Use categories to avoid ValueError in cudf
+    barcode_cats = fragments_df['barcode'].dtype.categories.to_arrow().to_pylist()
+    fetch_bc = [b for b in valid_barcodes.to_arrow().to_pylist() if b in barcode_cats]
+    fragments_df = fragments_df[fragments_df['barcode'].isin(fetch_bc)]
+    
+    chrom_cats = fragments_df['chrom'].dtype.categories.to_arrow().to_pylist()
+    fetch_chroms = [c for c in valid_chroms if c in chrom_cats]
+    fragments_df = fragments_df[fragments_df['chrom'].isin(fetch_chroms)]
     
     # Get unique barcodes and create mapping
     unique_barcodes = fragments_df['barcode'].unique().reset_index(drop=True)
@@ -336,17 +341,26 @@ def create_gene_matrix_gpu(
     gene_df = gene_df.reset_index(drop=True)
     gene_df['gene_idx'] = cp.arange(len(gene_df))
     
-    # Create gene index mapping (unique gene_names)
-    unique_genes = gene_df[['gene_name']].drop_duplicates().reset_index(drop=True)
-    unique_genes['final_gene_idx'] = cp.arange(len(unique_genes))
-    n_final_genes = len(unique_genes)
+    # Check if we should aggregate by gene_name (SnapATAC2 default for id_type='gene')
+    # If the user requested transcript-level (id_type='transcript'), we don't aggregate.
+    # We can detect this by checking if 'id' and 'gene_name' are different for any row,
+    # or more simply, if gene_regions has 'transcript_id' info but was filtered.
+    # Actually, load_gene_annotation already sets 'id' and 'name' appropriately.
+    # Consistency with SnapATAC2: if id_type='gene', we take MAX across transcripts.
+    # If id_type='transcript', 'id' is transcript_id.
     
-    # Build gene_idx -> gene_name -> final_gene_idx mapping
-    gene_to_final = gene_df[['gene_idx', 'gene_name']].merge(
-        unique_genes, on='gene_name', how='left'
+    # Create feature mapping
+    # By default, use 'id' as the unique feature identifier
+    unique_features = gene_df[['id']].drop_duplicates().sort_values('id').reset_index(drop=True)
+    unique_features['final_feature_idx'] = cp.arange(len(unique_features))
+    n_final_features = len(unique_features)
+    
+    # Build gene_idx -> final_feature_idx mapping
+    gene_to_final = gene_df[['gene_idx', 'id']].merge(
+        unique_features, on='id', how='left'
     )
     
-    logger.debug(f"Computing matrix: {n_cells} cells × {n_final_genes} genes (batch size: {cell_batch_size})")
+    logger.debug(f"Computing matrix: {n_cells} cells × {n_final_features} features (batch size: {cell_batch_size})")
 
     # Prepare chromosome-level gene data (sorted by start for searchsorted)
     chrom_gene_data = {}
@@ -374,7 +388,9 @@ def create_gene_matrix_gpu(
         
         # Filter fragments for this batch
         batch_barcodes_gpu = cudf.Series(batch_barcodes)
-        batch_frags = fragments_df[fragments_df['barcode'].isin(batch_barcodes_gpu)]
+        # Safe isin for categorical barcode
+        fetch_batch_bc = [b for b in batch_barcodes if b in barcode_cats]
+        batch_frags = fragments_df[fragments_df['barcode'].isin(fetch_batch_bc)]
         
         if len(batch_frags) == 0:
             # Empty batch - create zero matrix
@@ -392,7 +408,7 @@ def create_gene_matrix_gpu(
         batch_transcript_counts = []
         
         for chrom in valid_chroms:
-            if chrom not in chrom_gene_data:
+            if chrom not in chrom_gene_data or chrom not in chrom_cats:
                 continue
                 
             chrom_frags = batch_frags[batch_frags['chrom'] == chrom]
@@ -427,31 +443,34 @@ def create_gene_matrix_gpu(
             # Aggregate by (cell_idx, gene_idx) first
             all_counts = all_counts.groupby(['cell_idx', 'gene_idx'])['count'].sum().reset_index()
             
-            # Map gene_idx to final_gene_idx via gene_name (for MAX aggregation)
+            # Map gene_idx to final_feature_idx
             all_counts = all_counts.merge(gene_to_final, on='gene_idx', how='left')
             
-            # MAX aggregation: for each (cell, gene_name), take max count across transcripts
-            gene_counts = all_counts.groupby(['cell_idx', 'final_gene_idx'])['count'].max().reset_index()
+            # MAX aggregation: for each (cell, feature_id), take max count across transcripts
+            # This handles transcripts -> gene aggregation if id_type was 'gene'
+            # because 'id' would be the gene_id for multiple transcripts.
+            # If id_type was 'transcript', 'id' is unique to each transcript, so max is just the value.
+            feature_counts = all_counts.groupby(['cell_idx', 'final_feature_idx'])['count'].max().reset_index()
             del all_counts
             
             # Track max for dtype selection
-            batch_max = int(gene_counts['count'].max())
+            batch_max = int(feature_counts['count'].max())
             max_count_overall = max(max_count_overall, batch_max)
             
             # Build sparse matrix for this batch (on CPU)
-            gene_counts_pd = gene_counts.to_pandas()
-            del gene_counts
+            feature_counts_pd = feature_counts.to_pandas()
+            del feature_counts
             cp._default_memory_pool.free_all_blocks()
             
             batch_matrix = sp.coo_matrix(
-                (gene_counts_pd['count'].values.astype(np.int32),
-                 (gene_counts_pd['cell_idx'].values, gene_counts_pd['final_gene_idx'].values)),
-                shape=(batch_size, n_final_genes),
+                (feature_counts_pd['count'].values.astype(np.int32),
+                 (feature_counts_pd['cell_idx'].values, feature_counts_pd['final_feature_idx'].values)),
+                shape=(batch_size, n_final_features),
                 dtype=np.int32
             ).tocsr()
-            del gene_counts_pd
+            del feature_counts_pd
         else:
-            batch_matrix = sp.csr_matrix((batch_size, n_final_genes), dtype=np.int32)
+            batch_matrix = sp.csr_matrix((batch_size, n_final_features), dtype=np.int32)
         
         all_batch_matrices.append(batch_matrix)
         
@@ -471,14 +490,14 @@ def create_gene_matrix_gpu(
     else:
         matrix = matrix.astype(np.uint8)
 
-    # Prepare gene metadata (unique genes)
-    gene_metadata = gene_df.groupby('gene_name').first().reset_index()
-    gene_metadata = gene_metadata.merge(unique_genes, on='gene_name', how='left')
-    gene_metadata = gene_metadata.sort_values('final_gene_idx').reset_index(drop=True)
-    gene_metadata = gene_metadata[['chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name', 'final_gene_idx']]
-    gene_metadata = gene_metadata.rename(columns={'final_gene_idx': 'gene_idx'})
+    # Prepare gene metadata (unique features)
+    gene_metadata = gene_df.groupby('id').first().reset_index()
+    gene_metadata = gene_metadata.merge(unique_features, on='id', how='left')
+    gene_metadata = gene_metadata.sort_values('final_feature_idx').reset_index(drop=True)
+    gene_metadata = gene_metadata[['chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name', 'final_feature_idx']]
+    gene_metadata = gene_metadata.rename(columns={'final_feature_idx': 'gene_idx'})
 
-    logger.debug(f"Matrix: {n_cells} cells × {n_final_genes} genes, nnz: {matrix.nnz:,}")
+    logger.debug(f"Matrix: {n_cells} cells × {n_final_features} features, nnz: {matrix.nnz:,}")
 
     # Prepare cell metadata
     barcode_to_idx = cudf.DataFrame({

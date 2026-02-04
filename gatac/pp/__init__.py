@@ -1,6 +1,8 @@
 from .convert import make_parquet
-from .process import make_tile_matrix, make_gene_matrix, read_fragments_parquet
-from .features import select_features, select_features_multi, combine
+from .process import read_fragments_parquet, combine
+from .tile import make_tile_matrix
+from .gene import make_gene_matrix
+from .features import select_features, select_features_multi
 from .metrics import (
     load_tss_from_gtf, 
     compute_metrics,

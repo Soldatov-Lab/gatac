@@ -3,7 +3,10 @@ GPU-accelerated tile matrix generation from ATAC fragment data.
 """
 
 import logging
-from typing import Optional, Tuple
+import time
+import gc
+from pathlib import Path
+from typing import Optional, Tuple, List
 
 import cudf
 import cupy as cp
@@ -300,5 +303,141 @@ def tile_matrix_to_anndata(
 
     adata = sc.AnnData(X=matrix_cpu, obs=obs, var=var)
     logger.debug(f"Created AnnData: {adata.shape[0]} cells × {adata.shape[1]} tiles")
+
+    return adata
+
+
+def make_tile_matrix(
+    input_parquet: str | Path,
+    chrom_sizes: dict[str, int] | str,
+    output_path: Optional[str | Path] = None,
+    tile_size: int = 5000,
+    min_fragments_per_cell: int = 100,
+    exclude_chroms: Optional[list] = None,
+    metrics: Optional[str | Path | cudf.DataFrame] = None,
+    filter_query: Optional[str] = None,
+    count_strategy: str = "unique",
+    barcode_prefix: Optional[str] = None,
+    low_memory: bool = False,
+) -> 'sc.AnnData':
+    """
+    Process ATAC fragments parquet file and generate tile matrix.
+
+    Parameters
+    ----------
+    input_parquet : str or Path
+        Path to input parquet file containing ATAC fragments
+    chrom_sizes : dict or str
+        Dictionary of chromosome names and their sizes, or a genome name (e.g., 'hg38').
+    output_path : str or Path, optional
+        Path for output .h5ad file. If None, uses input filename.
+    tile_size : int
+        Size of genomic bins in base pairs (default: 5000)
+    min_fragments_per_cell : int
+        Minimum fragments required per barcode (default: 100)
+    exclude_chroms : list, optional
+        List of chromosomes to exclude. (default: None)
+    metrics : str, Path, or cudf.DataFrame, optional
+        Path to a CSV file or a cuDF DataFrame containing cell metrics for filtering.
+    filter_query : str, optional
+        Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
+    count_strategy : str
+        Strategy for counting fragments in tiles. Options:
+        - "unique": Count each unique fragment once (SnapATAC2 default)
+        - "count": Use PCR duplicate counts from the 'count' column
+        - "binarize": Convert counts to binary (0/1) per tile
+        (default: "unique")
+    barcode_prefix : str, optional
+        Prefix to add to barcodes
+    low_memory : bool
+        Use low memory mode for Parquet reading (default: False)
+
+    Returns
+    -------
+    adata : AnnData
+        AnnData object with tile matrix
+    """
+    from .genome import get_chrom_sizes
+    from .process import read_fragments_parquet
+    import scanpy as sc
+    
+    if isinstance(chrom_sizes, str):
+        chrom_sizes = get_chrom_sizes(chrom_sizes)
+
+    input_parquet = Path(input_parquet)
+    if output_path is None:
+        output_path = input_parquet.with_suffix('').with_name(
+            input_parquet.stem + '_tile_matrix.h5ad'
+        )
+    else:
+        output_path = Path(output_path)
+
+    # Load metrics if provided
+    cell_metadata_input = None
+    if metrics is not None:
+        if isinstance(metrics, cudf.DataFrame):
+            cell_metadata_input = metrics
+        else:
+            metrics_path = Path(metrics)
+            if metrics_path.exists():
+                logger.info(f"Loading cell metrics from {metrics_path}")
+                cell_metadata_input = cudf.read_csv(str(metrics_path))
+            else:
+                logger.warning(f"Metrics file {metrics_path} not found. Proceeding without it.")
+
+    logger.info(f"Processing {input_parquet.name}")
+
+    def _cleanup_memory():
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+
+    def _read_and_process(use_low_mem: bool, exclude: Optional[List[str]] = None):
+        df = read_fragments_parquet(input_parquet, low_memory=use_low_mem)
+        
+        df_sorted = df.sort_values('barcode')
+        del df
+        _cleanup_memory()
+
+        matrix, cell_metadata, tile_metadata = create_tile_matrix_gpu(
+            fragments_df=df_sorted,
+            chrom_sizes=chrom_sizes,
+            tile_size=tile_size,
+            exclude_chroms=exclude,
+            min_fragments_per_cell=min_fragments_per_cell,
+            cell_metadata=cell_metadata_input,
+            filter_query=filter_query,
+            return_sparse=True,
+            count_strategy=count_strategy
+        )
+        return matrix, cell_metadata, tile_metadata
+
+    start_time = time.perf_counter()
+    try:
+        matrix, cell_metadata, tile_metadata = _read_and_process(low_memory, exclude_chroms)
+    except (MemoryError, RuntimeError) as e:
+        err_msg = str(e).lower()
+        is_oom = "out of memory" in err_msg or "std::bad_alloc" in err_msg or "cudaerrormemoryallocation" in err_msg
+        
+        if is_oom:
+            if not low_memory:
+                logger.warning(f"CUDA Out of Memory. Retrying with low_memory=True: {e}")
+                _cleanup_memory()
+                matrix, cell_metadata, tile_metadata = _read_and_process(True, exclude_chroms)
+            else:
+                logger.error(f"CUDA Out of Memory even with low_memory=True: {e}")
+                raise e
+        else:
+            raise e
+
+    # Convert to AnnData
+    adata = tile_matrix_to_anndata(matrix, cell_metadata, tile_metadata)
+    
+    if barcode_prefix:
+        adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
+
+    # Save
+    adata.write_h5ad(str(output_path))
+    total_time = time.perf_counter() - start_time
+    logger.info(f"Created {output_path.name}: {adata.shape[0]:,} cells × {adata.shape[1]:,} tiles ({total_time:.1f}s)")
 
     return adata

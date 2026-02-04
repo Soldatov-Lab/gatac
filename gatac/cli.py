@@ -46,7 +46,7 @@ def convert_command(args):
 
 def tile_command(args):
     """Handle 'gatac tile' subcommand."""
-    from .pp.process import make_tile_matrix
+    from .pp.tile import make_tile_matrix
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -147,7 +147,7 @@ def features_command(args):
 def combine_command(args):
     """Handle 'gatac combine' subcommand."""
     import glob
-    from .pp.features import combine
+    from .pp.process import combine
 
     # Expand inputs - support glob patterns
     input_paths = []
@@ -217,7 +217,7 @@ def metrics_command(args):
 
 def gene_command(args):
     """Handle 'gatac gene' subcommand."""
-    from .pp.process import make_gene_matrix
+    from .pp.gene import make_gene_matrix
 
     input_path = Path(args.input)
     gtf_path = Path(args.gtf)

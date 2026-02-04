@@ -10,9 +10,15 @@ from typing import Optional, Tuple, List, Literal
 
 import cudf
 import cupy as cp
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+import scipy.sparse as sp
+from tqdm import tqdm
 
-from .tile import create_tile_matrix_gpu, tile_matrix_to_anndata
-from .gene import load_gene_annotation, create_gene_matrix_gpu, gene_matrix_to_anndata
+from .genome import HG38, HG19, MM10, MM39  # For type checking if needed in other modules, but actually not used here.
+# Actually, let's just remove the .tile and .gene imports.
 
 logger = logging.getLogger(__name__)
 
@@ -50,300 +56,184 @@ def read_fragments_parquet(
                 
     return df
 
-def make_tile_matrix(
-    input_parquet: str | Path,
-    chrom_sizes: dict[str, int] | str,
-    output_path: Optional[str | Path] = None,
-    tile_size: int = 5000,
-    min_fragments_per_cell: int = 100,
-    exclude_chroms: Optional[list] = None,
-    metrics: Optional[str | Path | cudf.DataFrame] = None,
-    filter_query: Optional[str] = None,
-    count_strategy: str = "unique",
-    barcode_prefix: Optional[str] = None,
-    low_memory: bool = False,
-) -> 'sc.AnnData':
+
+
+
+
+def combine(
+    input_paths: list[str | Path],
+    output_path: str | Path,
+):
     """
-    Process ATAC fragments parquet file and generate tile matrix.
+    Merge multiple h5ad files into a single file with efficient streaming.
 
     Parameters
     ----------
-    input_parquet : str or Path
-        Path to input parquet file containing ATAC fragments
-    chrom_sizes : dict or str
-        Dictionary of chromosome names and their sizes, or a genome name (e.g., 'hg38').
-    output_path : str or Path, optional
-        Path for output .h5ad file. If None, uses input filename.
-    tile_size : int
-        Size of genomic bins in base pairs (default: 5000)
-    min_fragments_per_cell : int
-        Minimum fragments required per barcode (default: 100)
-    exclude_chroms : list, optional
-        List of chromosomes to exclude. (default: None)
-    metrics : str, Path, or cudf.DataFrame, optional
-        Path to a CSV file or a cuDF DataFrame containing cell metrics for filtering.
-    filter_query : str, optional
-        Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
-    count_strategy : str
-        Strategy for counting fragments in tiles. Options:
-        - "unique": Count each unique fragment once (SnapATAC2 default)
-        - "count": Use PCR duplicate counts from the 'count' column
-        - "binarize": Convert counts to binary (0/1) per tile
-        (default: "unique")
-    barcode_prefix : str, optional
-        Prefix to add to barcodes
-    low_memory : bool
-        Use low memory mode for Parquet reading (default: False)
-
-    Returns
-    -------
-    adata : AnnData
-        AnnData object with tile matrix
+    input_paths : list of str or Path
+        List of paths to h5ad files
+    output_path : str or Path
+        Output path for combined h5ad file
     """
-    from .genome import get_chrom_sizes
+    input_paths = [Path(p) for p in input_paths]
+    output_path = Path(output_path)
+
+    if len(input_paths) == 0:
+        raise ValueError("No input files provided")
+
+    if len(input_paths) == 1:
+        logger.info("Single file provided, copying to output")
+        adata = sc.read_h5ad(str(input_paths[0]))
+        adata.write_h5ad(str(output_path))
+        return
+
+    logger.info(f"Combining {len(input_paths)} h5ad files")
+
+    # Get reference var from first file
+    first_adata = sc.read_h5ad(str(input_paths[0]), backed='r')
+    n_vars = first_adata.n_vars
+    var_df = first_adata.var.copy()
     
-    if isinstance(chrom_sizes, str):
-        chrom_sizes = get_chrom_sizes(chrom_sizes)
+    # Determine the highest dtype across all inputs and collect cell counts
+    logger.info("Checking feature consistency and determining optimal dtype...")
+    total_cells = 0
+    total_nnz = 0
+    dtypes = []
 
-    input_parquet = Path(input_parquet)
-    if output_path is None:
-        output_path = input_parquet.with_suffix('').with_name(
-            input_parquet.stem + '_tile_matrix.h5ad'
-        )
-    else:
-        output_path = Path(output_path)
-
-    # Load metrics if provided
-    cell_metadata_input = None
-    if metrics is not None:
-        if isinstance(metrics, cudf.DataFrame):
-            cell_metadata_input = metrics
+    for fpath in tqdm(input_paths, desc="Scanning files"):
+        adata = sc.read_h5ad(str(fpath), backed='r')
+        if adata.n_vars != n_vars:
+            raise ValueError(
+                f"Feature mismatch: {fpath.name} has {adata.n_vars} features, "
+                f"expected {n_vars}"
+            )
+        
+        # Collect dtype
+        if sp.issparse(adata.X):
+            dtypes.append(adata.X.dtype)
+            total_nnz += adata.X.nnz
         else:
-            metrics_path = Path(metrics)
-            if metrics_path.exists():
-                logger.info(f"Loading cell metrics from {metrics_path}")
-                cell_metadata_input = cudf.read_csv(str(metrics_path))
-            else:
-                logger.warning(f"Metrics file {metrics_path} not found. Proceeding without it.")
+            dtypes.append(adata.X.dtype)
+            total_nnz += np.count_nonzero(adata.X)
+            
+        total_cells += adata.n_obs
+        del adata
 
-    logger.info(f"Processing {input_parquet.name}")
+    # Select the "highest" dtype
+    optimal_dtype = np.result_type(*dtypes)
+    logger.info(f"Using combined dtype: {optimal_dtype}")
 
-    def _cleanup_memory():
+    # =========================================================================
+    # Build combined sparse matrix
+    # =========================================================================
+    logger.info("Building combined matrix...")
+
+    data_list = []
+    indices_list = []
+    indptr_list = []
+    obs_list = []
+    
+    current_nnz = 0
+    total_cells_processed = 0
+
+    for fpath in tqdm(input_paths, desc="Stream loading"):
+        adata = sc.read_h5ad(str(fpath))
+        n_obs = adata.n_obs
+        
+        X = adata.X
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        elif not isinstance(X, sp.csr_matrix):
+            X = X.tocsr()
+
+        nnz = X.nnz
+        
+        # Collect matrix components with optimal dtype
+        data_list.append(X.data.astype(optimal_dtype))
+            
+        # Determine optimal index dtype
+        index_dtype = np.uint32 if n_vars > 65535 else np.uint16
+        indices_list.append(X.indices.astype(index_dtype))
+        
+        # Adjust indptr for concatenation
+        if total_cells_processed == 0:
+            indptr_list.append(X.indptr.astype(np.uint64))
+        else:
+            # Drop the first 0 to append to existing indptr
+            chunk_indptr = X.indptr[1:].astype(np.uint64)
+            indptr_list.append(chunk_indptr + current_nnz)
+
+        # Collect obs metadata
+        obs_df = adata.obs.copy()
+        obs_df['source_file'] = fpath.name
+        obs_list.append(obs_df)
+
+        current_nnz += nnz
+        total_cells_processed += n_obs
+        
+        del adata, X
         gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
 
-    def _read_and_process(use_low_mem: bool, exclude: Optional[List[str]] = None):
-        df = read_fragments_parquet(input_parquet, low_memory=use_low_mem)
-        
-        df_sorted = df.sort_values('barcode')
-        del df
-        _cleanup_memory()
-
-        matrix, cell_metadata, tile_metadata = create_tile_matrix_gpu(
-            fragments_df=df_sorted,
-            chrom_sizes=chrom_sizes,
-            tile_size=tile_size,
-            exclude_chroms=exclude,
-            min_fragments_per_cell=min_fragments_per_cell,
-            cell_metadata=cell_metadata_input,
-            filter_query=filter_query,
-            return_sparse=True,
-            count_strategy=count_strategy
-        )
-        return matrix, cell_metadata, tile_metadata
-
-    start_time = time.perf_counter()
-    try:
-        matrix, cell_metadata, tile_metadata = _read_and_process(low_memory, exclude_chroms)
-    except (MemoryError, RuntimeError) as e:
-        err_msg = str(e).lower()
-        is_oom = "out of memory" in err_msg or "std::bad_alloc" in err_msg or "cudaerrormemoryallocation" in err_msg
-        
-        if is_oom:
-            if not low_memory:
-                logger.warning(f"CUDA Out of Memory. Retrying with low_memory=True: {e}")
-                _cleanup_memory()
-                matrix, cell_metadata, tile_metadata = _read_and_process(True, exclude_chroms)
-            else:
-                logger.error(f"CUDA Out of Memory even with low_memory=True: {e}")
-                raise e
-        else:
-            raise e
-
-    # Convert to AnnData
-    adata = tile_matrix_to_anndata(matrix, cell_metadata, tile_metadata)
+    # =========================================================================
+    # Final Assembly
+    # =========================================================================
+    logger.info("Final assembly...")
     
-    if barcode_prefix:
-        adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
+    # Concatenate sparse components
+    all_data = np.concatenate(data_list)
+    del data_list
+    all_indices = np.concatenate(indices_list)
+    del indices_list
+    all_indptr = np.concatenate(indptr_list)
+    del indptr_list
+    gc.collect()
 
-    # Save
-    adata.write_h5ad(str(output_path))
-    total_time = time.perf_counter() - start_time
-    logger.info(f"Created {output_path.name}: {adata.shape[0]:,} cells × {adata.shape[1]:,} tiles ({total_time:.1f}s)")
+    # Build final sparse matrix
+    combined_X = sp.csr_matrix(
+        (all_data, all_indices, all_indptr),
+        shape=(total_cells_processed, n_vars)
+    )
+    del all_data, all_indices, all_indptr
+    gc.collect()
 
-    return adata
-
-
-def make_gene_matrix(
-    input_parquet: str | Path,
-    gene_anno: str | Path,
-    output_path: Optional[str | Path] = None,
-    id_type: Literal["gene", "transcript"] = "gene",
-    upstream: int = 2000,
-    downstream: int = 0,
-    include_gene_body: bool = True,
-    min_fragments_per_cell: int = 100,
-    exclude_chroms: Optional[list] = None,
-    metrics: Optional[str | Path | cudf.DataFrame] = None,
-    filter_query: Optional[str] = None,
-    barcode_prefix: Optional[str] = None,
-    low_memory: bool = False,
-    cell_batch_size: int = 500,
-    gene_name_key: str = "gene_name",
-    gene_id_key: str = "gene_id",
-    transcript_name_key: str = "transcript_name",
-    transcript_id_key: str = "transcript_id",
-) -> 'sc.AnnData':
-    """
-    Process ATAC fragments parquet file and generate gene activity matrix.
-
-    Uses paired-insertion counting strategy matching SnapATAC2: each fragment 
-    contributes insertions at start and end positions. If both insertions fall 
-    within the same gene's regulatory domain, count +1. If in different genes, 
-    each gene gets +1.
-
-    Parameters
-    ----------
-    input_parquet : str or Path
-        Path to input parquet file containing ATAC fragments
-    gene_anno : str or Path
-        Path to GTF/GFF gene annotation file.
-    output_path : str or Path, optional
-        Path for output .h5ad file. If None, uses input filename.
-    id_type : str
-        "gene" or "transcript" - which feature type to use (default: "gene").
-    upstream : int
-        Base pairs upstream of TSS to include (default: 2000).
-    downstream : int
-        Base pairs downstream of regulatory domain (default: 0).
-    include_gene_body : bool
-        Whether to include the gene body in the regulatory domain (default: True).
-    min_fragments_per_cell : int
-        Minimum fragments required per barcode (default: 100)
-    exclude_chroms : list, optional
-        List of chromosomes to exclude. (default: None)
-    metrics : str, Path, or cudf.DataFrame, optional
-        Path to a CSV file or a cuDF DataFrame containing cell metrics for filtering.
-    filter_query : str, optional
-        Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
-    barcode_prefix : str, optional
-        Prefix to add to barcodes
-    low_memory : bool
-        Use low memory mode for Parquet reading (default: False)
-    cell_batch_size : int
-        Number of cells to process per batch (default: 500). Lower values
-        reduce GPU memory usage but may be slower.
-    gene_name_key : str
-        Key for gene name in GTF attributes (default: "gene_name").
-    gene_id_key : str
-        Key for gene ID in GTF attributes (default: "gene_id").
-    transcript_name_key : str
-        Key for transcript name in GTF attributes (default: "transcript_name").
-    transcript_id_key : str
-        Key for transcript ID in GTF attributes (default: "transcript_id").
-
-    Returns
-    -------
-    adata : AnnData
-        AnnData object with gene activity matrix
-    """
-    input_parquet = Path(input_parquet)
-    gene_anno = Path(gene_anno)
+    # Build combined obs
+    combined_obs = pd.concat(obs_list)
+    del obs_list
     
-    if output_path is None:
-        output_path = input_parquet.with_suffix('').with_name(
-            input_parquet.stem + '_gene_matrix.h5ad'
-        )
+    # Make barcodes unique
+    combined_obs.index.name = 'barcode'
+    if 'barcode' in combined_obs.columns:
+        combined_obs.drop(columns=['barcode'], inplace=True)
+    combined_obs.reset_index(inplace=True)
+
+    if not combined_obs['barcode'].is_unique:
+        n_dups = combined_obs['barcode'].duplicated().sum()
+        logger.warning(f"Detected {n_dups:,} duplicate barcodes. Making barcodes unique.")
+
+        def make_unique(indices):
+            seen = {}
+            out = []
+            for x in indices:
+                if x in seen:
+                    seen[x] += 1
+                    out.append(f"{x}-{seen[x]}")
+                else:
+                    seen[x] = 0
+                    out.append(x)
+            return out
+        
+        combined_obs.index = make_unique(combined_obs['barcode'])
+        combined_obs.drop(columns=['barcode'], inplace=True)
     else:
-        output_path = Path(output_path)
+        combined_obs.index = combined_obs['barcode'].values
+        combined_obs.drop(columns=['barcode'], inplace=True)
 
-    # Load gene annotation
-    gene_regions = load_gene_annotation(
-        gtf_path=gene_anno,
-        id_type=id_type,
-        upstream=upstream,
-        downstream=downstream,
-        include_gene_body=include_gene_body,
-        gene_name_key=gene_name_key,
-        gene_id_key=gene_id_key,
-        transcript_name_key=transcript_name_key,
-        transcript_id_key=transcript_id_key,
+    # Build combined AnnData
+    combined_adata = ad.AnnData(
+        X=combined_X,
+        obs=combined_obs,
+        var=var_df,
     )
 
-    # Load metrics if provided
-    cell_metadata_input = None
-    if metrics is not None:
-        if isinstance(metrics, cudf.DataFrame):
-            cell_metadata_input = metrics
-        else:
-            metrics_path = Path(metrics)
-            if metrics_path.exists():
-                logger.info(f"Loading cell metrics from {metrics_path}")
-                cell_metadata_input = cudf.read_csv(str(metrics_path))
-            else:
-                logger.warning(f"Metrics file {metrics_path} not found. Proceeding without it.")
-
-    logger.info(f"Processing {input_parquet.name}")
-
-    def _cleanup_memory():
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-
-    def _read_and_process(use_low_mem: bool, exclude: Optional[List[str]] = None):
-        df = read_fragments_parquet(input_parquet, low_memory=use_low_mem)
-        
-        df_sorted = df.sort_values('barcode')
-        del df
-        _cleanup_memory()
-
-        matrix, cell_metadata, gene_metadata = create_gene_matrix_gpu(
-            fragments_df=df_sorted,
-            gene_regions=gene_regions,
-            exclude_chroms=exclude,
-            min_fragments_per_cell=min_fragments_per_cell,
-            cell_metadata=cell_metadata_input,
-            filter_query=filter_query,
-            cell_batch_size=cell_batch_size,
-        )
-        return matrix, cell_metadata, gene_metadata
-
-    start_time = time.perf_counter()
-    try:
-        matrix, cell_metadata, gene_metadata = _read_and_process(low_memory, exclude_chroms)
-    except (MemoryError, RuntimeError) as e:
-        err_msg = str(e).lower()
-        is_oom = "out of memory" in err_msg or "std::bad_alloc" in err_msg or "cudaerrormemoryallocation" in err_msg
-        
-        if is_oom:
-            if not low_memory:
-                logger.warning(f"CUDA Out of Memory. Retrying with low_memory=True: {e}")
-                _cleanup_memory()
-                matrix, cell_metadata, gene_metadata = _read_and_process(True, exclude_chroms)
-            else:
-                logger.error(f"CUDA Out of Memory even with low_memory=True: {e}")
-                raise e
-        else:
-            raise e
-
-    # Convert to AnnData
-    adata = gene_matrix_to_anndata(matrix, cell_metadata, gene_metadata)
-    
-    if barcode_prefix:
-        adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
-
     # Save
-    adata.write_h5ad(str(output_path))
-    total_time = time.perf_counter() - start_time
-    logger.info(f"Created {output_path.name}: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes ({total_time:.1f}s)")
-
-    return adata
+    combined_adata.write_h5ad(str(output_path))
+    logger.info(f"Saved combined matrix ({total_cells_processed :,} cells × {n_vars:,} features) to {output_path}")

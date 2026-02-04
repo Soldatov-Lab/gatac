@@ -6,6 +6,7 @@ Usage:
     gatac tile <input.parquet> [-o output] [-t tile_size] [-m min_frags]
     gatac gene <input.parquet> -g <annotations.gtf> [-o output]
     gatac features <input.h5ad> [-n n_features] [-o output]
+    gatac combine <input.h5ad> [input2.h5ad ...] -o <output.h5ad>
     gatac metrics <input.parquet> -g <annotations.gtf> [-o output]
     gatac filter <input.parquet> [--metrics metrics.csv] [--filter "query"]
 """
@@ -141,6 +142,44 @@ def features_command(args):
             n_features=args.n_features,
             output_path=output_path,
         )
+
+
+def combine_command(args):
+    """Handle 'gatac combine' subcommand."""
+    import glob
+    from .pp.features import combine
+
+    # Expand inputs - support glob patterns
+    input_paths = []
+    for inp in args.input:
+        if '*' in inp or '?' in inp:
+            # Glob pattern
+            expanded = sorted(glob.glob(inp))
+            if not expanded:
+                logging.warning(f"No files matched pattern: {inp}")
+            input_paths.extend(expanded)
+        else:
+            input_paths.append(inp)
+
+    # Validate inputs exist
+    input_paths = [Path(p) for p in input_paths]
+    for p in input_paths:
+        if not p.exists():
+            logging.error(f"Input file not found: {p}")
+            sys.exit(1)
+
+    if len(input_paths) == 0:
+        logging.error("No input files found")
+        sys.exit(1)
+
+    if args.output is None:
+        logging.error("--output is required for combine command")
+        sys.exit(1)
+
+    combine(
+        input_paths,
+        output_path=args.output,
+    )
 
 
 def metrics_command(args):
@@ -405,6 +444,23 @@ def main():
         help='Preserve original counts instead of binarizing (multi-file mode)'
     )
     features_parser.set_defaults(func=features_command)
+
+    # Combine subcommand
+    combine_parser = subparsers.add_parser(
+        'combine',
+        help='Merge multiple h5ad files'
+    )
+    combine_parser.add_argument(
+        'input',
+        nargs='+',
+        help='Input .h5ad file(s) or glob pattern'
+    )
+    combine_parser.add_argument(
+        '-o', '--output',
+        required=True,
+        help='Output .h5ad file'
+    )
+    combine_parser.set_defaults(func=combine_command)
 
     # Metrics subcommand
     metrics_parser = subparsers.add_parser(

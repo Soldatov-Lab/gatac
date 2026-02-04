@@ -37,6 +37,9 @@ gatac features tile_matrix.h5ad -n 500000
 
 # Feature selection (multi-file streaming)
 gatac features "data/*.h5ad" -o combined.h5ad -n 500000
+
+# Merge h5ad files (file-by-file)
+gatac combine sample1.h5ad sample2.h5ad -o combined.h5ad
 ```
 
 ## Python API
@@ -92,6 +95,12 @@ ga.pp.select_features_multi(
     input_paths=["sample1.h5ad", "sample2.h5ad"],
     output_path="combined.h5ad",
     n_features=500000
+)
+
+# Merge multiple AnnData files
+ga.pp.combine(
+    input_paths=["sample1.h5ad", "sample2.h5ad"],
+    output_path="merged.h5ad"
 )
 ```
 

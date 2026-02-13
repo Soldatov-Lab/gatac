@@ -313,7 +313,7 @@ def make_tile_matrix(
     output_path: Optional[str | Path] = None,
     tile_size: int = 5000,
     min_fragments_per_cell: int = 100,
-    exclude_chroms: Optional[list] = None,
+    exclude_chroms: Optional[list] = ["chrM", "chrY", "M", "Y"],
     metrics: Optional[str | Path | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     count_strategy: str = "unique",

@@ -20,6 +20,15 @@ gatac metrics fragments.parquet -g annotations.gtf -o fragments_metrics.csv
 # Compute quality metrics (TSSe, etc.)
 gatac metrics fragments.parquet -g annotations.gtf --batch-size 64
 
+# Filter fragments by minimum fragment count
+gatac filter fragments.parquet -m 500 -o fragments_filtered.parquet
+
+# Filter fragments using metrics and quality threshold
+gatac filter fragments.parquet --metrics metrics.csv --filter "tsse_score > 5" -o fragments_filtered.parquet
+
+# Filter fragments with genome-based chromosome filtering
+gatac filter fragments.parquet -g hg38 -m 500 -o fragments_filtered.parquet
+
 # Generate tile matrix (m=min_unique_fragments)
 gatac tile fragments.parquet -g hg38 -t 500 -m 100
 
@@ -85,6 +94,27 @@ adata_gene = ga.pp.make_gene_matrix(
     gene_anno="annotations.gtf",
     metrics=metrics,
     filter_query="tsse_score > 5"
+)
+
+# Filter fragments by minimum fragment count
+ga.pp.filter_fragments(
+    "fragments.parquet",
+    min_fragments_per_cell=500
+)
+
+# Filter fragments using metrics with quality threshold
+ga.pp.filter_fragments(
+    "fragments.parquet",
+    metrics=metrics,
+    filter_query="tsse_score > 5"
+)
+
+# Filter multiple files with genome-based chromosome filtering
+ga.pp.filter_fragments(
+    ["sample1.parquet", "sample2.parquet"],
+    metrics=metrics,
+    filter_query="tsse_score > 5 and n_unique > 1000",
+    chrom_sizes="hg38"
 )
 
 # Select features (single AnnData)

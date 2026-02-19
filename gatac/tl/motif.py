@@ -1093,3 +1093,266 @@ def motif_enrichment(
     
     logger.info("Motif enrichment analysis complete")
     return result
+
+
+# =============================================================================
+# GSEA-based Motif Enrichment
+# =============================================================================
+
+
+def gsea_motif_enrichment(
+    adata,
+    rankings: "Union[pd.DataFrame, dict[str, pd.DataFrame]]",
+    logfc_col: str = "log2fc",
+    *,
+    motif_key: str = "motif_match",
+    permutation_num: int = 1000,
+    min_size: int = 15,
+    max_size: int = 2000,
+    seed: int = 42,
+    threads: int = 1,
+    backend: Literal["gpu", "gseapy"] = "gpu",
+) -> "Union[pl.DataFrame, dict[str, pl.DataFrame]]":
+    """
+    Run preranked GSEA to identify enriched TF motifs from a LogFC-ranked peak list.
+
+    Unlike Fisher/hypergeometric motif enrichment, GSEA does not require a hard
+    significance threshold to define "marker peaks". Instead it ranks *all* peaks
+    by log2 fold change and asks whether motif-containing peaks cluster at the top
+    (or bottom) of that ranking. This provides statistical power even in shallow
+    ATAC-seq data where no individual peak may reach significance.
+
+    Motif gene sets are built from the binary peak×motif matrix stored at
+    ``adata.varm[motif_key]`` (populated by :func:`gatac.tl.scan_motifs`).
+
+    Parameters
+    ----------
+    adata : AnnData
+        Peak-level AnnData object with ``varm[motif_key]`` (sparse bool
+        matrix of shape n_peaks × n_motifs) and ``uns["motif_name"]``
+        (list of motif names). Populated by ``ga.tl.scan_motifs``.
+    rankings : pd.DataFrame or dict[str, pd.DataFrame]
+        Per-peak ranking table(s).
+
+        * **Single DataFrame** – index must be peak names matching
+          ``adata.var_names``; ``logfc_col`` specifies the log2FC column.
+          Returns a single :class:`polars.DataFrame`.
+        * **Dict of DataFrames** – keys are group labels; each value is a
+          DataFrame as above. Returns ``dict[str, polars.DataFrame]``.
+    logfc_col : str, default ``"log2fc"``
+        Name of the column in each DataFrame that contains log2 fold change
+        values. Peaks are ranked descending by this column before GSEA.
+    motif_key : str, default ``"motif_match"``
+        Key in ``adata.varm`` that stores the peak×motif binary matrix.
+    permutation_num : int, default 1000
+        Number of GSEA permutations. Increase for more precise FDR estimates.
+    min_size : int, default 15
+        Minimum number of ranked peaks a motif gene set must contain (after
+        intersection with the ranked list) to be tested. Smaller sets yield
+        noisy NES estimates.
+    max_size : int, default 2000
+        Maximum motif gene set size.
+    seed : int, default 42
+        Random seed for permutation reproducibility.
+    threads : int, default 1
+        Number of threads passed to ``gseapy.prerank`` (only used when
+        ``backend="gseapy"``).
+    backend : {"gpu", "gseapy"}, default "gpu"
+        Which backend to use for the enrichment score computation.
+
+        * ``"gpu"`` – CuPy-based GPU implementation. Much faster for large
+          numbers of motifs (10-50× speedup). Requires a CUDA-capable GPU.
+        * ``"gseapy"`` – Delegates to ``gseapy.prerank`` (Rust backend).
+          No GPU required.
+
+    Returns
+    -------
+    polars.DataFrame or dict[str, polars.DataFrame]
+        GSEA results with columns:
+
+        * ``motif``        – motif name
+        * ``NES``          – normalised enrichment score (positive = enriched
+          at the top / high-logFC end)
+        * ``pval``         – nominal p-value
+        * ``fdr``          – FDR q-value (Benjamini–Hochberg)
+        * ``lead_edge_n``  – number of peaks in the leading edge
+
+        Sorted descending by NES. Returns a single DataFrame when *rankings*
+        is a single DataFrame, or a dict when it is a dict.
+
+    Raises
+    ------
+    ImportError
+        If ``gseapy`` is not installed (when ``backend="gseapy"``).
+    KeyError
+        If ``motif_key`` is not found in ``adata.varm``, or ``logfc_col``
+        is not found in a rankings DataFrame.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> import pandas as pd
+
+    >>> # rankings is a DataFrame with peaks as index and a 'log2fc' column
+    >>> ranked = pd.DataFrame({"log2fc": logfc_values}, index=peak_names)
+    >>> result = ga.tl.gsea_motif_enrichment(peak_adata, ranked)
+
+    >>> # Multiple groups at once
+    >>> group_rankings = {
+    ...     "CD4_Memory": pd.DataFrame({"log2fc": logfc_cd4}, index=peak_names),
+    ...     "NK":         pd.DataFrame({"log2fc": logfc_nk},  index=peak_names),
+    ... }
+    >>> results = ga.tl.gsea_motif_enrichment(peak_adata, group_rankings)
+    >>> results["NK"].head()
+    """
+    import pandas as pd
+    import scipy.sparse as sp
+
+    if backend == "gseapy":
+        try:
+            import gseapy as gp
+        except ImportError as exc:
+            raise ImportError(
+                "gseapy is required for backend='gseapy'. "
+                "Install it with: pip install gseapy"
+            ) from exc
+    elif backend == "gpu":
+        from gatac.tl.gsea_gpu import prerank_gpu
+    else:
+        raise ValueError(f"Unknown backend: {backend!r}. Use 'gpu' or 'gseapy'.")
+
+    # ------------------------------------------------------------------
+    # Build motif gene sets from adata.varm[motif_key]
+    # ------------------------------------------------------------------
+    if motif_key not in adata.varm:
+        raise KeyError(
+            f"'{motif_key}' not found in adata.varm. "
+            "Run ga.tl.scan_motifs first to populate the motif match matrix."
+        )
+
+    motif_match = adata.varm[motif_key]   # peaks × motifs  (sparse bool)
+    motif_names_list = list(adata.uns["motif_name"])
+    peak_names = adata.var_names
+
+    if sp.issparse(motif_match):
+        motif_match_csc = sp.csc_matrix(motif_match)
+    else:
+        motif_match_csc = sp.csc_matrix(motif_match)
+
+    gene_sets: dict[str, list] = {}
+    for i, name in enumerate(motif_names_list):
+        peak_idx = motif_match_csc.getcol(i).nonzero()[0]
+        if len(peak_idx) >= min_size:
+            gene_sets[str(name)] = list(peak_names[peak_idx])
+
+    if not gene_sets:
+        logger.warning(
+            f"No motif gene set has ≥{min_size} peaks. "
+            "Try lowering min_size or re-scanning with a more lenient pvalue."
+        )
+
+    logger.info(
+        f"Built {len(gene_sets):,} motif gene sets "
+        f"(≥{min_size} peaks; filter to ≥{min_size})"
+    )
+
+    # ------------------------------------------------------------------
+    # Internal helpers: run GSEA for a single ranked DataFrame
+    # ------------------------------------------------------------------
+    def _run_one_gseapy(df: pd.DataFrame, group_label: str = "") -> pl.DataFrame:
+        import gseapy as gp
+
+        if logfc_col not in df.columns:
+            raise KeyError(
+                f"Column '{logfc_col}' not found in rankings DataFrame"
+                + (f" for group '{group_label}'" if group_label else "")
+                + f". Available columns: {list(df.columns)}"
+            )
+
+        ranked_series = df[logfc_col].sort_values(ascending=False)
+
+        res = gp.prerank(
+            rnk=ranked_series,
+            gene_sets=gene_sets,
+            permutation_num=permutation_num,
+            seed=seed,
+            min_size=min_size,
+            max_size=max_size,
+            threads=threads,
+            no_plot=True,
+            verbose=False,
+        )
+
+        raw = res.res2d.rename(columns={
+            "Term": "motif",
+            "NOM p-val": "pval",
+            "FDR q-val": "fdr",
+            "Lead_genes": "lead_edge",
+        })
+
+        raw["lead_edge_n"] = raw["lead_edge"].apply(
+            lambda x: len(x.split(";")) if isinstance(x, str) and x else 0
+        )
+
+        result_df = (
+            raw[["motif", "NES", "pval", "fdr", "lead_edge_n"]]
+            .sort_values("NES", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        return pl.from_pandas(result_df)
+
+    def _run_one_gpu(df: pd.DataFrame, group_label: str = "") -> pl.DataFrame:
+        if logfc_col not in df.columns:
+            raise KeyError(
+                f"Column '{logfc_col}' not found in rankings DataFrame"
+                + (f" for group '{group_label}'" if group_label else "")
+                + f". Available columns: {list(df.columns)}"
+            )
+
+        ranked_series = df[logfc_col].sort_values(ascending=False)
+
+        results = prerank_gpu(
+            gene_names=list(ranked_series.index),
+            ranking_values=ranked_series.values,
+            gene_sets=gene_sets,
+            weight=1.0,
+            min_size=min_size,
+            max_size=max_size,
+            permutation_num=permutation_num,
+            seed=seed,
+        )
+
+        if not results:
+            return pl.DataFrame({
+                "motif": [],
+                "NES": [],
+                "pval": [],
+                "fdr": [],
+                "lead_edge_n": [],
+            })
+
+        result_df = pl.DataFrame({
+            "motif": [r["term"] for r in results],
+            "NES": [r["nes"] for r in results],
+            "pval": [r["pval"] for r in results],
+            "fdr": [r["fdr"] for r in results],
+            "lead_edge_n": [r["lead_edge_n"] for r in results],
+        }).sort("NES", descending=True)
+
+        return result_df
+
+    _run_one = _run_one_gpu if backend == "gpu" else _run_one_gseapy
+
+    # ------------------------------------------------------------------
+    # Dispatch: single DataFrame or dict of DataFrames
+    # ------------------------------------------------------------------
+    if isinstance(rankings, dict):
+        output: dict[str, pl.DataFrame] = {}
+        for group, df in rankings.items():
+            logger.info(f"Running GSEA ({backend}) for group '{group}'...")
+            output[group] = _run_one(df, group_label=str(group))
+        return output
+    else:
+        logger.info(f"Running GSEA ({backend}) on provided rankings...")
+        return _run_one(rankings)

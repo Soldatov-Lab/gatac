@@ -3,7 +3,7 @@ GATAC tools module - analysis functions for ATAC-seq data.
 """
 
 from .peaks import call_peaks, merge_peaks, make_peak_matrix
-from .motif import motif_enrichment, read_motifs, parse_meme, DNAMotif
+from .motif import motif_enrichment, read_motifs, parse_meme, DNAMotif, gsea_motif_enrichment
 from .markers import marker_peaks, get_marker_peaks
 from .chromvar import (
     chromvar,
@@ -17,6 +17,7 @@ __all__ = [
     "merge_peaks", 
     "make_peak_matrix",
     "motif_enrichment",
+    "gsea_motif_enrichment",
     "read_motifs",
     "parse_meme",
     "DNAMotif",

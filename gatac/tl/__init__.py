@@ -11,6 +11,7 @@ from .chromvar import (
     sample_bg_peaks,
     compute_peak_bias,
 )
+from .spectral import spectral
 
 __all__ = [
     "call_peaks", 
@@ -27,4 +28,5 @@ __all__ = [
     "scan_motifs",
     "sample_bg_peaks",
     "compute_peak_bias",
+    "spectral",
 ]

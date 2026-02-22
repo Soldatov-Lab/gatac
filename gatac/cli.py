@@ -321,7 +321,8 @@ def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
         prog='gatac',
-        description='GPU-accelerated ATAC-seq processing toolkit'
+        description='GPU-accelerated ATAC-seq processing toolkit',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         '-v', '--verbose',
@@ -334,7 +335,8 @@ def main():
     # Convert subcommand
     convert_parser = subparsers.add_parser(
         'convert',
-        help='Convert ATAC fragments TSV.GZ to Parquet'
+        help='Convert ATAC fragments TSV.GZ to Parquet',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     convert_parser.add_argument(
         'input',
@@ -359,7 +361,8 @@ def main():
     # Tile subcommand
     tile_parser = subparsers.add_parser(
         'tile',
-        help='Process fragments to tile matrix'
+        help='Process fragments to tile matrix',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     tile_parser.add_argument(
         'input',
@@ -373,13 +376,13 @@ def main():
         '-t', '--tile-size',
         type=int,
         default=5000,
-        help='Tile size in bp (default: 5000)'
+        help='Tile size in bp'
     )
     tile_parser.add_argument(
         '-m', '--min-fragments',
         type=int,
         default=100,
-        help='Min fragments per cell (default: 100)'
+        help='Min fragments per cell'
     )
     tile_parser.add_argument(
         '-g', '--genome',
@@ -390,7 +393,7 @@ def main():
         '-e', '--exclude-chroms',
         nargs='+',
         default=["chrM", "chrY", "M", "Y"],
-        help='Chromosomes to exclude (default: chrM chrY M Y)'
+        help='Chromosomes to exclude'
     )
     tile_parser.add_argument(
         '--metrics',
@@ -414,14 +417,15 @@ def main():
         '--count-strategy',
         choices=['unique', 'count', 'binarize'],
         default='unique',
-        help='Counting strategy: unique (SnapATAC2 default), count (PCR duplicates), or binarize (binary 0/1)'
+        help='Counting strategy: unique (SnapATAC2-compatible), count (includes PCR duplicates), or binarize (binary 0/1)'
     )
     tile_parser.set_defaults(func=tile_command)
 
     # Features subcommand
     features_parser = subparsers.add_parser(
         'features',
-        help='GPU-accelerated feature selection'
+        help='GPU-accelerated feature selection',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     features_parser.add_argument(
         'input',
@@ -432,7 +436,7 @@ def main():
         '-n', '--n-features',
         type=int,
         default=500000,
-        help='Number of features to select (default: 500000)'
+        help='Number of features to select'
     )
     features_parser.add_argument(
         '-o', '--output',
@@ -448,7 +452,8 @@ def main():
     # Combine subcommand
     combine_parser = subparsers.add_parser(
         'combine',
-        help='Merge multiple h5ad files'
+        help='Merge multiple h5ad files',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     combine_parser.add_argument(
         'input',
@@ -465,7 +470,8 @@ def main():
     # Metrics subcommand
     metrics_parser = subparsers.add_parser(
         'metrics',
-        help='GPU-accelerated quality metrics (TSSe)'
+        help='GPU-accelerated quality metrics (TSSe)',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     metrics_parser.add_argument(
         'input',
@@ -484,26 +490,27 @@ def main():
         '--memory-resource',
         choices=['cuda-async', 'managed', 'managed-pool', 'cuda'],
         default='managed-pool',
-        help='GPU memory resource: managed-pool (UVM, default), cuda-async (fast), cuda (basic)'
+        help='GPU memory resource: managed-pool (UVM), cuda-async (fast), cuda (basic)'
     )
     metrics_parser.add_argument(
         '--min-frags',
         type=int,
         default=100,
-        help='Minimum unique fragments per cell (default: 100)'
+        help='Minimum unique fragments per cell'
     )
     metrics_parser.add_argument(
         '--batch-size',
         type=int,
         default=64,
-        help='Number of parquet row groups per batch (default: 64, lower = less memory)'
+        help='Number of parquet row groups per batch (lower = less memory)'
     )
     metrics_parser.set_defaults(func=metrics_command)
 
     # Filter subcommand
     filter_parser = subparsers.add_parser(
         'filter',
-        help='GPU-accelerated filtering of fragment parquet files'
+        help='GPU-accelerated filtering of fragment parquet files',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     filter_parser.add_argument(
         'input',
@@ -522,7 +529,7 @@ def main():
         '-m', '--min-fragments',
         type=int,
         default=100,
-        help='Min unique fragments per cell (default: 100)'
+        help='Min unique fragments per cell'
     )
     filter_parser.add_argument(
         '--filter',
@@ -541,14 +548,15 @@ def main():
         '--batch-size',
         type=int,
         default=64,
-        help='Number of parquet row groups per batch (default: 64)'
+        help='Number of parquet row groups per batch'
     )
     filter_parser.set_defaults(func=filter_command)
 
     # Gene subcommand
     gene_parser = subparsers.add_parser(
         'gene',
-        help='Generate gene activity matrix from fragments'
+        help='Generate gene activity matrix from fragments',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     gene_parser.add_argument(
         'input',
@@ -567,25 +575,25 @@ def main():
         '--id-type',
         choices=['gene', 'transcript'],
         default='gene',
-        help='Feature type to use (default: gene)'
+        help='Feature type to use'
     )
     gene_parser.add_argument(
         '--upstream',
         type=int,
         default=2000,
-        help='Base pairs upstream of TSS (default: 2000)'
+        help='Base pairs upstream of TSS'
     )
     gene_parser.add_argument(
         '--downstream',
         type=int,
         default=0,
-        help='Base pairs downstream (default: 0)'
+        help='Base pairs downstream'
     )
     gene_parser.add_argument(
         '--include-gene-body',
         action='store_true',
         default=True,
-        help='Include gene body in regulatory domain (default: True)'
+        help='Include gene body in regulatory domain'
     )
     gene_parser.add_argument(
         '--no-gene-body',
@@ -597,7 +605,7 @@ def main():
         '-m', '--min-fragments',
         type=int,
         default=100,
-        help='Min fragments per cell (default: 100)'
+        help='Min fragments per cell'
     )
     gene_parser.add_argument(
         '-e', '--exclude-chroms',

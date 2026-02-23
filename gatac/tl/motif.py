@@ -1170,12 +1170,15 @@ def gsea_motif_enrichment(
     polars.DataFrame or dict[str, polars.DataFrame]
         GSEA results with columns:
 
-        * ``motif``        – motif name
-        * ``NES``          – normalised enrichment score (positive = enriched
+        * ``motif``           – motif name
+        * ``NES``             – normalised enrichment score (positive = enriched
           at the top / high-logFC end)
-        * ``pval``         – nominal p-value
-        * ``fdr``          – FDR q-value (Benjamini–Hochberg)
-        * ``lead_edge_n``  – number of peaks in the leading edge
+        * ``pval``            – nominal p-value
+        * ``fdr``             – FDR q-value (Benjamini–Hochberg)
+        * ``lead_edge_n``     – number of peaks in the leading edge
+        * ``set_size``        – number of ranked peaks containing the motif
+        * ``lead_edge_frac``  – ``lead_edge_n / set_size``; fraction of the
+          motif set in the leading edge (0–1)
 
         Sorted descending by NES. Returns a single DataFrame when *rankings*
         is a single DataFrame, or a dict when it is a dict.
@@ -1293,9 +1296,14 @@ def gsea_motif_enrichment(
         raw["lead_edge_n"] = raw["lead_edge"].apply(
             lambda x: len(x.split(";")) if isinstance(x, str) and x else 0
         )
+        raw["set_size"] = raw["motif"].map(lambda m: len(gene_sets.get(m, [])))
+        raw["lead_edge_frac"] = raw.apply(
+            lambda row: row["lead_edge_n"] / row["set_size"] if row["set_size"] > 0 else 0.0,
+            axis=1,
+        )
 
         result_df = (
-            raw[["motif", "NES", "pval", "fdr", "lead_edge_n"]]
+            raw[["motif", "NES", "pval", "fdr", "lead_edge_n", "set_size", "lead_edge_frac"]]
             .sort_values("NES", ascending=False)
             .reset_index(drop=True)
         )
@@ -1330,6 +1338,8 @@ def gsea_motif_enrichment(
                 "pval": [],
                 "fdr": [],
                 "lead_edge_n": [],
+                "set_size": [],
+                "lead_edge_frac": [],
             })
 
         result_df = pl.DataFrame({
@@ -1338,6 +1348,11 @@ def gsea_motif_enrichment(
             "pval": [r["pval"] for r in results],
             "fdr": [r["fdr"] for r in results],
             "lead_edge_n": [r["lead_edge_n"] for r in results],
+            "set_size": [len(r["hits"]) for r in results],
+            "lead_edge_frac": [
+                r["lead_edge_n"] / len(r["hits"]) if len(r["hits"]) > 0 else 0.0
+                for r in results
+            ],
         }).sort("NES", descending=True)
 
         return result_df

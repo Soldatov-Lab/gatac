@@ -132,6 +132,55 @@ def _enrichment_scores_and_running_gpu(
     return es, run_es
 
 
+def _enrichment_scores_and_running_gpu_batch(
+    weighted_metric: cp.ndarray,
+    tag_indicators: cp.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """
+    Compute enrichment scores and full running ES for multiple gene sets.
+
+    Vectorised version of :func:`_enrichment_scores_and_running_gpu`.
+
+    Parameters
+    ----------
+    weighted_metric : cp.ndarray, shape (N,)
+    tag_indicators : cp.ndarray, shape (n_sets, N)
+        Binary indicators: 1 if gene is in set, 0 otherwise.
+
+    Returns
+    -------
+    es : cp.ndarray, shape (n_sets,)
+    run_es : cp.ndarray, shape (n_sets, N)
+    """
+    N = weighted_metric.shape[0]
+
+    n_hits = tag_indicators.sum(axis=1, keepdims=True)
+    n_miss = N - n_hits
+
+    sum_correl_tag = (tag_indicators * weighted_metric[None, :]).sum(
+        axis=1, keepdims=True
+    )
+
+    norm_tag = 1.0 / cp.maximum(sum_correl_tag, 1e-10)
+    norm_no_tag = 1.0 / cp.maximum(n_miss, 1.0)
+
+    no_tag = 1.0 - tag_indicators
+
+    increments = (
+        tag_indicators * weighted_metric[None, :] * norm_tag
+        - no_tag * norm_no_tag
+    )
+
+    run_es = cp.cumsum(increments, axis=1)
+
+    max_es = run_es.max(axis=1)
+    min_es = run_es.min(axis=1)
+
+    es = cp.where(cp.abs(max_es) > cp.abs(min_es), max_es, min_es)
+
+    return es, run_es
+
+
 # =============================================================================
 # Permutation generation
 # =============================================================================
@@ -298,6 +347,7 @@ def prerank_gpu(
     permutation_num: int = 1000,
     seed: int = 42,
     perm_batch_size: int = 256,
+    gs_batch_size: int = 16,
 ) -> list[dict]:
     """
     GPU-accelerated preranked GSEA.
@@ -305,11 +355,14 @@ def prerank_gpu(
     Implements the same algorithm as GSEApy's ``prerank`` but runs the
     enrichment-score computation entirely on the GPU using CuPy.
 
-    The permutation null is computed in batches to control GPU memory:
-    for each gene set, permutations are chunked into groups of
-    ``perm_batch_size``. Each chunk allocates (perm_batch_size, N) floats
-    of GPU memory, so the peak memory for the ES computation is
-    ``perm_batch_size * N * 4`` bytes (float32).
+    Gene sets are processed in batches of ``gs_batch_size`` and, within
+    each batch, permutations are chunked into groups of ``perm_batch_size``.
+    All gene-set × permutation combinations in a chunk are evaluated in
+    a **single GPU kernel call**, which dramatically increases GPU
+    utilisation compared to processing one gene set at a time.
+
+    Peak GPU memory for the ES computation is approximately
+    ``gs_batch_size * perm_batch_size * N * 4`` bytes (float32).
 
     Parameters
     ----------
@@ -331,8 +384,12 @@ def prerank_gpu(
     seed : int, default 42
         Random seed for permutation reproducibility.
     perm_batch_size : int, default 256
-        Number of permutations to process together on GPU per gene set.
-        Controls GPU memory usage. Reduce if OOM.
+        Number of permutations to process together on GPU per gene-set
+        batch. Controls GPU memory usage. Reduce if OOM.
+    gs_batch_size : int, default 16
+        Number of gene sets to process simultaneously on the GPU.
+        Larger values improve throughput but increase memory usage.
+        Reduce if OOM.
 
     Returns
     -------
@@ -378,7 +435,8 @@ def prerank_gpu(
 
     logger.info(
         f"GPU GSEA: {n_sets} gene sets, {N} genes, "
-        f"{permutation_num} permutations"
+        f"{permutation_num} permutations  "
+        f"(gs_batch={gs_batch_size}, perm_batch={perm_batch_size})"
     )
 
     # Generate permutation indices ONCE on CPU (shared across all gene sets)
@@ -394,61 +452,86 @@ def prerank_gpu(
     all_hits = []
     nesnull_parts = []
 
-    # Determine effective perm batch size
+    # Determine effective batch sizes
     effective_perm_batch = min(perm_batch_size, n_total_perms)
+    effective_gs_batch = min(gs_batch_size, n_sets)
 
-    # Process each gene set
-    for i, (term, hit_idx, tag_np) in enumerate(tqdm(
-        valid_sets, desc="GSEA gene sets"
-    )):
-        tag_gpu = cp.asarray(tag_np)
+    n_gs_batches = (n_sets + effective_gs_batch - 1) // effective_gs_batch
 
-        # Compute ES for all permutations in batches to control memory
-        es_parts = []
+    # Process gene sets in batches
+    for gs_start in tqdm(
+        range(0, n_sets, effective_gs_batch),
+        desc="GSEA gene-set batches",
+        total=n_gs_batches,
+    ):
+        gs_end = min(gs_start + effective_gs_batch, n_sets)
+        gs_batch = valid_sets[gs_start:gs_end]
+        n_gs = len(gs_batch)
+
+        # Stack tag indicators for all gene sets in this batch → (n_gs, N)
+        tags_np = np.stack([t for _, _, t in gs_batch])
+        tags_gpu = cp.asarray(tags_np)
+
+        # -----------------------------------------------------------
+        # Compute ES for every (gene-set, permutation) pair in chunks
+        # -----------------------------------------------------------
+        es_all = np.empty((n_gs, n_total_perms), dtype=np.float32)
+
         for perm_start in range(0, n_total_perms, effective_perm_batch):
             perm_end = min(perm_start + effective_perm_batch, n_total_perms)
+            n_perm = perm_end - perm_start
 
-            # Get this batch of permutation indices → (batch, N)
-            perm_batch_np = perm_indices[perm_start:perm_end]
-            perm_batch_gpu = cp.asarray(perm_batch_np)
+            # Transfer permutation indices once for all gene sets
+            perm_batch_gpu = cp.asarray(perm_indices[perm_start:perm_end])
 
-            # Apply permutations to tag indicator → (batch, N)
-            perm_tags = tag_gpu[perm_batch_gpu]  # fancy index: (batch, N)
+            # Apply permutations to all gene sets at once:
+            #   tags_gpu[:, perm_batch_gpu] → (n_gs, n_perm, N)
+            # Flatten to (n_gs * n_perm, N) for a single kernel call
+            perm_tags = tags_gpu[:, perm_batch_gpu].reshape(
+                n_gs * n_perm, N
+            )
 
-            # Compute ES for this batch
-            es_batch = _enrichment_scores_gpu(weighted_metric_gpu, perm_tags)
-            es_parts.append(cp.asnumpy(es_batch))
+            # One GPU kernel for the entire (gene-set × permutation) block
+            es_batch_flat = _enrichment_scores_gpu(
+                weighted_metric_gpu, perm_tags
+            )
+            es_all[:, perm_start:perm_end] = cp.asnumpy(
+                es_batch_flat.reshape(n_gs, n_perm)
+            )
 
-            del perm_batch_gpu, perm_tags, es_batch
+            del perm_batch_gpu, perm_tags, es_batch_flat
 
-        # Concatenate all permutation ES values
-        es_all = np.concatenate(es_parts)
-
-        es_obs = float(es_all[0])
-        esnull = es_all[1:]
-
-        # Running ES for leading edge (observed only)
-        _, run_es_gpu = _enrichment_scores_and_running_gpu(
-            weighted_metric_gpu, tag_gpu
+        # -----------------------------------------------------------
+        # Running ES for leading edge (all gene sets in batch at once)
+        # -----------------------------------------------------------
+        _, run_es_batch_gpu = _enrichment_scores_and_running_gpu_batch(
+            weighted_metric_gpu, tags_gpu
         )
-        run_es_np = cp.asnumpy(run_es_gpu)
-        del run_es_gpu, tag_gpu
+        run_es_batch_np = cp.asnumpy(run_es_batch_gpu)
+        del tags_gpu, run_es_batch_gpu
 
-        # Nominal p-value
-        pval = _compute_pval(es_obs, esnull)
+        # -----------------------------------------------------------
+        # Per-gene-set statistics (CPU – negligible cost)
+        # -----------------------------------------------------------
+        for j in range(n_gs):
+            idx = gs_start + j
+            _term, hit_idx, _ = gs_batch[j]
 
-        # Normalize
-        nes, nesnull = _normalize_es(es_obs, esnull)
+            es_obs = float(es_all[j, 0])
+            esnull = es_all[j, 1:]
 
-        # Leading edge
-        le_n = _leading_edge_size(run_es_np, es_obs, hit_idx)
+            pval = _compute_pval(es_obs, esnull)
+            nes, nesnull = _normalize_es(es_obs, esnull)
+            le_n = _leading_edge_size(
+                run_es_batch_np[j], es_obs, hit_idx
+            )
 
-        all_es[i] = es_obs
-        all_nes[i] = nes
-        all_pvals[i] = pval
-        all_lead_edge_n[i] = le_n
-        all_hits.append(hit_idx)
-        nesnull_parts.append(nesnull)
+            all_es[idx] = es_obs
+            all_nes[idx] = nes
+            all_pvals[idx] = pval
+            all_lead_edge_n[idx] = le_n
+            all_hits.append(hit_idx)
+            nesnull_parts.append(nesnull)
 
     # FDR across all gene sets
     nesnull_concat = np.concatenate(nesnull_parts)

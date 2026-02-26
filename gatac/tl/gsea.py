@@ -7,16 +7,16 @@ the GPU for large-scale motif enrichment.
 
 Algorithm
 ---------
-For a ranked list of N genes with ranking metric r[i] and a gene set S of
+For a ranked list of N features with ranking metric r[i] and a feature set S of
 size N_H:
 
-    P_hit(i) = |r[i]|^w / N_R   if gene i ∈ S    (N_R = Σ_{j∈S} |r[j]|^w)
-    P_miss(i) = 1 / (N - N_H)   if gene i ∉ S
+    P_hit(i) = |r[i]|^w / N_R   if feature i ∈ S    (N_R = Σ_{j∈S} |r[j]|^w)
+    P_miss(i) = 1 / (N - N_H)   if feature i ∉ S
 
     RES(i) = cumsum(P_hit - P_miss)
     ES = max(RES) if |max(RES)| > |min(RES)| else min(RES)
 
-Permutation null: shuffle gene labels (gene-set permutation), recompute ES.
+Permutation null: shuffle feature labels (feature-set permutation), recompute ES.
 NES, p-value, FDR follow the GSEA paper / GSEApy implementation.
 """
 
@@ -46,9 +46,9 @@ def _enrichment_scores_gpu(
     Parameters
     ----------
     weighted_metric : cp.ndarray, shape (N,)
-        |r[i]|^weight for each gene, in the original ranked order.
+        |r[i]|^weight for each feature, in the original ranked order.
     tag_indicators : cp.ndarray, shape (n_perm, N)
-        Binary indicators: 1 if gene is in set, 0 otherwise.
+        Binary indicators: 1 if feature is in set, 0 otherwise.
 
     Returns
     -------
@@ -95,7 +95,7 @@ def _enrichment_scores_and_running_gpu(
     tag_indicator: cp.ndarray,
 ) -> tuple[float, cp.ndarray]:
     """
-    Compute enrichment score and full running ES for a single gene set.
+    Compute enrichment score and full running ES for a single feature set.
 
     Parameters
     ----------
@@ -137,7 +137,7 @@ def _enrichment_scores_and_running_gpu_batch(
     tag_indicators: cp.ndarray,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """
-    Compute enrichment scores and full running ES for multiple gene sets.
+    Compute enrichment scores and full running ES for multiple feature sets.
 
     Vectorised version of :func:`_enrichment_scores_and_running_gpu`.
 
@@ -145,7 +145,7 @@ def _enrichment_scores_and_running_gpu_batch(
     ----------
     weighted_metric : cp.ndarray, shape (N,)
     tag_indicators : cp.ndarray, shape (n_sets, N)
-        Binary indicators: 1 if gene is in set, 0 otherwise.
+        Binary indicators: 1 if feature is in set, 0 otherwise.
 
     Returns
     -------
@@ -187,27 +187,27 @@ def _enrichment_scores_and_running_gpu_batch(
 
 
 def _generate_permutation_indices(
-    n_genes: int,
+    n_features: int,
     n_perm: int,
     seed: int,
 ) -> np.ndarray:
     """
-    Generate permutation index arrays (gene-set permutation).
+    Generate permutation index arrays (feature-set permutation).
 
     Row 0 = identity (original order), rows 1..n_perm = shuffled.
 
     Parameters
     ----------
-    n_genes : int
+    n_features : int
     n_perm : int
     seed : int
 
     Returns
     -------
-    np.ndarray, shape (n_perm + 1, n_genes), dtype int32
+    np.ndarray, shape (n_perm + 1, n_features), dtype int32
     """
-    perm_indices = np.empty((n_perm + 1, n_genes), dtype=np.int32)
-    perm_indices[0] = np.arange(n_genes, dtype=np.int32)
+    perm_indices = np.empty((n_perm + 1, n_features), dtype=np.int32)
+    perm_indices[0] = np.arange(n_features, dtype=np.int32)
 
     rs = np.random.RandomState(seed)
     for i in range(1, n_perm + 1):
@@ -338,9 +338,9 @@ def _leading_edge_size(run_es_np: np.ndarray, es: float, hit_indices: np.ndarray
 
 
 def prerank_gpu(
-    gene_names: list[str],
+    feature_names: list[str],
     ranking_values: np.ndarray,
-    gene_sets: dict[str, list[str]],
+    feature_sets: dict[str, list[str]],
     weight: float = 1.0,
     min_size: int = 15,
     max_size: int = 2000,
@@ -355,39 +355,39 @@ def prerank_gpu(
     Implements the same algorithm as GSEApy's ``prerank`` but runs the
     enrichment-score computation entirely on the GPU using CuPy.
 
-    Gene sets are processed in batches of ``gs_batch_size`` and, within
+    Feature sets are processed in batches of ``gs_batch_size`` and, within
     each batch, permutations are chunked into groups of ``perm_batch_size``.
-    All gene-set × permutation combinations in a chunk are evaluated in
+    All feature-set × permutation combinations in a chunk are evaluated in
     a **single GPU kernel call**, which dramatically increases GPU
-    utilisation compared to processing one gene set at a time.
+    utilisation compared to processing one feature set at a time.
 
     Peak GPU memory for the ES computation is approximately
     ``gs_batch_size * perm_batch_size * N * 4`` bytes (float32).
 
     Parameters
     ----------
-    gene_names : list[str]
-        Gene (or peak) names in ranked order (descending by ranking_values).
+    feature_names : list[str]
+        Feature (or peak) names in ranked order (descending by ranking_values).
     ranking_values : np.ndarray, shape (N,)
-        Ranking metric values corresponding to gene_names (already sorted
+        Ranking metric values corresponding to feature_names (already sorted
         descending).
-    gene_sets : dict[str, list[str]]
-        Gene sets to test. Keys are set names, values are lists of gene names.
+    feature_sets : dict[str, list[str]]
+        Feature sets to test. Keys are set names, values are lists of feature names.
     weight : float, default 1.0
         Weighting exponent for the ranking metric.
     min_size : int, default 15
-        Minimum gene set size (after intersection with ranked list).
+        Minimum feature set size (after intersection with ranked list).
     max_size : int, default 2000
-        Maximum gene set size.
+        Maximum feature set size.
     permutation_num : int, default 1000
         Number of permutations for the null distribution.
     seed : int, default 42
         Random seed for permutation reproducibility.
     perm_batch_size : int, default 256
-        Number of permutations to process together on GPU per gene-set
+        Number of permutations to process together on GPU per feature-set
         batch. Controls GPU memory usage. Reduce if OOM.
     gs_batch_size : int, default 16
-        Number of gene sets to process simultaneously on the GPU.
+        Number of feature sets to process simultaneously on the GPU.
         Larger values improve throughput but increase memory usage.
         Reduce if OOM.
 
@@ -395,51 +395,51 @@ def prerank_gpu(
     -------
     list[dict]
         List of result dicts with keys:
-        - term: gene set name
+        - term: feature set name
         - es: enrichment score
         - nes: normalized enrichment score
         - pval: nominal p-value
         - fdr: FDR q-value
-        - lead_edge_n: number of leading-edge genes
-        - hits: indices of gene-set members in the ranked list
+        - lead_edge_n: number of leading-edge features
+        - hits: indices of feature-set members in the ranked list
     """
     from tqdm.auto import tqdm
 
-    N = len(gene_names)
+    N = len(feature_names)
     if N == 0:
         return []
 
-    # Build gene-name → index lookup
-    gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+    # Build feature-name → index lookup
+    feature_to_idx = {g: i for i, g in enumerate(feature_names)}
 
     # Weight the metric: |r|^weight
     ranking_values = np.asarray(ranking_values, dtype=np.float64)
     weighted_metric_np = (np.abs(ranking_values) ** weight).astype(np.float32)
     weighted_metric_gpu = cp.asarray(weighted_metric_np)
 
-    # Filter and build tag indicators for each gene set
+    # Filter and build tag indicators for each feature set
     valid_sets = []  # (name, hit_indices_np, tag_np)
-    for term, members in gene_sets.items():
-        hit_idx = sorted([gene_to_idx[g] for g in members if g in gene_to_idx])
+    for term, members in feature_sets.items():
+        hit_idx = sorted([feature_to_idx[g] for g in members if g in feature_to_idx])
         if min_size <= len(hit_idx) <= max_size:
             tag = np.zeros(N, dtype=np.float32)
             tag[hit_idx] = 1.0
             valid_sets.append((term, np.array(hit_idx, dtype=np.int32), tag))
 
     if not valid_sets:
-        logger.warning("No gene sets passed size filter.")
+        logger.warning("No feature sets passed size filter.")
         return []
 
     n_sets = len(valid_sets)
     n_total_perms = permutation_num + 1  # including the unpermuted original
 
     logger.info(
-        f"GPU GSEA: {n_sets} gene sets, {N} genes, "
+        f"GPU GSEA: {n_sets} feature sets, {N} features, "
         f"{permutation_num} permutations  "
         f"(gs_batch={gs_batch_size}, perm_batch={perm_batch_size})"
     )
 
-    # Generate permutation indices ONCE on CPU (shared across all gene sets)
+    # Generate permutation indices ONCE on CPU (shared across all feature sets)
     logger.info("Generating permutation indices...")
     perm_indices = _generate_permutation_indices(N, permutation_num, seed)
     # Keep on CPU; we'll transfer batches to GPU as needed
@@ -458,22 +458,22 @@ def prerank_gpu(
 
     n_gs_batches = (n_sets + effective_gs_batch - 1) // effective_gs_batch
 
-    # Process gene sets in batches
+    # Process feature sets in batches
     for gs_start in tqdm(
         range(0, n_sets, effective_gs_batch),
-        desc="GSEA gene-set batches",
+        desc="GSEA feature-set batches",
         total=n_gs_batches,
     ):
         gs_end = min(gs_start + effective_gs_batch, n_sets)
         gs_batch = valid_sets[gs_start:gs_end]
         n_gs = len(gs_batch)
 
-        # Stack tag indicators for all gene sets in this batch → (n_gs, N)
+        # Stack tag indicators for all feature sets in this batch → (n_gs, N)
         tags_np = np.stack([t for _, _, t in gs_batch])
         tags_gpu = cp.asarray(tags_np)
 
         # -----------------------------------------------------------
-        # Compute ES for every (gene-set, permutation) pair in chunks
+        # Compute ES for every (feature-set, permutation) pair in chunks
         # -----------------------------------------------------------
         es_all = np.empty((n_gs, n_total_perms), dtype=np.float32)
 
@@ -481,10 +481,10 @@ def prerank_gpu(
             perm_end = min(perm_start + effective_perm_batch, n_total_perms)
             n_perm = perm_end - perm_start
 
-            # Transfer permutation indices once for all gene sets
+            # Transfer permutation indices once for all feature sets
             perm_batch_gpu = cp.asarray(perm_indices[perm_start:perm_end])
 
-            # Apply permutations to all gene sets at once:
+            # Apply permutations to all feature sets at once:
             #   tags_gpu[:, perm_batch_gpu] → (n_gs, n_perm, N)
             # Flatten to (n_gs * n_perm, N) for a single kernel call
             perm_tags = tags_gpu[:, perm_batch_gpu].reshape(
@@ -502,7 +502,7 @@ def prerank_gpu(
             del perm_batch_gpu, perm_tags, es_batch_flat
 
         # -----------------------------------------------------------
-        # Running ES for leading edge (all gene sets in batch at once)
+        # Running ES for leading edge (all feature sets in batch at once)
         # -----------------------------------------------------------
         _, run_es_batch_gpu = _enrichment_scores_and_running_gpu_batch(
             weighted_metric_gpu, tags_gpu
@@ -511,7 +511,7 @@ def prerank_gpu(
         del tags_gpu, run_es_batch_gpu
 
         # -----------------------------------------------------------
-        # Per-gene-set statistics (CPU – negligible cost)
+        # Per-feature-set statistics (CPU – negligible cost)
         # -----------------------------------------------------------
         for j in range(n_gs):
             idx = gs_start + j
@@ -533,7 +533,7 @@ def prerank_gpu(
             all_hits.append(hit_idx)
             nesnull_parts.append(nesnull)
 
-    # FDR across all gene sets
+    # FDR across all feature sets
     nesnull_concat = np.concatenate(nesnull_parts)
     fdrs = _compute_fdr(all_nes, nesnull_concat)
 

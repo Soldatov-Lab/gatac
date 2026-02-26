@@ -1225,7 +1225,7 @@ def gsea_motif_enrichment(
                 "Install it with: pip install gseapy"
             ) from exc
     elif backend == "gpu":
-        from gatac.tl.gsea_gpu import prerank_gpu
+        from gatac.tl.gsea import prerank_gpu
     else:
         raise ValueError(f"Unknown backend: {backend!r}. Use 'gpu' or 'gseapy'.")
 
@@ -1247,20 +1247,20 @@ def gsea_motif_enrichment(
     else:
         motif_match_csc = sp.csc_matrix(motif_match)
 
-    gene_sets: dict[str, list] = {}
+    feature_sets: dict[str, list] = {}
     for i, name in enumerate(motif_names_list):
         peak_idx = motif_match_csc.getcol(i).nonzero()[0]
         if len(peak_idx) >= min_size:
-            gene_sets[str(name)] = list(peak_names[peak_idx])
+            feature_sets[str(name)] = list(peak_names[peak_idx])
 
-    if not gene_sets:
+    if not feature_sets:
         logger.warning(
-            f"No motif gene set has ≥{min_size} peaks. "
+            f"No motif feature set has ≥{min_size} peaks. "
             "Try lowering min_size or re-scanning with a more lenient pvalue."
         )
 
     logger.info(
-        f"Built {len(gene_sets):,} motif gene sets "
+        f"Built {len(feature_sets):,} motif feature sets "
         f"(≥{min_size} peaks; filter to ≥{min_size})"
     )
 
@@ -1281,7 +1281,7 @@ def gsea_motif_enrichment(
 
         res = gp.prerank(
             rnk=ranked_series,
-            gene_sets=gene_sets,
+            gene_sets=feature_sets,
             permutation_num=permutation_num,
             seed=seed,
             min_size=min_size,
@@ -1301,7 +1301,7 @@ def gsea_motif_enrichment(
         raw["lead_edge_n"] = raw["lead_edge"].apply(
             lambda x: len(x.split(";")) if isinstance(x, str) and x else 0
         )
-        raw["set_size"] = raw["motif"].map(lambda m: len(gene_sets.get(m, [])))
+        raw["set_size"] = raw["motif"].map(lambda m: len(feature_sets.get(m, [])))
         raw["lead_edge_frac"] = raw.apply(
             lambda row: row["lead_edge_n"] / row["set_size"] if row["set_size"] > 0 else 0.0,
             axis=1,
@@ -1326,9 +1326,9 @@ def gsea_motif_enrichment(
         ranked_series = df[logfc_col].sort_values(ascending=False)
 
         results = prerank_gpu(
-            gene_names=list(ranked_series.index),
+            feature_names=list(ranked_series.index),
             ranking_values=ranked_series.values,
-            gene_sets=gene_sets,
+            feature_sets=feature_sets,
             weight=1.0,
             min_size=min_size,
             max_size=max_size,

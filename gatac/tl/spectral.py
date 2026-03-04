@@ -728,6 +728,14 @@ def spectral(
         )
         n_comps = max_comps
 
+    # ---- Set chunk_size if number of cells exceeds 100k ----
+    if n > 100_000 and chunk_size is None:
+        chunk_size = 50_000
+        logger.info(
+            f"Number of cells ({n:,}) exceeds 100k; "
+            f"automatically enabling chunked processing with chunk_size={chunk_size:,}."
+        )
+
     # ---- Dispatch to chunked or full-GPU path ----
     if chunk_size is not None:
         # ---- Chunked path: data stays on CPU, chunks stream to GPU ----

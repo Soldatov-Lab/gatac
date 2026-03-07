@@ -173,15 +173,18 @@ def create_tile_matrix_gpu(
     else:
         included_chroms = all_chroms
 
-    # Fragments on included chromosomes only (matches SnapATAC2 counting)
+    # For tile content: only included_chroms (excludes chrM, chrY, etc.)
     fragments_for_counting = fragments_df[fragments_df['chrom'].isin(included_chroms)]
+    # For n_unique counting: all chroms in chrom_sizes (including chrM/chrY),
+    # matching SnapATAC2's min_num_fragments threshold behaviour.
+    fragments_for_n_unique = fragments_df[fragments_df['chrom'].isin(all_chroms)]
 
     # ------------------------------------------------------------------ #
     # 2. Cell filtering                                                    #
     # ------------------------------------------------------------------ #
     if cell_metadata is None:
         logger.debug("Filtering cells by unique fragment count")
-        barcode_counts = fragments_for_counting.groupby('barcode', observed=True).agg(
+        barcode_counts = fragments_for_n_unique.groupby('barcode', observed=True).agg(
             {'count': ['sum', 'size']}
         )
         barcode_counts.columns = ['n_total', 'n_unique']
@@ -194,27 +197,33 @@ def create_tile_matrix_gpu(
         if filter_query:
             cell_metadata = cell_metadata.query(filter_query)
 
-        if 'n_unique' in cell_metadata.columns:
-            cell_metadata = cell_metadata[
-                cell_metadata['n_unique'] >= min_fragments_per_cell
-            ]
-        else:
-            subset_frags = fragments_for_counting[
-                fragments_for_counting['barcode'].isin(cell_metadata['barcode'])
-            ]
-            barcode_counts = subset_frags.groupby('barcode', observed=True).agg(
-                {'count': ['sum', 'size']}
-            )
-            barcode_counts.columns = ['n_total', 'n_unique']
-            barcode_counts = barcode_counts.reset_index()
+        # Always recompute n_unique from fragments restricted to included_chroms
+        # (metrics n_unique may include non-standard contigs, causing too many
+        # cells to pass min_fragments_per_cell compared to filter_fragments).
+        # Cast to string to avoid cudf categorical isin mismatches when the two
+        # series have different category sets.
+        metadata_barcodes = cell_metadata['barcode'].astype('str')
+        subset_frags = fragments_for_n_unique[
+            fragments_for_n_unique['barcode'].astype('str').isin(metadata_barcodes)
+        ]
+        barcode_counts = subset_frags.groupby('barcode', observed=True).agg(
+            {'count': ['sum', 'size']}
+        )
+        barcode_counts.columns = ['n_total', 'n_unique']
+        barcode_counts = barcode_counts.reset_index()
 
-            valid_bc = barcode_counts[
-                barcode_counts['n_unique'] >= min_fragments_per_cell
-            ]['barcode']
-            cell_metadata = cell_metadata[cell_metadata['barcode'].isin(valid_bc)]
-            cell_metadata = cell_metadata.merge(
-                barcode_counts[['barcode', 'n_unique']], on='barcode', how='left'
-            )
+        valid_bc = barcode_counts[
+            barcode_counts['n_unique'] >= min_fragments_per_cell
+        ]['barcode'].astype('str')
+        cell_metadata = cell_metadata[cell_metadata['barcode'].astype('str').isin(valid_bc)]
+        if 'n_unique' in cell_metadata.columns:
+            cell_metadata = cell_metadata.drop(columns=['n_unique'])
+        # barcode_counts still has the original categorical barcode; merge on str
+        barcode_counts['barcode'] = barcode_counts['barcode'].astype('str')
+        cell_metadata['barcode'] = cell_metadata['barcode'].astype('str')
+        cell_metadata = cell_metadata.merge(
+            barcode_counts[['barcode', 'n_unique']], on='barcode', how='left'
+        )
 
     valid_barcodes = cell_metadata['barcode']
     logger.debug(f"Retained {len(valid_barcodes)} cells")

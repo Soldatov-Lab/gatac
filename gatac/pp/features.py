@@ -71,15 +71,21 @@ def _find_most_accessible_features_gpu(
     cp.ndarray
         Indices of selected features
     """
-    sorted_indices = cp.argsort(feature_count)
     n = len(feature_count)
 
     if is_binary:
-        # For binary matrices: simply select top N most accessible features
+        # For binary matrices: select top N most accessible features.
+        # argpartition is O(n) vs argsort's O(n log n) — meaningful for large genomes.
         n_to_select = min(total_features, n)
-        selected = sorted_indices[-n_to_select:]
+        if n_to_select < n:
+            # Partial sort: only the top-N need to be identified, not fully ordered
+            partition_idx = cp.argpartition(feature_count, n - n_to_select)
+            selected = partition_idx[n - n_to_select:]
+        else:
+            selected = cp.arange(n)
     else:
         # For count matrices: first exclude zero-count features (matching SnapATAC2)
+        sorted_indices = cp.argsort(feature_count)
         # Find the first non-zero index in sorted order
         sorted_counts = feature_count[sorted_indices]
         nonzero_mask = sorted_counts > 0
@@ -109,42 +115,55 @@ def _compute_feature_counts_gpu(
     """
     Compute per-feature (column) counts from a sparse matrix.
 
+    For CPU sparse matrices, column sums are computed entirely on CPU and only
+    the small result vector is transferred to GPU, avoiding the expensive PCIe
+    bulk data transfer that bottlenecks consumer GPUs.
+
     Parameters
     ----------
     X : sparse matrix
         Cell x feature count matrix (GPU or CPU sparse)
     chunk_size : int
-        Chunk size for processing (used for very large matrices)
+        Unused; kept for API compatibility.
 
     Returns
     -------
     cp.ndarray
         Sum of counts per feature
     """
-    if isinstance(X, (cusp.csr_matrix, cusp.csc_matrix)):
-        # Already on GPU
-        X_gpu = X if isinstance(X, cusp.csc_matrix) else X.tocsc()
-        return cp.array(X_gpu.sum(axis=0)).ravel()
+    n_features = X.shape[1]
+
+    if isinstance(X, cusp.csr_matrix):
+        # Already on GPU — bincount is O(nnz) and avoids format conversion
+        if X.data.dtype == cp.bool_:
+            return cp.bincount(X.indices, minlength=n_features).astype(cp.float32)
+        else:
+            return cp.bincount(
+                X.indices,
+                weights=X.data.astype(cp.float32),
+                minlength=n_features,
+            )
+    elif isinstance(X, cusp.csc_matrix):
+        if X.data.dtype == cp.bool_:
+            # For CSC, column counts are directly encoded in indptr differences
+            return cp.diff(X.indptr).astype(cp.float32)
+        else:
+            return cp.array(X.sum(axis=0)).ravel().astype(cp.float32)
     elif sp.issparse(X):
-        # CPU sparse matrix - transfer to GPU for fast column sum
-        try:
-            # Convert to float32 for GPU compatibility
-            X_f32 = X.astype(np.float32)
-            X_gpu = cusp.csr_matrix(X_f32)
-            return cp.array(X_gpu.sum(axis=0)).ravel()
-        except Exception as e:
-            # Fallback to chunked CPU processing if GPU transfer fails
-            logger.warning(f"GPU transfer failed, falling back to CPU: {e}")
-            n_features = X.shape[1]
-            feature_counts = cp.zeros(n_features, dtype=cp.float32)
-            for start in range(0, n_features, chunk_size):
-                end = min(start + chunk_size, n_features)
-                chunk_sum = np.array(X[:, start:end].sum(axis=0)).ravel()
-                feature_counts[start:end] = cp.asarray(chunk_sum)
-            return feature_counts
+        # CPU sparse: compute on CPU, transfer only the small result vector.
+        # This avoids shipping the full matrix over PCIe (critical for consumer GPUs).
+        if not isinstance(X, sp.csr_matrix):
+            X = X.tocsr()
+        if X.data.dtype in (np.bool_, bool):
+            # np.bincount on indices alone — O(nnz), no data array needed
+            counts = np.bincount(X.indices, minlength=n_features).astype(np.float32)
+        else:
+            counts = np.asarray(X.sum(axis=0)).ravel().astype(np.float32)
+        return cp.asarray(counts)
     else:
         # Dense array
-        return cp.asarray(X.sum(axis=0)).ravel()
+        arr = X if isinstance(X, cp.ndarray) else cp.asarray(X)
+        return arr.sum(axis=0).astype(cp.float32)
 
 
 def select_features(
@@ -207,10 +226,9 @@ def select_features(
     n_selected = len(selected_indices)
     logger.debug(f"Selected {n_selected:,} features")
 
-    # Create selection mask
-    selected_mask = cp.zeros(adata.shape[1], dtype=bool)
-    selected_mask[selected_indices] = True
-    selected_mask_cpu = selected_mask.get()
+    # Build selection mask on CPU — avoids a GPU alloc + PCIe round-trip
+    selected_mask_cpu = np.zeros(adata.shape[1], dtype=bool)
+    selected_mask_cpu[selected_indices.get()] = True
 
     if inplace:
         adata.var['selected'] = selected_mask_cpu

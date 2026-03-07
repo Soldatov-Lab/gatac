@@ -1,4 +1,4 @@
-from .convert import make_parquet
+from .convert import make_parquet, make_parquet_batch
 from .process import read_fragments_parquet, combine
 from .tile import make_tile_matrix
 from .gene import make_gene_matrix
@@ -12,7 +12,8 @@ from .filter import filter_fragments
 from .genome import HG38, HG19, MM10, MM39
 
 __all__ = [
-    "make_parquet", 
+    "make_parquet",
+    "make_parquet_batch",
     "make_tile_matrix",
     "make_gene_matrix",
     "read_fragments_parquet", 

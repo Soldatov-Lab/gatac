@@ -3,6 +3,8 @@ ATAC fragments TSV.GZ to Parquet conversion.
 """
 
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -84,3 +86,87 @@ def make_parquet(
 
     logger.info(f"Created {output_path.name}")
     return output_path
+
+
+def make_parquet_batch(
+    input_paths: list[str | Path],
+    output_dir: Optional[str | Path] = None,
+    workers: Optional[int] = None,
+    separator: str = '\t',
+    barcode_prefix: Optional[str] = None,
+    row_group_size: int = 1_000_000,
+) -> list[Path]:
+    """
+    Convert multiple ATAC fragment TSV.GZ files to Parquet in parallel.
+
+    Each file is processed in a separate worker process, so DuckDB can
+    use all available CPU cores across files simultaneously.
+
+    Parameters
+    ----------
+    input_paths : list of str or Path
+        Paths to input .tsv.gz (or .bed.gz) files.
+    output_dir : str or Path, optional
+        Directory for output Parquet files.  If None, each output is
+        placed in the same directory as its input.
+    workers : int, optional
+        Number of parallel worker processes.
+        Defaults to ``min(len(input_paths), os.cpu_count())``.
+    separator : str
+        Column separator forwarded to :func:`make_parquet`.
+    barcode_prefix : str, optional
+        Prefix forwarded to :func:`make_parquet`.
+    row_group_size : int
+        Row-group size forwarded to :func:`make_parquet`.
+
+    Returns
+    -------
+    list of Path
+        Output Parquet paths in the same order as *input_paths*.
+
+    Raises
+    ------
+    Exception
+        Re-raises the first worker exception encountered so the caller
+        can handle it.
+    """
+    input_paths = [Path(p) for p in input_paths]
+
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_paths: list[Optional[Path]] = [
+            output_dir / p.with_suffix('').with_suffix('.parquet').name
+            for p in input_paths
+        ]
+    else:
+        output_paths = [None] * len(input_paths)
+
+    n_workers = min(
+        len(input_paths),
+        workers if workers is not None else (os.cpu_count() or 1),
+    )
+
+    logger.info(
+        f"Converting {len(input_paths)} file(s) with {n_workers} worker(s)"
+    )
+
+    results: list[Optional[Path]] = [None] * len(input_paths)
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        future_to_idx = {
+            executor.submit(
+                make_parquet,
+                inp,
+                out,
+                separator,
+                barcode_prefix,
+                row_group_size,
+            ): i
+            for i, (inp, out) in enumerate(zip(input_paths, output_paths))
+        }
+        for future in as_completed(future_to_idx):
+            i = future_to_idx[future]
+            results[i] = future.result()  # propagate worker exceptions
+
+    return results  # type: ignore[return-value]

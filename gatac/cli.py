@@ -28,20 +28,50 @@ def setup_logging(verbose: bool = False):
 
 def convert_command(args):
     """Handle 'gatac convert' subcommand."""
-    from .pp.convert import make_parquet
+    import glob
+    from .pp.convert import make_parquet, make_parquet_batch
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        logging.error(f"Input file not found: {input_path}")
+    # Expand inputs - support glob patterns
+    input_paths = []
+    for inp in args.input:
+        if '*' in inp or '?' in inp:
+            expanded = sorted(glob.glob(inp))
+            if not expanded:
+                logging.warning(f"No files matched pattern: {inp}")
+            input_paths.extend(expanded)
+        else:
+            input_paths.append(inp)
+
+    input_paths = [Path(p) for p in input_paths]
+    for p in input_paths:
+        if not p.exists():
+            logging.error(f"Input file not found: {p}")
+            sys.exit(1)
+
+    if len(input_paths) == 0:
+        logging.error("No input files found")
         sys.exit(1)
 
-    output_path = args.output if args.output else None
-    make_parquet(
-        input_path, 
-        output_path, 
-        progress=args.progress,
-        barcode_prefix=args.barcode_prefix
-    )
+    if len(input_paths) == 1:
+        if args.output_dir:
+            output_path = Path(args.output_dir) / input_paths[0].with_suffix('').with_suffix('.parquet').name
+        else:
+            output_path = args.output if args.output else None
+        make_parquet(
+            input_paths[0],
+            output_path,
+            barcode_prefix=args.barcode_prefix,
+        )
+    else:
+        if args.output:
+            logging.error("Use --output-dir instead of --output when converting multiple files")
+            sys.exit(1)
+        make_parquet_batch(
+            input_paths,
+            output_dir=args.output_dir,
+            workers=args.workers,
+            barcode_prefix=args.barcode_prefix,
+        )
 
 
 def tile_command(args):
@@ -340,17 +370,22 @@ def main():
     )
     convert_parser.add_argument(
         'input',
-        help='Input .tsv.gz file'
+        nargs='+',
+        help='Input .tsv.gz file(s) or glob pattern (e.g. "samples/*.tsv.gz")'
     )
     convert_parser.add_argument(
-        'output',
-        nargs='?',
-        help='Output .parquet file (default: input name with .parquet)'
+        '-o', '--output',
+        help='Output .parquet file (single-file mode only)'
     )
     convert_parser.add_argument(
-        '-p', '--progress',
-        action='store_true',
-        help='Show progress bar'
+        '--output-dir',
+        help='Output directory for Parquet files (multi-file mode)'
+    )
+    convert_parser.add_argument(
+        '-j', '--workers',
+        type=int,
+        default=None,
+        help='Number of parallel worker processes (default: number of input files, capped at CPU count)'
     )
     convert_parser.add_argument(
         '--barcode-prefix',

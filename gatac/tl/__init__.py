@@ -12,6 +12,7 @@ from .chromvar import (
     compute_peak_bias,
 )
 from .spectral import spectral
+from .lda import lda, MiniBatchLDA
 
 __all__ = [
     "call_peaks", 
@@ -29,4 +30,6 @@ __all__ = [
     "sample_bg_peaks",
     "compute_peak_bias",
     "spectral",
+    "lda",
+    "MiniBatchLDA",
 ]

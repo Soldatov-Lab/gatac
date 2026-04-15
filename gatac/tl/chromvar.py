@@ -407,9 +407,9 @@ def scan_motifs(
     motifs: list[DNAMotif],
     genome_fasta: Union[str, Path],
     *,
-    pvalue: float = 1e-5,
+    pvalue: float = 5e-5,
     check_rc: bool = True,
-    bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
+    bg: Union[str, tuple[float, float, float, float]] = "subject",
     mode: Literal["gatac", "motifmatchr"] = "gatac",
     key_added: str = "motif_match",
     peak_batch_size: int = 50000,
@@ -431,12 +431,15 @@ def scan_motifs(
         List of motifs to scan (from `read_motifs` or `parse_meme`)
     genome_fasta : str or Path
         Path to genome FASTA file (supports .fa, .fasta, .fa.gz, .fasta.gz)
-    pvalue : float, default 1e-5
-        P-value threshold for motif matching
+    pvalue : float, default 5e-5
+        P-value threshold for motif matching (matches R/motifmatchr default)
     check_rc : bool, default True
         Whether to check both strands (forward and reverse complement)
-    bg_probs : tuple, default (0.25, 0.25, 0.25, 0.25)
-        Background nucleotide probabilities (A, C, G, T) for score thresholding
+    bg : str or tuple, default "subject"
+        Background nucleotide probabilities (A, C, G, T). Options:
+        - "subject": Compute from extracted peak sequences (matches R/motifmatchr default)
+        - "even": Uniform (0.25, 0.25, 0.25, 0.25)
+        - tuple of 4 floats: Custom background frequencies
     key_added : str, default "motif_match"
         Key to store motif match matrix in `adata.varm`
     peak_batch_size : int, default 50000
@@ -516,6 +519,30 @@ def scan_motifs(
                 logger.warning(f"Failed to fetch sequence for {region}: {e}")
                 sequences.append("")
     
+    # Resolve background probabilities
+    if isinstance(bg, str):
+        if bg == "even":
+            bg_probs = (0.25, 0.25, 0.25, 0.25)
+        elif bg == "subject":
+            # Compute bg from extracted sequences (matches R/motifmatchr default)
+            counts = np.zeros(4, dtype=np.int64)
+            for seq in sequences:
+                seq_upper = seq.upper()
+                counts[0] += seq_upper.count('A')
+                counts[1] += seq_upper.count('C')
+                counts[2] += seq_upper.count('G')
+                counts[3] += seq_upper.count('T')
+            total = counts.sum()
+            if total > 0:
+                bg_probs = tuple(counts / total)
+            else:
+                bg_probs = (0.25, 0.25, 0.25, 0.25)
+            logger.info(f"Background from sequences: A={bg_probs[0]:.4f} C={bg_probs[1]:.4f} G={bg_probs[2]:.4f} T={bg_probs[3]:.4f}")
+        else:
+            raise ValueError(f"Unknown bg mode: {bg}. Use 'subject', 'even', or a tuple of 4 floats.")
+    else:
+        bg_probs = bg
+
     # Precompute thresholds and PWM list (these stay on CPU)
     logger.info("Computing score thresholds...")
     bg_probs_np = np.array(bg_probs, dtype=np.float64)

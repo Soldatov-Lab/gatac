@@ -55,25 +55,35 @@ def _open_fasta(fasta_path: Union[str, Path]):
     fasta_path = Path(fasta_path)
     
     if str(fasta_path).endswith('.gz'):
-        # Decompress gzip file to temporary location using rapidgzip
-        import rapidgzip
+        # Decompress gzip file to temporary location
         import shutil
+        try:
+            import rapidgzip
+            _use_rapidgzip = True
+        except ImportError:
+            import gzip
+            _use_rapidgzip = False
         
-        logger.info(f"Decompressing {fasta_path.name} using rapidgzip...")
+        logger.info(f"Decompressing {fasta_path.name}...")
         
         # Create temp file with same base name for pyfaidx indexing
         temp_dir = tempfile.mkdtemp(prefix="gatac_fasta_")
         temp_fasta = Path(temp_dir) / fasta_path.name.replace('.gz', '')
         
         try:
-            # Decompress using rapidgzip (parallel decompression)
-            with rapidgzip.open(str(fasta_path)) as f_in:
-                with open(temp_fasta, 'wb') as f_out:
-                    while True:
-                        chunk = f_in.read(64 * 1024 * 1024)  # 64MB chunks
-                        if not chunk:
-                            break
-                        f_out.write(chunk)
+            if _use_rapidgzip:
+                # Parallel decompression with rapidgzip
+                with rapidgzip.open(str(fasta_path)) as f_in:
+                    with open(temp_fasta, 'wb') as f_out:
+                        while True:
+                            chunk = f_in.read(64 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            f_out.write(chunk)
+            else:
+                with gzip.open(str(fasta_path), 'rb') as f_in:
+                    with open(temp_fasta, 'wb') as f_out:
+                        shutil.copyfileobj(f_in, f_out)
             
             logger.info(f"Decompressed to {temp_fasta}")
             
@@ -121,6 +131,7 @@ class DNAMotif:
         pwm: np.ndarray,
         name: Optional[str] = None,
         family: Optional[str] = None,
+        pfm: Optional[np.ndarray] = None,
     ):
         """
         Initialize a DNAMotif.
@@ -135,6 +146,11 @@ class DNAMotif:
             Human-readable name
         family : str, optional
             Transcription factor family
+        pfm : np.ndarray, optional
+            Raw position frequency (count) matrix, shape (length, 4).
+            When provided, ``to_log_odds(mode="motifmatchr")`` applies a
+            MOODS-compatible pseudocount to the counts before computing
+            log-odds, matching R's motifmatchr scoring exactly.
         """
         self.id = id
         self.name = name
@@ -150,6 +166,15 @@ class DNAMotif:
         # Normalize rows to sum to 1
         pwm = pwm / pwm.sum(axis=1, keepdims=True)
         self.pwm = pwm
+        
+        # Store raw count matrix for MOODS-compatible pseudocount handling
+        if pfm is not None:
+            pfm = np.asarray(pfm, dtype=np.float64)
+            if pfm.shape != self.pwm.shape:
+                raise ValueError(
+                    f"PFM shape {pfm.shape} must match PWM shape {self.pwm.shape}"
+                )
+        self.pfm = pfm
     
     def __repr__(self) -> str:
         name_str = f", name={self.name}" if self.name else ""
@@ -181,11 +206,14 @@ class DNAMotif:
             Background nucleotide probabilities (A, C, G, T)
         mode : {"gatac", "motifmatchr"}, default "gatac"
             - "gatac": Natural log-odds with minimal pseudocount
-            - "motifmatchr": Log2-odds matching MOODS/motifmatchr scoring
+            - "motifmatchr": Log2-odds matching MOODS/motifmatchr scoring.
+              When raw counts (``pfm``) are available, applies a
+              MOODS-compatible pseudocount:
+              ``prob = (count + pseudocount * bg) / (row_sum + pseudocount)``
         pseudocount : float, default 0.8
-            Pseudocount for preventing log(0). Only used when PWM has zeros.
-            Note: For normalized PWMs (like from MEME files), pseudocount is
-            already baked into the probabilities, so this is just for safety.
+            Pseudocount multiplier used in motifmatchr mode when raw counts
+            (``self.pfm``) are available.  Ignored for probability-only motifs
+            (e.g. from MEME files where the pseudocount is already baked in).
             
         Returns
         -------
@@ -195,13 +223,18 @@ class DNAMotif:
         bg = np.array(bg_probs, dtype=np.float64)
         
         if mode == "motifmatchr":
+            if self.pfm is not None:
+                # MOODS-compatible log-odds from raw counts with pseudocount.
+                # Formula: prob = (count + ps*bg) / (row_sum + ps)
+                # score  = log2(prob / even) + log2(bg / even)
+                smoothed = self.pfm + pseudocount * bg
+                prob = smoothed / smoothed.sum(axis=1, keepdims=True)
+            else:
+                # PPM input (e.g. MEME): pseudocount already baked in
+                prob = self.pwm
+            
             even = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
-            
-            # Use log2 for motifmatchr compatibility
-            log_odds = np.log2(self.pwm / even)
-            
-            # Apply motifmatchr adjustment for non-uniform background:
-            # final = log2(prob/0.25) - (log2(0.25) - log2(bg))
+            log_odds = np.log2(prob / even)
             adj = np.log2(bg) - np.log2(even)
             return log_odds + adj
         else:
@@ -219,11 +252,13 @@ class DNAMotif:
         """
         # Reverse rows and swap A<->T, C<->G columns
         rc_pwm = self.pwm[::-1, ::-1].copy()
+        rc_pfm = self.pfm[::-1, ::-1].copy() if self.pfm is not None else None
         return DNAMotif(
             id=f"{self.id}_rc",
             pwm=rc_pwm,
             name=f"{self.name}_rc" if self.name else None,
             family=self.family,
+            pfm=rc_pfm,
         )
 
 
@@ -505,18 +540,45 @@ def _compute_score_threshold_jit(
         # Swap accumulators
         accum, new_accum = new_accum, accum
     
-    # Compute CDF and find threshold
-    cdf_val = 0.0
-    target = 1.0 - pvalue
-    idx = num_bins
-    
-    for i in range(num_bins + 1):
-        cdf_val += accum[i]
-        if cdf_val >= target:
-            idx = i
+    # Compute min_delta: smallest gap between max and second-max log-odds
+    # at any position (used by MOODS when P(max_score) > pvalue)
+    min_delta = np.inf
+    for pos in range(motif_len):
+        max1 = -np.inf
+        max2 = -np.inf
+        for j in range(4):
+            v = pwm_log_odds[pos, j]
+            if v > max1:
+                max2 = max1
+                max1 = v
+            elif v > max2:
+                max2 = v
+        delta = max1 - max2
+        if delta < min_delta:
+            min_delta = delta
+
+    # Find rightmost non-zero bin (max score may not land on last bin
+    # due to floating-point shift truncation in the DP)
+    max_nonzero_bin = num_bins
+    for i in range(num_bins, -1, -1):
+        if accum[i] > 0.0:
+            max_nonzero_bin = i
             break
-    
-    return total_min + (idx + 0.5) * step
+
+    # Scan from right tail (MOODS convention): accumulate P(score >= s)
+    right_sum = accum[max_nonzero_bin]
+    if right_sum > pvalue:
+        # P(max_score) alone exceeds pvalue — use MOODS heuristic:
+        # place threshold halfway between max and second-highest unique score
+        return total_max - min_delta / 2.0
+
+    for r in range(max_nonzero_bin - 1, -1, -1):
+        right_sum += accum[r]
+        if right_sum > pvalue:
+            # Threshold at next bin boundary above r
+            return total_min + (r + 1) * step
+
+    return total_min
 
 
 def _compute_score_threshold(

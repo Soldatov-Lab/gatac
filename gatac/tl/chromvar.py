@@ -842,27 +842,29 @@ def _compute_deviations(
     return out
 
 
-def chromvar(
+def compute_deviations(
     adata: AnnData,
     *,
-    batch_size: int = 50000,
+    batch_size: int = 5000,
     motif_batch_size: int = -1,
-) -> AnnData:
+    key_added: str = "chromvar",
+    return_adata: bool = False,
+) -> Optional[AnnData]:
     """
     Compute chromVAR TF deviation scores.
-    
-    This is the main chromVAR function that computes per-cell, per-motif deviation
-    scores normalized by background expectation. Requires prior setup:
-    
+
+    Computes per-cell, per-motif deviation scores normalized by background
+    expectation. Requires prior setup:
+
     1. `sample_bg_peaks()` to generate `adata.varm["bg_peaks"]`
     2. `scan_motifs()` to generate `adata.varm["motif_match"]`
-    
+
     The algorithm:
     - For each cell, computes observed motif accessibility
     - Computes expected accessibility based on overall peak accessibility and cell depth
     - For background peaks, computes deviation
     - Z-score normalizes: (observed_dev - mean_bg_dev) / std_bg_dev
-    
+
     Parameters
     ----------
     adata : AnnData
@@ -870,38 +872,40 @@ def chromvar(
         - `adata.varm["bg_peaks"]`: Background peak indices from `sample_bg_peaks()`
         - `adata.varm["motif_match"]`: Motif match matrix from `scan_motifs()`
         - `adata.uns["motif_name"]`: Motif names from `scan_motifs()`
-    batch_size : int, default 50000
+    batch_size : int, default 5000
         Number of cells to process at once. Reduce if GPU memory is limited.
     motif_batch_size : int, default -1
         Number of motifs to process at once. If -1, uses default of 100 motifs
         to balance memory usage and speed. Reduce further for very large datasets.
-        
+    key_added : str, default "chromvar"
+        Key under which the deviation DataFrame is stored in `adata.obsm`.
+    return_adata : bool, default False
+        If True, also return a new AnnData with deviations as `.X`.
+
     Returns
     -------
-    AnnData
-        New AnnData object with deviation scores:
-        - `.X`: Deviation matrix (n_cells, n_motifs)
-        - `.obs`: Copy of input cell metadata
-        - `.var_names`: Motif names
-        
+    None or AnnData
+        Always stores deviations as a DataFrame in `adata.obsm[key_added]`.
+        Returns an AnnData (cells × motifs) only when `return_adata=True`.
+
     Examples
     --------
     >>> import gatac as ga
-    >>> 
+    >>>
     >>> # 1. Create peak matrix
     >>> peak_adata = ga.tl.make_peak_matrix(tile_adata, parquet_path)
-    >>> 
+    >>>
     >>> # 2. Compute biases and sample background
     >>> ga.tl.compute_peak_bias(peak_adata, "genome.fa")
     >>> ga.tl.sample_bg_peaks(peak_adata)
-    >>> 
+    >>>
     >>> # 3. Scan motifs
     >>> motifs = ga.tl.read_motifs("motifs.meme")
     >>> ga.tl.scan_motifs(peak_adata, motifs, "genome.fa")
-    >>> 
-    >>> # 4. Compute chromVAR deviations
-    >>> dev_adata = ga.tl.chromvar(peak_adata)
-    >>> dev_adata.X  # Deviation scores (cells × motifs)
+    >>>
+    >>> # 4. Compute deviations (stored in peak_adata.obsm["chromvar"])
+    >>> ga.tl.compute_deviations(peak_adata)
+    >>> peak_adata.obsm["chromvar"]  # DataFrame (cells × motifs)
     """
     # Validate inputs
     if "bg_peaks" not in adata.varm:
@@ -1071,11 +1075,129 @@ def chromvar(
     
     # Concatenate all motif chunks
     dev = np.concatenate(dev_all, axis=1) if len(dev_all) > 1 else dev_all[0]
-    
-    # Create output AnnData
-    dev_adata = AnnData(dev, dtype=np.float32, obs=adata.obs.copy())
-    dev_adata.var_names = adata.uns["motif_name"]
-    
-    logger.info(f"Computed chromVAR deviations: {dev_adata.shape}")
-    
-    return dev_adata
+
+    import pandas as pd
+
+    motif_names = adata.uns["motif_name"]
+    adata.obsm[key_added] = pd.DataFrame(
+        dev, index=adata.obs_names, columns=motif_names
+    )
+
+    logger.info(
+        f"Computed chromVAR deviations: {dev.shape}. "
+        f"Stored in adata.obsm['{key_added}']"
+    )
+
+    if return_adata:
+        dev_adata = AnnData(dev, dtype=np.float32, obs=adata.obs.copy())
+        dev_adata.var_names = motif_names
+        return dev_adata
+    return None
+
+
+# =============================================================================
+# Full chromVAR Pipeline
+# =============================================================================
+
+
+def chromvar(
+    adata: AnnData,
+    genome_fasta: Union[str, Path],
+    motifs_path: Union[str, Path],
+    *,
+    method: Literal["knn", "chromvar"] = "chromvar",
+    n_iterations: int = 50,
+    pvalue: float = 5e-5,
+    check_rc: bool = True,
+    bg: Union[str, tuple] = "subject",
+    coordinate_system: Literal["0-based", "1-based"] = "0-based",
+    batch_size: int = 5000,
+    motif_batch_size: int = -1,
+    key_added: str = "chromvar",
+    return_adata: bool = False,
+) -> Optional[AnnData]:
+    """
+    Run the full chromVAR pipeline in a single call.
+
+    Executes the following steps in order:
+
+    1. `compute_peak_bias` — GC content from genome FASTA
+    2. `sample_bg_peaks` — background peak sampling
+    3. `read_motifs` + `scan_motifs` — motif matching
+    4. `compute_deviations` — TF deviation scores
+
+    Parameters
+    ----------
+    adata : AnnData
+        Peak-level AnnData (cells × peaks).
+    genome_fasta : str or Path
+        Path to genome FASTA file.
+    motifs_path : str or Path
+        Path to motif file in MEME format.
+    method : {"knn", "chromvar"}, default "chromvar"
+        Background sampling method passed to `sample_bg_peaks`.
+    n_iterations : int, default 50
+        Number of background peaks to sample per peak.
+    pvalue : float, default 5e-5
+        P-value threshold for motif matching.
+    check_rc : bool, default True
+        Whether to scan both strands.
+    bg : str or tuple, default "subject"
+        Background nucleotide probabilities for motif scoring.
+    coordinate_system : {"0-based", "1-based"}, default "0-based"
+        Coordinate system of peak names in `adata.var_names`.
+    batch_size : int, default 5000
+        Number of cells per GPU batch in `compute_deviations`.
+    motif_batch_size : int, default -1
+        Number of motifs per chunk in `compute_deviations`.
+    key_added : str, default "chromvar"
+        Key under which the deviation DataFrame is stored in `adata.obsm`.
+    return_adata : bool, default False
+        If True, also return a new AnnData with deviations as `.X`.
+
+    Returns
+    -------
+    None or AnnData
+        Always stores deviations as a DataFrame in `adata.obsm[key_added]`.
+        Returns an AnnData (cells × motifs) only when `return_adata=True`.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.tl.chromvar(
+    ...     peak_adata,
+    ...     "../resources/GRCh38.p13.genome.fa",
+    ...     "../resources/cisBP_human.meme",
+    ... )
+    >>> peak_adata.obsm["chromvar"]  # DataFrame (cells × motifs)
+    """
+    from .motif import read_motifs
+
+    logger.info("=== chromVAR pipeline ===")
+
+    logger.info("Step 1/4: Computing peak biases...")
+    compute_peak_bias(adata, genome_fasta)
+
+    logger.info("Step 2/4: Sampling background peaks...")
+    sample_bg_peaks(adata, method=method, n_iterations=n_iterations)
+
+    logger.info("Step 3/4: Reading motifs and scanning peaks...")
+    motifs = read_motifs(motifs_path)
+    scan_motifs(
+        adata,
+        motifs,
+        genome_fasta,
+        pvalue=pvalue,
+        check_rc=check_rc,
+        bg=bg,
+        coordinate_system=coordinate_system,
+    )
+
+    logger.info("Step 4/4: Computing deviations...")
+    return compute_deviations(
+        adata,
+        batch_size=batch_size,
+        motif_batch_size=motif_batch_size,
+        key_added=key_added,
+        return_adata=return_adata,
+    )

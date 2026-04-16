@@ -7,6 +7,7 @@ from .motif import motif_enrichment, read_motifs, parse_meme, DNAMotif, gsea_mot
 from .markers import marker_peaks, get_marker_peaks
 from .chromvar import (
     chromvar,
+    compute_deviations,
     scan_motifs,
     sample_bg_peaks,
     compute_peak_bias,
@@ -26,6 +27,7 @@ __all__ = [
     "marker_peaks",
     "get_marker_peaks",
     "chromvar",
+    "compute_deviations",
     "scan_motifs",
     "sample_bg_peaks",
     "compute_peak_bias",

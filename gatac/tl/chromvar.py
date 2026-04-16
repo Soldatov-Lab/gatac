@@ -74,6 +74,88 @@ def scipy_to_cupy_sparse(sparse_matrix: scipy_csr_matrix) -> cupy_sparse.csr_mat
     return cupy_sparse_matrix
 
 
+def _compute_gc_content_gpu(
+    peak_regions: list[str],
+    genome_fasta: Union[str, Path],
+    coordinate_system: Literal["0-based", "1-based"] = "0-based",
+    batch_size: int = 10000,
+) -> np.ndarray:
+    """
+    Compute GC content using GPU-accelerated batch processing.
+
+    Fetches sequences from the FASTA file in one pass, encodes them as a
+    padded 2-D byte matrix, and counts G/C bases on the GPU via CuPy.
+    This is significantly faster than per-peak Python string `.count()` calls
+    for large peak sets.
+
+    Parameters
+    ----------
+    peak_regions : list[str]
+        Peak names in "chr:start-end" format.
+    genome_fasta : str or Path
+        Path to genome FASTA file.
+    coordinate_system : {"0-based", "1-based"}, default "0-based"
+        Coordinate system of the peak names.
+    batch_size : int, default 10000
+        Number of peaks to process per GPU batch.
+
+    Returns
+    -------
+    np.ndarray
+        GC content per peak, shape (n_peaks,), dtype float32.
+    """
+    n_peaks = len(peak_regions)
+
+    # --- 1. Fetch all sequences (CPU / I/O bound) ---
+    sequences: list[str] = []
+    with _open_fasta(genome_fasta) as genome:
+        for region in tqdm(peak_regions, desc="Fetching sequences for GC content"):
+            try:
+                chrom, coords = region.split(":")
+                start, end = int(coords.split("-")[0]), int(coords.split("-")[1])
+                if coordinate_system == "1-based":
+                    seq = str(genome[chrom][start - 1 : end].seq).upper()
+                else:
+                    seq = str(genome[chrom][start:end].seq).upper()
+                sequences.append(seq)
+            except Exception as e:
+                logger.warning(f"Failed to fetch {region}: {e}")
+                sequences.append("")
+
+    lengths = np.array([len(s) for s in sequences], dtype=np.int32)
+    gc_content = np.zeros(n_peaks, dtype=np.float32)
+
+    # --- 2. GPU-vectorised GC counting in batches ---
+    for batch_start in range(0, n_peaks, batch_size):
+        batch_end = min(batch_start + batch_size, n_peaks)
+        batch_seqs = sequences[batch_start:batch_end]
+        batch_lengths = lengths[batch_start:batch_end]
+
+        max_len = int(batch_lengths.max()) if batch_lengths.max() > 0 else 0
+        if max_len == 0:
+            continue
+
+        # Encode: pad sequences into a (batch, max_len) uint8 matrix
+        seq_array = np.zeros((len(batch_seqs), max_len), dtype=np.uint8)
+        for i, seq in enumerate(batch_seqs):
+            n = len(seq)
+            if n > 0:
+                seq_array[i, :n] = np.frombuffer(seq.encode(), dtype=np.uint8)
+
+        # Transfer to GPU and count G (71) and C (67) in parallel
+        seq_gpu = cp.asarray(seq_array)
+        gc_mask = (seq_gpu == 71) | (seq_gpu == 67)
+        gc_counts = gc_mask.sum(axis=1).astype(cp.float32)
+        batch_len_gpu = cp.asarray(batch_lengths, dtype=cp.float32)
+        batch_gc = cp.where(batch_len_gpu > 0, gc_counts / batch_len_gpu, 0.0)
+        gc_content[batch_start:batch_end] = cp.asnumpy(batch_gc)
+
+        del seq_gpu, gc_mask, gc_counts, batch_gc
+        mempool.free_all_blocks()
+
+    return gc_content
+
+
 def compute_peak_bias(
     adata: AnnData,
     genome_fasta: Union[str, Path],
@@ -113,46 +195,29 @@ def compute_peak_bias(
     >>> peak_adata.var["gc_content"]  # GC content per peak
     """
     logger.info(f"Computing peak biases from {genome_fasta}...")
-    
+
     peak_regions = list(adata.var_names)
     n_peaks = len(peak_regions)
-    
-    # Initialize arrays
-    gc_content = np.zeros(n_peaks, dtype=np.float32) if add_gc_content else None
-    cpg_density = np.zeros(n_peaks, dtype=np.float32) if add_cpg_density else None
-    
-    # Fetch sequences and compute biases
-    with _open_fasta(genome_fasta) as genome:
-        for i, region in enumerate(tqdm(peak_regions, desc="Computing biases")):
-            try:
-                chrom, coords = region.split(":")
-                start, end = coords.split("-")
-                start, end = int(start), int(end)
-                seq = str(genome[chrom][start:end].seq).upper()
-                
-                if add_gc_content:
-                    gc_count = seq.count("G") + seq.count("C")
-                    gc_content[i] = gc_count / len(seq) if len(seq) > 0 else 0.0
-                
-                if add_cpg_density:
-                    cpg_count = seq.count("CG")
-                    cpg_density[i] = cpg_count / len(seq) if len(seq) > 0 else 0.0
-                    
-            except Exception as e:
-                logger.warning(f"Failed to process {region}: {e}")
-                if add_gc_content:
-                    gc_content[i] = 0.0
-                if add_cpg_density:
-                    cpg_density[i] = 0.0
-    
-    # Add to adata.var
+
+    # GC content: GPU-accelerated batch computation
     if add_gc_content:
-        adata.var["gc_content"] = gc_content
-        logger.info(f"Added 'gc_content' to adata.var")
-    
+        adata.var["gc_content"] = _compute_gc_content_gpu(peak_regions, genome_fasta)
+        logger.info("Added 'gc_content' to adata.var")
+
+    # CpG density: sequential (requires per-sequence string scan)
     if add_cpg_density:
+        cpg_density = np.zeros(n_peaks, dtype=np.float32)
+        with _open_fasta(genome_fasta) as genome:
+            for i, region in enumerate(tqdm(peak_regions, desc="Computing CpG density")):
+                try:
+                    chrom, coords = region.split(":")
+                    start, end = int(coords.split("-")[0]), int(coords.split("-")[1])
+                    seq = str(genome[chrom][start:end].seq).upper()
+                    cpg_density[i] = seq.count("CG") / len(seq) if len(seq) > 0 else 0.0
+                except Exception as e:
+                    logger.warning(f"Failed to process {region}: {e}")
         adata.var["cpg_density"] = cpg_density
-        logger.info(f"Added 'cpg_density' to adata.var")
+        logger.info("Added 'cpg_density' to adata.var")
 
 
 # =============================================================================
@@ -289,6 +354,7 @@ def sample_bg_peaks(
     method: Literal["knn", "chromvar"] = "knn",
     n_iterations: int = 50,
     bg_columns: list[str] = ["gc_content", "reads_per_peak"],
+    genome_fasta: Optional[Union[str, Path]] = None,
     n_neighbors: int = 50,
     bs: int = 50,
     w: float = 0.1,
@@ -314,28 +380,34 @@ def sample_bg_peaks(
     n_iterations : int, default 50
         Number of background peaks to sample per peak
     bg_columns : list[str], default ["gc_content", "reads_per_peak"]
-        Columns in `adata.var` to use for bias matching. If "gc_content" is
-        included but not present, it will be computed automatically.
+        Columns in `adata.var` to use for bias matching. Any column listed here
+        that is absent from `adata.var` will be computed automatically when
+        `genome_fasta` is provided.
+    genome_fasta : str or Path, optional
+        Path to genome FASTA file. Required when `bg_columns` contains
+        "gc_content" and it has not been precomputed.
     n_neighbors : int, default 50
         Number of neighbors for k-NN method (only used if method="knn")
     bs : int, default 50
         Bin size for chromVAR method (only used if method="chromvar")
     w : float, default 0.1
         Gaussian kernel width for chromVAR method (only used if method="chromvar")
-        
+
     Returns
     -------
     None
         Adds `adata.varm["bg_peaks"]` with shape (n_peaks, n_iterations) containing
         background peak indices for each peak.
-        
+
     Examples
     --------
     >>> import gatac as ga
-    >>> # Compute biases first
+    >>> # Option A: precompute biases separately
     >>> ga.tl.compute_peak_bias(peak_adata, "genome.fa")
-    >>> # Sample background peaks
     >>> ga.tl.sample_bg_peaks(peak_adata, method="knn")
+    >>>
+    >>> # Option B: let sample_bg_peaks compute gc_content on the fly
+    >>> ga.tl.sample_bg_peaks(peak_adata, method="knn", genome_fasta="genome.fa")
     >>> peak_adata.varm["bg_peaks"]  # Background indices
     """
     # Compute reads per peak (log10 transformed)
@@ -344,7 +416,20 @@ def sample_bg_peaks(
         raise ValueError("Some peaks have no reads. Filter peaks before sampling.")
     reads_per_peak = np.log10(reads_per_peak)
     adata.var["reads_per_peak"] = reads_per_peak
-    
+
+    # Auto-compute missing bias columns that can be derived from the genome
+    if "gc_content" in bg_columns and "gc_content" not in adata.var.columns:
+        if genome_fasta is None:
+            raise ValueError(
+                "'gc_content' is not in adata.var and no genome_fasta was provided. "
+                "Either run ga.tl.compute_peak_bias(adata, genome_fasta) first, "
+                "or pass genome_fasta to sample_bg_peaks()."
+            )
+        logger.info("'gc_content' not found in adata.var — computing automatically...")
+        adata.var["gc_content"] = _compute_gc_content_gpu(
+            list(adata.var_names), genome_fasta
+        )
+
     # Prepare bias matrix
     if len(bg_columns) > 0:
         mat = np.array(adata.var[bg_columns].values).T

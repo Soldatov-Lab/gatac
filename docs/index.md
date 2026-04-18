@@ -6,35 +6,22 @@ sd_hide_title: true
 
 ```{toctree}
 :hidden:
+:caption: General
 :maxdepth: 1
 
 installation
+tutorials/index
 changelog
 contributing
 ```
 
 ```{toctree}
 :hidden:
-:caption: CLI Reference
-:maxdepth: 2
-
-cli/index
-```
-
-```{toctree}
-:hidden:
-:caption: Python API
+:caption: Reference
 :maxdepth: 2
 
 api/index
-```
-
-```{toctree}
-:hidden:
-:caption: Tutorials
-:maxdepth: 2
-
-tutorials/index
+cli/index
 ```
 
 ::::{grid} 1 1 2 2

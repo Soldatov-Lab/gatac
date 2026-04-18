@@ -38,8 +38,9 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
-    "sphinx.ext.viewcode",
     "sphinx.ext.githubpages",
+    # scanpydoc (theme + extensions); must come after napoleon
+    "scanpydoc",
     # Typing
     "sphinx_autodoc_typehints",
     # Notebooks + Markdown (myst_nb already loads myst_parser)
@@ -142,47 +143,19 @@ exclude_patterns = [
 ]
 
 # -- Options for HTML output -------------------------------------------------
-html_theme = "pydata_sphinx_theme"
+html_theme = "scanpydoc"
 html_title = "GATAC"
+html_logo = "_static/logo_outlines.svg"
 
 html_theme_options = {
-    "logo": {
-        "image_light": "logo_outlines.svg",
-        "image_dark": "logo_outlines.svg",
-        "text": "GATAC",
-    },
-    "github_url": "https://github.com/Soldatov-Lab/gatac",
-    "navbar_start": ["navbar-logo"],
-    "navbar_center": ["navbar-nav"],
-    "navbar_end": ["navbar-icon-links", "theme-switcher"],
-    "navbar_persistent": ["search-button"],
-    "secondary_sidebar_items": ["page-toc", "edit-this-page", "sourcelink"],
-    "footer_start": ["copyright"],
-    "footer_end": ["sphinx-version"],
-    "show_toc_level": 2,
-    "navigation_depth": 3,
-    "collapse_navigation": True,
-    "pygments_light_style": "tango",
-    "pygments_dark_style": "monokai",
-    "announcement": None,
-}
-
-html_sidebars = {
-    "index": [],
-    "installation": [],
-    "contributing": [],
-    "changelog": [],
-    "api/**": ["sidebar-nav-bs"],
-    "cli/**": ["sidebar-nav-bs"],
-    "tutorials/**": ["sidebar-nav-bs"],
+    "repository_url": "https://github.com/Soldatov-Lab/gatac",
+    "repository_branch": "main",
+    "use_repository_button": True,
+    "navigation_with_keys": False,
 }
 
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
-
-html_context = {
-    "default_mode": "light",
-}
 
 # -- Source suffix -----------------------------------------------------------
 # myst_nb owns both .md and .ipynb; use "myst-nb" so Sphinx can find the parser.

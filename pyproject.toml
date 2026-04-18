@@ -40,7 +40,7 @@ conflicts = [
 [dependency-groups]
 docs = [
     "sphinx>=9.1",  # TODO: remove conf.py monkey-patch once executablebooks/MyST-Parser#1052 is fixed
-    "pydata-sphinx-theme>=0.15",
+    "scanpydoc>=0.13",
     "myst-parser>=4.0",
     "myst-nb>=1.1",
     "sphinx-autodoc-typehints>=2.0",
@@ -49,6 +49,7 @@ docs = [
     "sphinxcontrib-mermaid>=0.9",
     "sphinx-autobuild>=2024",
     "numpydoc>=1.7",
+    "sphinx-book-theme>=1.2.0",
 ]
 
 [build-system]

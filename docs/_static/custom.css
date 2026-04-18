@@ -1,23 +1,29 @@
-/* GATAC documentation — custom styles (pydata-sphinx-theme base) */
+/* GATAC documentation — custom styles (scanpydoc / sphinx-book-theme base) */
 
 /* ── Brand colours ───────────────────────────────────────────────────────── */
 :root {
-  --gatac-green:     #2ea44f;
-  --gatac-green-dark:#238636;
-  --gatac-blue:      #0969da;
+  --gatac-green:     #73b301;   /* logo green */
+  --gatac-green-dark:#5a8c00;
   --gatac-gpu:       #76b900;   /* NVIDIA green */
 }
 
-/* ── Navbar ──────────────────────────────────────────────────────────────── */
-.bd-header {
-  border-bottom: 2px solid var(--pst-color-border);
+/* ── Logo spacing ────────────────────────────────────────────────────────── */
+.navbar-brand img {
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  max-height: 100px;
 }
 
-.bd-header .navbar-brand span {
-  font-weight: 700;
-  font-size: 1.25rem;
-  letter-spacing: -0.02em;
+/* ── Toctree caption headings (sidebar section labels) ───────────────────── */
+p.caption .caption-text {
+  color: var(--gatac-green);
+  font-weight: 600;
+  text-transform: uppercase;
 }
+
+/* ── Custom small/smaller roles (mirrors rapids-singlecell usage) ─────────── */
+.small   { font-size: 40% !important; }
+.smaller { font-size: 70% !important; }
 
 /* ── Landing page hero cards ─────────────────────────────────────────────── */
 .sd-card {
@@ -66,7 +72,7 @@ div.admonition.tip > p.admonition-title::before {
   border-radius: 6px;
 }
 
-/* ── Sidebar navigation ──────────────────────────────────────────────────── */
+/* ── Sidebar active link ─────────────────────────────────────────────────── */
 .bd-sidebar-primary .nav-link.active {
   border-left: 3px solid var(--gatac-green);
   font-weight: 600;

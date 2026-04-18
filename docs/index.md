@@ -24,6 +24,31 @@ api/index
 cli/index
 ```
 
+```{toctree}
+:hidden:
+:caption: About
+:maxdepth: 1
+
+../reproducibility/README
+```
+# GATAC: GPU-Accelerated scATACseq Analysis
+
+GATAC is a GPU-accelerated toolkit for end-to-end ATAC-seq data processing.
+Starting from raw fragment files, it produces analysis-ready sparse matrices
+(tile, peak, and gene activity) that integrate directly with the
+[scverse](https://scverse.org) ecosystem — AnnData, Scanpy, and SnapATAC2.
+Computations are offloaded to the GPU via [RAPIDS cuDF](https://rapids.ai),
+[CuPy](https://cupy.dev), and [cuML](https://docs.rapids.ai/api/cuml/stable/),
+delivering 10× speedups over CPU-only workflows on typical single-cell
+datasets.
+
+GATAC workflow takes advantage of [Apache Parquet](https://parquet.apache.org) file format. Parquet's columnar layout and
+built-in compression make it an ideal staging format for GPU-based pipelines:
+columns are read independently, so only the genomic coordinates actually needed
+for a given operation are transferred to device memory. RAPIDS cuDF can read
+Parquet directly into GPU memory with zero CPU round-trips, enabling streaming
+aggregation over datasets that far exceed the size of available GPU RAM.
+
 ::::{grid} 1 1 2 2
 :gutter: 3
 
@@ -43,20 +68,17 @@ Get started
 ```
 :::
 
-:::{grid-item-card} Scanpy-compatible
+:::{grid-item-card} Ecosystem Integration
 :shadow: none
 
-GATAC outputs standard **AnnData** objects that drop straight into any
-Scanpy/SnapATAC2 downstream workflow.  Quality metrics, tile matrices, peak
-matrices, spectral embeddings, and chromVAR deviations are all first-class
-citizens.
+GATAC [reproduces](../reproducibility/README) the core operations and functions of established tools like **SnapATAC2**, **ArchR**, **MACS3**, and **chromVAR** within a unified framework. It produces standard **AnnData** objects that are fully compatible with the **scverse** ecosystem.
 
 +++
-```{button-ref} api/index
+```{button-ref} tutorials/index
 :ref-type: doc
-:color: secondary
+:color: success
 :outline:
-Browse the API
+View Tutorials
 ```
 :::
 

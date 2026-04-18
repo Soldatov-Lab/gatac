@@ -1,6 +1,20 @@
-# GATAC
+# GATAC: GPU-Accelerated scATACseq Analysis
 
-GPU-accelerated ATAC-seq processing toolkit.
+GATAC is a GPU-accelerated toolkit for end-to-end ATAC-seq data processing.
+Starting from raw fragment files, it produces analysis-ready sparse matrices
+(tile, peak, and gene activity) that integrate directly with the
+[scverse](https://scverse.org) ecosystem — AnnData, Scanpy, and SnapATAC2.
+Computations are offloaded to the GPU via [RAPIDS cuDF](https://rapids.ai),
+[CuPy](https://cupy.dev), and [cuML](https://docs.rapids.ai/api/cuml/stable/),
+delivering 10–50× speedups over CPU-only workflows on typical single-cell
+datasets.
+
+GATAC workflow takes advantage of [Apache Parquet](https://parquet.apache.org) file format. Parquet's columnar layout and
+built-in compression make it an ideal staging format for GPU-based pipelines:
+columns are read independently, so only the genomic coordinates actually needed
+for a given operation are transferred to device memory. RAPIDS cuDF can read
+Parquet directly into GPU memory with zero CPU round-trips, enabling streaming
+aggregation over datasets that far exceed the size of available GPU RAM.
 
 ## Installation
 

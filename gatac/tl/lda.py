@@ -12,6 +12,7 @@ References
 .. [1] Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
        Stochastic variational inference. *JMLR*, 14, 1303–1347.
 """
+from __future__ import annotations
 
 import cupy as cp
 import cupyx.scipy.sparse as cp_sparse

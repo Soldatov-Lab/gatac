@@ -3,6 +3,7 @@ GPU-accelerated filtering of ATAC fragment parquet files.
 
 This module provides functions to filter fragment data based on cell quality metrics.
 """
+from __future__ import annotations
 
 import logging
 import gc

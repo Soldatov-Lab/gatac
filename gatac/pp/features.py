@@ -1,6 +1,7 @@
 """
 GPU-accelerated feature selection for ATAC-seq tile matrices.
 """
+from __future__ import annotations
 
 import gc
 import logging

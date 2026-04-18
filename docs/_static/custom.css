@@ -1,0 +1,111 @@
+/* GATAC documentation — custom styles (pydata-sphinx-theme base) */
+
+/* ── Brand colours ───────────────────────────────────────────────────────── */
+:root {
+  --gatac-green:     #2ea44f;
+  --gatac-green-dark:#238636;
+  --gatac-blue:      #0969da;
+  --gatac-gpu:       #76b900;   /* NVIDIA green */
+}
+
+/* ── Navbar ──────────────────────────────────────────────────────────────── */
+.bd-header {
+  border-bottom: 2px solid var(--pst-color-border);
+}
+
+.bd-header .navbar-brand span {
+  font-weight: 700;
+  font-size: 1.25rem;
+  letter-spacing: -0.02em;
+}
+
+/* ── Landing page hero cards ─────────────────────────────────────────────── */
+.sd-card {
+  border-radius: 8px;
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.sd-card:hover {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
+  transform: translateY(-2px);
+}
+
+/* ── API summary tables ──────────────────────────────────────────────────── */
+table.autosummary td:first-child code {
+  white-space: nowrap;
+}
+
+/* ── Code blocks ─────────────────────────────────────────────────────────── */
+div.highlight pre {
+  border-radius: 6px;
+}
+
+/* Inline code */
+code.literal {
+  background-color: var(--pst-color-surface);
+  border: 1px solid var(--pst-color-border);
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-size: 0.88em;
+}
+
+/* ── Admonition tweaks ───────────────────────────────────────────────────── */
+div.admonition.note > p.admonition-title::before {
+  content: "ℹ️  ";
+}
+div.admonition.warning > p.admonition-title::before {
+  content: "⚠️  ";
+}
+div.admonition.tip > p.admonition-title::before {
+  content: "💡  ";
+}
+
+/* ── Mermaid diagrams ────────────────────────────────────────────────────── */
+.mermaid svg {
+  max-width: 100%;
+  border-radius: 6px;
+}
+
+/* ── Sidebar navigation ──────────────────────────────────────────────────── */
+.bd-sidebar-primary .nav-link.active {
+  border-left: 3px solid var(--gatac-green);
+  font-weight: 600;
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+footer.bd-footer {
+  border-top: 1px solid var(--pst-color-border);
+  font-size: 0.85rem;
+}
+
+/* ── GPU badge (used in API pages) ──────────────────────────────────────── */
+.gpu-badge {
+  display: inline-block;
+  background: var(--gatac-gpu);
+  color: #000;
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin-left: 4px;
+}
+
+/* ── Responsive tables ───────────────────────────────────────────────────── */
+table.docutils {
+  width: 100%;
+  overflow-x: auto;
+  display: block;
+}
+
+/* ── Dark mode overrides ─────────────────────────────────────────────────── */
+html[data-theme="dark"] {
+  --gatac-green: #3fb950;
+  --gatac-blue:  #58a6ff;
+}
+
+html[data-theme="dark"] code.literal {
+  background-color: #161b22;
+  border-color: #30363d;
+}

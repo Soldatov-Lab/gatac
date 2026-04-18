@@ -7,6 +7,7 @@ tile insertions are computed for *all* chromosomes at once (one groupby
 instead of ~25), then COO triplets are accumulated on the host.  The
 final CSR matrix is assembled with SciPy.
 """
+from __future__ import annotations
 
 import logging
 import time

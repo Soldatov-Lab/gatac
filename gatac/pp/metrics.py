@@ -5,6 +5,7 @@ Implementation:
 1. compute_metrics: Polars-based, streams data in chunks to reduce peak memory.
    This is the standard implementation for both small and large datasets.
 """
+from __future__ import annotations
 
 import logging
 import gc

@@ -4,6 +4,7 @@ GPU-accelerated peak calling using gmacs algorithm.
 This module integrates gmacs peak calling directly into GATAC,
 adapted to use GATAC's parquet handling and genome inference.
 """
+from __future__ import annotations
 
 import gc
 import logging

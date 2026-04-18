@@ -23,6 +23,7 @@ from typing import Optional, Sequence, Union
 import cupy as cp
 import cupyx.scipy.sparse as cusp
 import numpy as np
+import pandas as pd
 import polars as pl
 import scipy.sparse as sp
 from cupyx.scipy.special import betainc
@@ -239,7 +240,7 @@ def marker_peaks(
     use_raw: bool = False,
     key_added: str = "marker_peaks",
     seed: int = 42,
-) -> dict[str, pl.DataFrame]:
+) -> dict[str, pd.DataFrame]:
     """
     GPU-accelerated marker peak detection using binomial test.
     
@@ -282,7 +283,7 @@ def marker_peaks(
         
     Returns
     -------
-    dict[str, pl.DataFrame]
+    dict[str, pd.DataFrame]
         Dictionary mapping group names to DataFrames with columns:
         - "feature": Peak/feature name
         - "log2_fc": Log2 fold change (foreground vs background)
@@ -474,7 +475,7 @@ def marker_peaks(
     
     logger.info(f"Marker peak detection complete. Results stored in adata.uns['{key_added}']")
     
-    return results
+    return {k: v.to_pandas() for k, v in results.items()}
 
 
 def get_marker_peaks(

@@ -17,6 +17,7 @@ from typing import Literal, Optional, Union
 
 import cupy as cp
 import numpy as np
+import pandas as pd
 import polars as pl
 from numba import njit
 
@@ -919,7 +920,7 @@ def motif_enrichment(
     check_rc: bool = True,
     bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
     motif_batch_size: int = 16,
-) -> dict[str, pl.DataFrame]:
+) -> dict[str, pd.DataFrame]:
     """
     Identify enriched transcription factor motifs using GPU acceleration.
     
@@ -953,7 +954,7 @@ def motif_enrichment(
         
     Returns
     -------
-    dict[str, pl.DataFrame]
+    dict[str, pd.DataFrame]
         Dictionary mapping group names to DataFrames with columns:
         - id: Motif ID
         - name: Motif name
@@ -1154,7 +1155,7 @@ def motif_enrichment(
         result[group] = group_df
     
     logger.info("Motif enrichment analysis complete")
-    return result
+    return {k: v.to_pandas() for k, v in result.items()}
 
 
 # =============================================================================
@@ -1175,7 +1176,7 @@ def gsea_motif_enrichment(
     threads: int = 1,
     backend: Literal["gpu", "gseapy"] = "gpu",
     gs_batch_size: int = 4,
-) -> "Union[pl.DataFrame, dict[str, pl.DataFrame]]":
+) -> "Union[pd.DataFrame, dict[str, pd.DataFrame]]":
     """
     Run preranked GSEA to identify enriched TF motifs from a LogFC-ranked peak list.
 
@@ -1199,9 +1200,9 @@ def gsea_motif_enrichment(
 
         * **Single DataFrame** – index must be peak names matching
           ``adata.var_names``; ``logfc_col`` specifies the log2FC column.
-          Returns a single :class:`polars.DataFrame`.
+          Returns a single :class:`pandas.DataFrame`.
         * **Dict of DataFrames** – keys are group labels; each value is a
-          DataFrame as above. Returns ``dict[str, polars.DataFrame]``.
+          DataFrame as above. Returns ``dict[str, pandas.DataFrame]``.
     logfc_col : str, default ``"log2fc"``
         Name of the column in each DataFrame that contains log2 fold change
         values. Peaks are ranked descending by this column before GSEA.
@@ -1234,7 +1235,7 @@ def gsea_motif_enrichment(
 
     Returns
     -------
-    polars.DataFrame or dict[str, polars.DataFrame]
+    pandas.DataFrame or dict[str, pandas.DataFrame]
         GSEA results with columns:
 
         * ``motif``           – motif name
@@ -1431,11 +1432,11 @@ def gsea_motif_enrichment(
     # Dispatch: single DataFrame or dict of DataFrames
     # ------------------------------------------------------------------
     if isinstance(rankings, dict):
-        output: dict[str, pl.DataFrame] = {}
+        output: dict[str, pd.DataFrame] = {}
         for group, df in rankings.items():
             logger.info(f"Running GSEA ({backend}) for group '{group}'...")
-            output[group] = _run_one(df, group_label=str(group))
+            output[group] = _run_one(df, group_label=str(group)).to_pandas()
         return output
     else:
         logger.info(f"Running GSEA ({backend}) on provided rankings...")
-        return _run_one(rankings)
+        return _run_one(rankings).to_pandas()

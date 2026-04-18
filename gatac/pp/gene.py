@@ -3,17 +3,19 @@ GPU-accelerated gene activity matrix generation from ATAC fragment data.
 
 Implements paired-insertion counting strategy matching SnapATAC2.
 """
+from __future__ import annotations
 
 import logging
 import time
 import gc
 from pathlib import Path
-from typing import Optional, Tuple, Literal, List
+from typing import Optional, Tuple, Literal, List, Union
 
 import cudf
 import cupy as cp
 import cupyx.scipy.sparse as cusp
 import numpy as np
+import pandas as pd
 import polars as pl
 import scipy.sparse as sp
 
@@ -60,7 +62,7 @@ def load_gene_annotation(
     gene_id_key: str = "gene_id",
     transcript_name_key: str = "transcript_name",
     transcript_id_key: str = "transcript_id",
-) -> pl.DataFrame:
+) -> pd.DataFrame:
     """
     Load gene annotation from a GTF file and compute regulatory domains.
 
@@ -87,7 +89,7 @@ def load_gene_annotation(
 
     Returns
     -------
-    pl.DataFrame
+    pd.DataFrame
         DataFrame with columns: ['chrom', 'start', 'end', 'name', 'id', 'strand']
         where start/end define the regulatory domain.
     """
@@ -215,12 +217,12 @@ def load_gene_annotation(
     result = result.sort(['chrom', 'start'])
     
     logger.info(f"Loaded {len(result):,} transcript regulatory domains (for {id_type}-level output)")
-    return result
+    return result.to_pandas()
 
 
 def create_gene_matrix_gpu(
     fragments_df: cudf.DataFrame,
-    gene_regions: pl.DataFrame,
+    gene_regions: Union[pl.DataFrame, pd.DataFrame],
     exclude_chroms: Optional[list] = None,
     min_fragments_per_cell: int = 100,
     cell_metadata: Optional[cudf.DataFrame] = None,
@@ -264,7 +266,10 @@ def create_gene_matrix_gpu(
         Metadata for genes
     """
     # Convert gene regions to cudf for GPU processing
-    gene_df = cudf.from_pandas(gene_regions.to_pandas())
+    if isinstance(gene_regions, pl.DataFrame):
+        gene_df = cudf.from_pandas(gene_regions.to_pandas())
+    else:
+        gene_df = cudf.from_pandas(gene_regions)
     
     # Get valid chromosomes (those in gene annotation, minus excluded ones)
     valid_chroms = set(gene_df['chrom'].unique().to_arrow().to_pylist())

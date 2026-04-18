@@ -1,6 +1,7 @@
 """
 Fragment processing pipeline for generating tile and gene matrices.
 """
+from __future__ import annotations
 
 import logging
 import time
@@ -207,22 +208,15 @@ def combine(
 
     if not combined_obs['barcode'].is_unique:
         n_dups = combined_obs['barcode'].duplicated().sum()
-        logger.warning(f"Detected {n_dups:,} duplicate barcodes. Making barcodes unique.")
-
-        def make_unique(indices):
-            seen = {}
-            out = []
-            for x in indices:
-                if x in seen:
-                    seen[x] += 1
-                    out.append(f"{x}-{seen[x]}")
-                else:
-                    seen[x] = 0
-                    out.append(x)
-            return out
-        
-        combined_obs.index = make_unique(combined_obs['barcode'])
-        combined_obs.drop(columns=['barcode'], inplace=True)
+        dup_examples = combined_obs['barcode'][combined_obs['barcode'].duplicated(keep=False)].unique()[:5].tolist()
+        raise ValueError(
+            f"Detected {n_dups:,} duplicate cell barcode(s) across the input files "
+            f"(e.g. {dup_examples}). "
+            "Barcodes must be unique before combining. "
+            "Re-run the preceding processing steps with a per-sample `--barcode-prefix` "
+            "argument (e.g. `gatac convert sample.tsv.gz --barcode-prefix sample1`) "
+            "so that each sample's barcodes are namespaced and collisions are avoided."
+        )
     else:
         combined_obs.index = combined_obs['barcode'].values
         combined_obs.drop(columns=['barcode'], inplace=True)

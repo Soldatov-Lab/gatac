@@ -147,6 +147,8 @@ html_title = "GATAC"
 
 html_theme_options = {
     "logo": {
+        "image_light": "logo_outlines.svg",
+        "image_dark": "logo_outlines.svg",
         "text": "GATAC",
     },
     "github_url": "https://github.com/Soldatov-Lab/gatac",

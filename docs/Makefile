@@ -12,10 +12,10 @@ BUILDDIR      = _build
 .PHONY: help html clean livehtml
 
 help:
-	@$(SPHINXBUILD) -c "$(CONFDIR)" -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@$(SPHINXBUILD) --help
 
 html:
-	@$(SPHINXBUILD) -c "$(CONFDIR)" -M html "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@$(SPHINXBUILD) -c "$(CONFDIR)" -b html "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/html."
 
@@ -23,8 +23,8 @@ livehtml:
 	uv run sphinx-autobuild -c "$(CONFDIR)" "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
 
 clean:
-	@$(SPHINXBUILD) -c "$(CONFDIR)" -M clean "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	rm -rf "$(BUILDDIR)"
 
 .PHONY: Makefile
 %: Makefile
-	@$(SPHINXBUILD) -c "$(CONFDIR)" -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@$(SPHINXBUILD) -c "$(CONFDIR)" -b $@ "$(SOURCEDIR)" "$(BUILDDIR)/$@" $(SPHINXOPTS) $(O)

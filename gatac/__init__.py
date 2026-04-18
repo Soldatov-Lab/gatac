@@ -17,9 +17,10 @@ if not sys.stderr.isatty():
 
 from . import pp
 from . import tl
+from . import pl
 
 __version__ = "0.1.0"
-__all__ = ["pp", "tl", "set_verbosity"]
+__all__ = ["pp", "tl", "pl", "set_verbosity"]
 
 # ---------------------------------------------------------------------------
 # Package-level logging

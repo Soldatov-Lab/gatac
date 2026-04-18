@@ -1,3 +1,6 @@
 [submodule "notebooks"]
 	path = notebooks
 	url = git@github.com:Soldatov-Lab/gatac-notebooks.git
+[submodule "reproducibility"]
+	path = reproducibility
+	url = git@github.com:Soldatov-Lab/gatac-reproducibilty.git

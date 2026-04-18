@@ -18,16 +18,22 @@ uv sync --extra cuda12
 
 ## Running tests
 
-Tests are located in `tests/` (unit tests) and in the companion
-[`reproducibility`](https://github.com/Soldatov-Lab/reproducibility)
-repository for integration/benchmark tests.
+Tests are located in `tests/` (unit tests) and in the
+[`reproducibility/`](https://github.com/Soldatov-Lab/gatac-reproducibilty)
+submodule (tracked at `reproducibility/`) for integration/benchmark tests.
+
+After cloning, initialise the submodule once:
+
+```bash
+git submodule update --init --recursive
+```
 
 ```bash
 # Unit tests
 uv run pytest tests/
 
 # Reproducibility benchmarks (requires GPU + data)
-cd /path/to/reproducibility
+cd reproducibility
 pixi run pytest test/
 ```
 
@@ -35,6 +41,7 @@ After any change to a preprocessing or analysis function, run the related
 reproducibility test:
 
 ```bash
+cd reproducibility
 pixi run pytest test/tile_matrix.py
 pixi run pytest test/spectral_embedding.py
 ```

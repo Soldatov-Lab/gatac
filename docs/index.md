@@ -30,6 +30,8 @@ cli/index
 :maxdepth: 1
 
 ../reproducibility/README
+license
+credits
 ```
 # GATAC: GPU-Accelerated scATACseq Analysis
 

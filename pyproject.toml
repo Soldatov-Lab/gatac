@@ -3,6 +3,7 @@ name = "gatac"
 version = "0.1.0"
 description = "GPU-accelerated ATAC-seq fragment processing and tile matrix generation"
 readme = "README.md"
+license = { text = "BSD-3-Clause" }
 requires-python = ">=3.12"
 dependencies = [
     "polars>=1.0,<1.32",

@@ -4,7 +4,7 @@
 # CONFDIR keeps conf.py in this (docs/) directory.
 
 SPHINXOPTS    ?=
-SPHINXBUILD   ?= uv run sphinx-build
+SPHINXBUILD   ?= uv run --group docs sphinx-build
 SOURCEDIR     = ..
 CONFDIR       = .
 BUILDDIR      = _build
@@ -20,7 +20,7 @@ html:
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/html."
 
 livehtml:
-	uv run sphinx-autobuild -c "$(CONFDIR)" "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
+	uv run --group docs sphinx-autobuild -c "$(CONFDIR)" "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
 
 clean:
 	rm -rf "$(BUILDDIR)"

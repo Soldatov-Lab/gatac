@@ -521,27 +521,26 @@ def scan_motifs(
     check_rc : bool, default True
         Whether to check both strands (forward and reverse complement)
     bg : str or tuple, default "subject"
-        Background nucleotide probabilities (A, C, G, T). Options:
-        - "subject": Compute from extracted peak sequences (matches R/motifmatchr default)
-        - "even": Uniform (0.25, 0.25, 0.25, 0.25)
-        - tuple of 4 floats: Custom background frequencies
+        Background nucleotide probabilities ``(A, C, G, T)``. Use
+        ``"subject"`` to compute them from extracted peak sequences, which
+        matches motifmatchr's default. Use ``"even"`` for a uniform
+        background ``(0.25, 0.25, 0.25, 0.25)``, or pass a custom 4-tuple.
     key_added : str, default "motif_match"
         Key to store motif match matrix in `adata.varm`
     peak_batch_size : int, default 50000
         Number of peaks to process at once on GPU. Reduce if running out of
         GPU memory.
     coordinate_system : {"0-based", "1-based"}, default "0-based"
-        Coordinate system of peak names in `adata.var_names`.
-        - "0-based": BED format (e.g., from MACS, GATAC peak calling). Half-open 
-          interval [start, end). Extract as genome[start:end].
-        - "1-based": R/GenomicRanges format (e.g., from chromVAR). Closed interval 
-          [start, end]. Extract as genome[start-1:end].
-        GATAC-generated peaks use 0-based. R/Bioconductor tools use 1-based.
+        Coordinate system of peak names in ``adata.var_names``. ``"0-based"``
+        is BED-style half-open indexing ``[start, end)`` and is what GATAC
+        peak callers produce, so sequences are extracted as
+        ``genome[start:end]``. ``"1-based"`` is the closed interval format
+        used by R/GenomicRanges and chromVAR, so sequences are extracted as
+        ``genome[start-1:end]``.
     mode : {"gatac", "motifmatchr"}, default "gatac"
-        Motif scoring mode:
-        - "gatac": Standard natural log-odds ln(p/bg).
-        - "motifmatchr": Reproduction of motifmatchr/scPrinter scoring:
-          log2(p/0.25) - (log2(0.25) - log2(bg)).
+        Motif scoring mode. ``"gatac"`` uses the standard natural-log odds
+        ``ln(p / bg)``. ``"motifmatchr"`` reproduces motifmatchr/scPrinter
+        scoring with ``log2(p / 0.25) - (log2(0.25) - log2(bg))``.
         
     Returns
     -------

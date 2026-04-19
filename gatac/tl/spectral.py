@@ -618,11 +618,10 @@ def spectral(
         (default) the result is insensitive to this value as long as it is
         large enough (e.g. 30).
     features
-        Which features (columns) to use:
-        - ``"selected"`` (default): use ``adata.var["selected"]`` boolean mask
-          (requires a prior call to ``pp.select_features``).
-        - A numpy boolean array of length ``n_vars``.
-        - ``None``: use all features.
+        Which features (columns) to use. ``"selected"`` uses the boolean
+        mask in ``adata.var["selected"]`` and requires a prior call to
+        ``pp.select_features``. You can also pass a NumPy boolean array of
+        length ``n_vars`` or ``None`` to use all features.
     random_state
         Seed for reproducibility of the Lanczos starting vector.
     weighted_by_sd
@@ -653,22 +652,15 @@ def spectral(
 
     Notes
     -----
-    **Memory behaviour (full-GPU path, default):**
+    In the default full-GPU path, the matrix is uploaded in its original
+    integer dtype and only ``X.data`` is converted to float32 in place during
+    normalization. The sparse index arrays stay int32, and peak GPU memory is
+    roughly one float32 copy of the ``data`` array.
 
-    The matrix is uploaded to the GPU in its original integer dtype
-    (int8, uint16, …).  Only the ``data`` array is converted to float32
-    in-place during normalisation; the index arrays (typically dominant
-    in sparse matrices) stay int32.  All arithmetic runs in float32.
-    Peak GPU memory ≈ 1 × the **data array** in float32.
-
-    **Memory behaviour (chunked path, ``chunk_size`` set):**
-
-    Peak GPU memory ≈ 1 chunk.  The full matrix stays on the CPU
-    (data converted to float32 in-place, indices untouched) and
-    row-chunks are streamed to the GPU during each eigsh matvec call.
-    Each matvec requires two passes (Xᵀv then Xw), so this path is
-    slower than the full-GPU path by a factor that depends on PCIe
-    bandwidth.
+    When ``chunk_size`` is set, peak GPU memory is roughly one chunk. The full
+    matrix stays on the CPU, row chunks are streamed to the GPU for each eigsh
+    matvec, and throughput is lower because each matvec requires two passes
+    over the streamed chunks.
 
     The algorithm:
 

@@ -114,7 +114,7 @@ accelerated binomial test with Benjamini–Hochberg correction.
    get_marker_peaks
 ```
 
-#### Output columns
+### Output columns
 
 | Column | Description |
 |--------|-------------|
@@ -126,7 +126,7 @@ accelerated binomial test with Benjamini–Hochberg correction.
 | `p_value` | Raw two-sided binomial p-value |
 | `fdr` | Benjamini–Hochberg adjusted p-value |
 
-#### Usage example
+### Usage example
 
 ```python
 markers = ga.tl.marker_peaks(
@@ -242,7 +242,7 @@ algorithm.  All compute-intensive steps are executed on GPU.
    compute_deviations
 ```
 
-#### Workflow
+### Workflow
 
 ```python
 import gatac as ga
@@ -261,7 +261,7 @@ ga.tl.chromvar(adata, motifs=motifs, genome_fasta="GRCh38.fa")
 # → stores deviation scores in adata.obsm["X_chromvar"]
 ```
 
-#### Output
+### Output
 
 Deviation scores are stored in `adata.obsm["X_chromvar"]` as a cell × motif
 matrix.  Motif names are stored in `adata.uns["chromvar_motifs"]`.

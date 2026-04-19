@@ -153,7 +153,7 @@ or many h5ad files using streaming aggregation.
 Spectral decomposition of the cell × feature matrix for dimensionality
 reduction, UMAP, and clustering.
 
-[→ API: tl.spectral](api/tools.md#gatac.tl.spectral)
+[→ API: tl.spectral](api/tools.md#spectral-embedding)
 :::
 
 :::{grid-item-card} {fas}`mountain` Peak Calling
@@ -162,7 +162,7 @@ reduction, UMAP, and clustering.
 Call peaks per cell-type group, merge overlapping peaks across groups, and
 build a cell × peak count matrix.
 
-[→ API: tl.call_peaks](api/tools.md#gatac.tl.call_peaks)
+[→ API: tl.call_peaks](api/tools.md#call-peaks)
 :::
 
 :::{grid-item-card} {fas}`dna` Motif Analysis
@@ -171,7 +171,7 @@ build a cell × peak count matrix.
 Scan peaks for TF binding motifs (MEME format), run motif enrichment tests,
 and compute chromVAR deviation scores.
 
-[→ API: tl.chromvar](api/tools.md#gatac.tl.chromvar)
+[→ API: tl.chromvar](api/tools.md#chromvar)
 :::
 
 ::::

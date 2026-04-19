@@ -9,7 +9,16 @@ from .metrics import (
     cleanup_gpu_memory
 )
 from .filter import filter_fragments
-from .genome import HG38, HG19, MM10, MM39
+from .genome import HG38 as _HG38, HG19 as _HG19, MM10 as _MM10, MM39 as _MM39
+
+#: GRCh38 / hg38 chromosome sizes.
+HG38 = _HG38
+#: GRCh37 / hg19 chromosome sizes.
+HG19 = _HG19
+#: GRCm38 / mm10 chromosome sizes.
+MM10 = _MM10
+#: GRCm39 / mm39 chromosome sizes.
+MM39 = _MM39
 
 __all__ = [
     "make_parquet",

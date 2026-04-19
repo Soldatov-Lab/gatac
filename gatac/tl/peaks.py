@@ -1161,13 +1161,13 @@ def merge_peaks(
 ) -> Optional[pd.DataFrame]:
     """Merge peaks from different groups into fixed-width, non-overlapping peaks.
 
-    This mirrors the behavior of SnapATAC2's `merge_peaks` by:
-    1. Expanding each peak summit by `half_width` on both sides (+1 for half-open intervals)
-    2. Sorting all peaks by genomic position
-    3. Grouping overlapping/adjacent peaks
-    4. Within each group, iteratively keeping the most significant peak (highest -log10 p-value)
-       and discarding any overlapping peaks
-    
+    This mirrors the behavior of SnapATAC2's ``merge_peaks``.
+
+    The algorithm expands each peak summit by ``half_width`` on both sides,
+    sorts peaks by genomic position, groups overlapping or adjacent intervals,
+    and then iteratively keeps the most significant peak in each overlap group
+    while discarding the overlapping alternatives.
+     
     This algorithm matches SnapATAC2's Rust implementation which uses merge_sorted_bed_with
     to group overlapping intervals before applying iterative_merge.
 
@@ -1739,14 +1739,12 @@ def make_peak_matrix(
         Genome name (e.g., 'hg38', 'mm10') or dict of chromosome sizes.
         Used for validation and chromosome filtering.
     counting_strategy
-        Counting strategy for peak matrix generation. Options are:
-        - 'paired-insertion' (default): Count TN5 insertions at fragment ends
-          (start and end-1 positions). If both insertions fall in the same peak,
-          count only once. This matches SnapATAC2's default behavior.
-        - 'insertion': Count each insertion separately. A fragment overlapping
-          a peak with both ends counts as 2.
-        - 'fragment': Legacy behavior. Count if any part of the fragment overlaps
-          the peak.
+        Counting strategy for peak matrix generation. ``"paired-insertion"``
+        counts Tn5 insertions at fragment ends and counts a fragment once if
+        both ends land in the same peak; this matches SnapATAC2's default.
+        ``"insertion"`` counts each insertion separately, so a fragment with
+        both ends in a peak contributes 2. ``"fragment"`` is the legacy mode
+        that counts any fragment overlapping the peak.
     inplace
         Whether to add the peak matrix to the AnnData object (not recommended,
         will replace .X). If False, returns a new AnnData object.
@@ -1754,10 +1752,9 @@ def make_peak_matrix(
         Number of parquet row groups to load at once (default: 50).
         Larger values are faster but use more GPU memory.
     verbose
-        Controls progress reporting:
-        - False: no output
-        - True or "tqdm": show tqdm progress bar
-        - "log": print one line per file with ETA (useful for non-interactive environments)
+        Controls progress reporting. ``False`` disables progress output.
+        ``True`` or ``"tqdm"`` shows a tqdm progress bar. ``"log"`` prints
+        one line per file with ETA for non-interactive environments.
     filter_chromosomes : bool
         If True, only keep fragments from chromosomes recognized by the 
         provided genome (keys if genome is a dict, or standard chromosomes 

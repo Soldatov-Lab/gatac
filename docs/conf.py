@@ -41,13 +41,12 @@ extensions = [
     "sphinx.ext.githubpages",
     # scanpydoc (theme + extensions); must come after napoleon
     "scanpydoc",
-    # Typing
-    "sphinx_autodoc_typehints",
     # Notebooks + Markdown (myst_nb already loads myst_parser)
     "myst_nb",
     # UX
     "sphinx_copybutton",
     "sphinx_design",
+    "sphinxcontrib.mermaid",
 ]
 
 # MyST extensions
@@ -57,6 +56,7 @@ myst_enable_extensions = [
     "html_image",
     "substitution",
 ]
+myst_heading_anchors = 4
 
 myst_substitutions = {
     "version": release,
@@ -120,6 +120,7 @@ root_doc = "docs/index"
 templates_path = ["_templates"]
 exclude_patterns = [
     "docs/_build",
+    "docs/_templates/**",
     "**/Thumbs.db",
     "**/.DS_Store",
     "**/.ipynb_checkpoints",
@@ -140,6 +141,9 @@ exclude_patterns = [
     "AGENTS.md",
     "GEMINI.md",
     "README.md",
+    "notebooks/README.md",
+    "reproducibility/AGENTS.md",
+    "reproducibility/GEMINI.md",
 ]
 
 # -- Options for HTML output -------------------------------------------------

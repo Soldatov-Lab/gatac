@@ -2,7 +2,7 @@
 Genomic constants and chromosome sizes.
 """
 
-# GRCh38 / hg38 chromosome sizes (Gencode v41)
+#: GRCh38 / hg38 chromosome sizes (Gencode v41).
 HG38 = {
     "chr1": 248956422, "chr2": 242193529, "chr3": 198295559,
     "chr4": 190214555, "chr5": 181538259, "chr6": 170805979,
@@ -14,7 +14,7 @@ HG38 = {
     "chr22": 50818468, "chrX": 156040895, "chrY": 57227415
 }
 
-# GRCh37 / hg19 chromosome sizes
+#: GRCh37 / hg19 chromosome sizes.
 HG19 = {
     "chr1": 249250621, "chr2": 243199373, "chr3": 198022430,
     "chr4": 191154276, "chr5": 180915260, "chr6": 171115067,
@@ -26,7 +26,7 @@ HG19 = {
     "chr22": 51304566, "chrX": 155270560, "chrY": 59373566
 }
 
-# GRCm39 / mm39 chromosome sizes (Gencode vM30)
+#: GRCm39 / mm39 chromosome sizes (Gencode vM30).
 MM39 = {
     "chr1": 195154279, "chr2": 181755017, "chr3": 159745316,
     "chr4": 156860686, "chr5": 151758149, "chr6": 149588044,
@@ -37,7 +37,7 @@ MM39 = {
     "chr19": 61420004, "chrX": 169476592, "chrY": 91455967
 }
 
-# GRCm38 / mm10 chromosome sizes (Gencode vM25)
+#: GRCm38 / mm10 chromosome sizes (Gencode vM25).
 MM10 = {
     "chr1": 195471971, "chr2": 182113224, "chr3": 160039680,
     "chr4": 156508116, "chr5": 151834684, "chr6": 149736546,

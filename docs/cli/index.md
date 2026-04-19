@@ -14,24 +14,6 @@ Global option:
 |------|-------------|
 | `-v, --verbose` | Enable debug-level logging |
 
----
-
-## Preprocessing workflow
-
-The typical end-to-end CLI pipeline looks like:
-
-```{mermaid}
-flowchart LR
-    A["fragments.tsv.gz"] -->|convert| B["fragments.parquet"]
-    B -->|metrics| C["metrics.csv"]
-    B & C -->|filter| D["filtered.parquet"]
-    D -->|tile| E["tile_matrix.h5ad"]
-    D -->|gene| F["gene_matrix.h5ad"]
-    E -->|features| G["features.h5ad"]
-    E & F -->|combine| H["combined.h5ad"]
-```
-
----
 
 ```{toctree}
 :maxdepth: 1

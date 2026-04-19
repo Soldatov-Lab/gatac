@@ -148,7 +148,7 @@ exclude_patterns = [
 
 # -- Options for HTML output -------------------------------------------------
 html_theme = "scanpydoc"
-html_title = "GATAC"
+html_title = "GATAC: GPU-Accelerated scATACseq Analysis"
 html_logo = "_static/logo_outlines.svg"
 
 html_theme_options = {

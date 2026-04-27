@@ -20,6 +20,7 @@ from anndata import AnnData
 from scipy.sparse import csr_matrix as scipy_csr_matrix
 from tqdm.auto import tqdm, trange
 
+from ._bias_matching import compute_bias_knn_indices, normalize_bias_matrix
 from .motif import DNAMotif, _encode_sequences_batch, _open_fasta
 
 logger = logging.getLogger(__name__)
@@ -432,10 +433,8 @@ def sample_bg_peaks(
 
     # Prepare bias matrix
     if len(bg_columns) > 0:
-        mat = np.array(adata.var[bg_columns].values).T
-        # Normalize using Cholesky decomposition (same as scPrinter)
-        chol_cov_mat = np.linalg.cholesky(np.cov(mat))
-        trans_norm_mat = np.linalg.solve(chol_cov_mat, mat).T
+        bias_matrix = np.asarray(adata.var[bg_columns].values, dtype=np.float64)
+        trans_norm_mat = normalize_bias_matrix(bias_matrix)
     else:
         trans_norm_mat = reads_per_peak.reshape(-1, 1)
     
@@ -444,16 +443,12 @@ def sample_bg_peaks(
     if method == "knn":
         # GPU-accelerated k-NN using cuML
         try:
-            from cuml.neighbors import NearestNeighbors
-            
             logger.info("Using cuML for k-NN background sampling...")
-            knn = NearestNeighbors(n_neighbors=n_iterations + 1, metric="euclidean")
-            knn.fit(trans_norm_mat)
-            distances, knn_idx = knn.kneighbors(trans_norm_mat)
-            
-            # Exclude self (first neighbor)
-            knn_idx = knn_idx[:, 1:]
-            
+            knn_idx = compute_bias_knn_indices(
+                trans_norm_mat,
+                n_neighbors=n_iterations,
+                exclude_self=True,
+            )
         except ImportError:
             raise ImportError(
                 "cuML is required for method='knn'. Install via: "

@@ -184,6 +184,7 @@ background peaks.
    :toctree: generated/
    :nosignatures:
 
+   sample_gc_matched_background
    motif_enrichment
 ```
 
@@ -191,10 +192,17 @@ background peaks.
 
 ```python
 motifs = ga.tl.read_motifs("cisBP_human.meme")
+matched_bg = ga.tl.sample_gc_matched_background(
+   marker_peaks,
+   genome_fasta="GRCh38.fa",
+   background_pool=list(peak_adata.var_names),
+)
+
 enrichment_df = ga.tl.motif_enrichment(
-    adata,
-    motif_path="cisBP_human.meme",
-    genome_fasta="GRCh38.fa",
+   motifs,
+   marker_peaks,
+   genome_fasta="GRCh38.fa",
+   background=matched_bg,
 )
 ```
 

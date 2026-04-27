@@ -21,6 +21,8 @@ import pandas as pd
 import polars as pl
 from numba import njit
 
+from ._bias_matching import sample_bias_matched_indices
+
 logger = logging.getLogger(__name__)
 
 # CuPy memory pools for efficient memory management
@@ -102,6 +104,124 @@ def _open_fasta(fasta_path: Union[str, Path]):
         # Uncompressed FASTA - open directly
         genome = Fasta(str(fasta_path), one_based_attributes=False)
         yield genome
+
+
+def _ordered_unique_regions(region_groups: list[list[str]]) -> list[str]:
+    """Collect regions once while preserving input order."""
+    ordered_regions = []
+    seen = set()
+
+    for group in region_groups:
+        for region in group:
+            if region not in seen:
+                seen.add(region)
+                ordered_regions.append(region)
+
+    return ordered_regions
+
+
+def _fetch_region_sequences(
+    regions: list[str],
+    genome_fasta: Union[str, Path],
+) -> list[str]:
+    """Fetch region sequences from a FASTA file."""
+    logger.info(f"Fetching {len(regions)} sequences...")
+
+    sequences = []
+    with _open_fasta(genome_fasta) as genome:
+        for region in regions:
+            try:
+                chrom, coords = region.split(":")
+                start, end = coords.split("-")
+                start, end = int(start), int(end)
+                seq = str(genome[chrom][start:end].seq)
+                sequences.append(seq)
+            except Exception as e:
+                logger.warning(f"Failed to fetch sequence for {region}: {e}")
+                sequences.append("")
+
+    return sequences
+
+
+def _compute_gc_content_from_sequences(sequences: list[str]) -> np.ndarray:
+    """Compute per-sequence GC fraction on CPU."""
+    gc_content = np.zeros(len(sequences), dtype=np.float64)
+
+    for i, seq in enumerate(sequences):
+        seq = seq.upper()
+        seq_len = len(seq)
+        if seq_len == 0:
+            continue
+
+        gc_count = seq.count("G") + seq.count("C")
+        gc_content[i] = gc_count / seq_len
+
+    return gc_content
+
+
+def _compute_region_gc_content(
+    regions: list[str],
+    genome_fasta: Union[str, Path],
+) -> np.ndarray:
+    """Compute GC fraction for a list of genomic regions."""
+    sequences = _fetch_region_sequences(regions, genome_fasta)
+    return _compute_gc_content_from_sequences(sequences)
+
+
+def _compute_bg_probs_from_sequences(
+    sequences: list[str],
+) -> tuple[float, float, float, float]:
+    """Estimate background nucleotide probabilities from sequences."""
+    counts = np.zeros(4, dtype=np.int64)
+
+    for seq in sequences:
+        seq_upper = seq.upper()
+        counts[0] += seq_upper.count("A")
+        counts[1] += seq_upper.count("C")
+        counts[2] += seq_upper.count("G")
+        counts[3] += seq_upper.count("T")
+
+    total = counts.sum()
+    if total == 0:
+        return (0.25, 0.25, 0.25, 0.25)
+
+    probs = counts / total
+    return tuple(float(x) for x in probs)
+
+
+def _resolve_bg_probs(
+    bg_probs: Union[str, tuple[float, float, float, float]],
+    sequences: list[str],
+) -> tuple[float, float, float, float]:
+    """Resolve string background modes to explicit nucleotide probabilities."""
+    if isinstance(bg_probs, str):
+        if bg_probs in {"auto", "subject"}:
+            resolved = _compute_bg_probs_from_sequences(sequences)
+            logger.info(
+                "Background from sequences: "
+                f"A={resolved[0]:.4f} C={resolved[1]:.4f} "
+                f"G={resolved[2]:.4f} T={resolved[3]:.4f}"
+            )
+            return resolved
+        if bg_probs == "even":
+            return (0.25, 0.25, 0.25, 0.25)
+        raise ValueError(
+            f"Unknown bg mode: {bg_probs}. "
+            "Use 'auto', 'subject', 'even', or a tuple of 4 floats."
+        )
+
+    if len(bg_probs) != 4:
+        raise ValueError(
+            "Background nucleotide probabilities must contain exactly 4 values "
+            "for (A, C, G, T)."
+        )
+
+    probs = tuple(float(x) for x in bg_probs)
+    total = sum(probs)
+    if total <= 0:
+        raise ValueError("Background nucleotide probabilities must sum to a positive value.")
+
+    return tuple(x / total for x in probs)
 
 
 
@@ -905,6 +1025,190 @@ def _p_adjust_bh(p_values: np.ndarray) -> np.ndarray:
     return result
 
 
+def _normalize_background_groups(
+    regions: dict[str, list[str]],
+    background: Optional[Union[list[str], dict[str, list[str]]]],
+) -> Optional[dict[str, list[str]]]:
+    """Normalize shared or per-group backgrounds to a per-group mapping."""
+    if background is None:
+        return None
+
+    if isinstance(background, dict):
+        missing = [group for group in regions if group not in background]
+        extra = [group for group in background if group not in regions]
+        if missing or extra:
+            problems = []
+            if missing:
+                problems.append(f"missing keys: {missing}")
+            if extra:
+                problems.append(f"unexpected keys: {extra}")
+            raise ValueError(
+                "When 'background' is a dict, its keys must match 'regions'. "
+                + "; ".join(problems)
+            )
+        background_groups = {group: list(background[group]) for group in regions}
+    else:
+        background_groups = {group: list(background) for group in regions}
+
+    empty_groups = [group for group, group_background in background_groups.items() if len(group_background) == 0]
+    if empty_groups:
+        raise ValueError(
+            "Background regions must be non-empty for every group. "
+            f"Empty groups: {empty_groups}"
+        )
+
+    return background_groups
+
+
+def _sample_gc_matched_background_single(
+    target_regions: list[str],
+    background_pool: list[str],
+    gc_by_region: dict[str, float],
+    *,
+    n_background: Optional[int],
+    n_bins: int,
+    replace: bool,
+    rng: np.random.Generator,
+) -> list[str]:
+    """Sample a background set whose GC distribution matches a target set."""
+    if len(target_regions) == 0:
+        raise ValueError("Target regions must be non-empty.")
+
+    target_set = set(target_regions)
+    unique_pool = [region for region in _ordered_unique_regions([background_pool]) if region not in target_set]
+    if len(unique_pool) == 0:
+        raise ValueError(
+            "Background pool is empty after removing target regions. "
+            "Provide a larger background pool."
+        )
+
+    target_size = len(target_regions) if n_background is None else int(n_background)
+    if target_size < 1:
+        raise ValueError("'n_background' must be at least 1.")
+
+    target_gc = np.asarray([gc_by_region[region] for region in target_regions], dtype=np.float64)
+    pool_gc = np.asarray([gc_by_region[region] for region in unique_pool], dtype=np.float64)
+
+    sampled_indices = sample_bias_matched_indices(
+        target_gc,
+        pool_gc,
+        n_samples=target_size,
+        n_bins=n_bins,
+        replace=replace,
+        rng=rng,
+    )
+    return [unique_pool[idx] for idx in sampled_indices]
+
+
+def sample_gc_matched_background(
+    regions: Union[list[str], dict[str, list[str]]],
+    genome_fasta: Union[str, Path],
+    *,
+    background_pool: Union[list[str], dict[str, list[str]]],
+    n_background: Optional[int] = None,
+    n_bins: int = 50,
+    replace: bool = True,
+    random_state: Optional[int] = 0,
+) -> Union[list[str], dict[str, list[str]]]:
+    """
+    Sample background peaks whose GC-content distribution matches target peaks.
+
+    Parameters
+    ----------
+    regions : list[str] or dict[str, list[str]]
+        Target peaks to match. When a dict is provided, each group is sampled
+        independently and the return value mirrors the same keys.
+    genome_fasta : str or Path
+        Path to the reference genome FASTA used to compute GC content.
+    background_pool : list[str] or dict[str, list[str]]
+        Candidate background peaks to sample from. When `regions` is a dict,
+        this can be either one shared pool or a dict keyed like `regions`.
+    n_background : int, optional
+        Number of peaks to sample per target group. Defaults to the size of the
+        corresponding target set.
+    n_bins : int, default 50
+        Matching resolution. Larger values enforce tighter GC matching.
+    replace : bool, default True
+        Whether sampled background peaks may be reused. Set to ``False`` to
+        require unique sampled peaks within each returned background set.
+    random_state : int, optional
+        Seed for deterministic sampling.
+
+    Returns
+    -------
+    list[str] or dict[str, list[str]]
+        GC-matched background peaks with the same container shape as `regions`.
+
+    Examples
+    --------
+    >>> matched_bg = ga.tl.sample_gc_matched_background(
+    ...     da_peaks,
+    ...     genome_fasta="genome.fa",
+    ...     background_pool=all_peaks,
+    ... )
+    >>> matched_bg_by_group = ga.tl.sample_gc_matched_background(
+    ...     marker_peaks,
+    ...     genome_fasta="genome.fa",
+    ...     background_pool=list(peak_adata.var_names),
+    ...     replace=False,
+    ... )
+    """
+    if n_bins < 1:
+        raise ValueError("'n_bins' must be at least 1.")
+
+    rng = np.random.default_rng(random_state)
+
+    if isinstance(regions, dict):
+        if isinstance(background_pool, dict):
+            background_groups = _normalize_background_groups(regions, background_pool)
+        else:
+            background_groups = {group: list(background_pool) for group in regions}
+
+        gc_regions = _ordered_unique_regions(
+            list(regions.values()) + list(background_groups.values())
+        )
+        gc_values = _compute_region_gc_content(gc_regions, genome_fasta)
+        gc_by_region = {
+            region: float(gc)
+            for region, gc in zip(gc_regions, gc_values, strict=False)
+        }
+
+        return {
+            group: _sample_gc_matched_background_single(
+                target_regions,
+                background_groups[group],
+                gc_by_region,
+                n_background=n_background,
+                n_bins=n_bins,
+                replace=replace,
+                rng=rng,
+            )
+            for group, target_regions in regions.items()
+        }
+
+    if isinstance(background_pool, dict):
+        raise ValueError(
+            "When 'regions' is a list, 'background_pool' must also be a list."
+        )
+
+    gc_regions = _ordered_unique_regions([list(regions), list(background_pool)])
+    gc_values = _compute_region_gc_content(gc_regions, genome_fasta)
+    gc_by_region = {
+        region: float(gc)
+        for region, gc in zip(gc_regions, gc_values, strict=False)
+    }
+
+    return _sample_gc_matched_background_single(
+        list(regions),
+        list(background_pool),
+        gc_by_region,
+        n_background=n_background,
+        n_bins=n_bins,
+        replace=replace,
+        rng=rng,
+    )
+
+
 # =============================================================================
 # Main API
 # =============================================================================
@@ -914,11 +1218,14 @@ def motif_enrichment(
     motifs: list[DNAMotif],
     regions: dict[str, list[str]],
     genome_fasta: Union[str, Path],
-    background: Optional[list[str]] = None,
+    background: Optional[Union[list[str], dict[str, list[str]]]] = None,
     method: Optional[Literal["binomial", "hypergeometric"]] = None,
     pvalue: float = 1e-5,
     check_rc: bool = True,
-    bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
+    bg_probs: Union[
+        Literal["auto", "subject", "even"],
+        tuple[float, float, float, float],
+    ] = (0.25, 0.25, 0.25, 0.25),
     motif_batch_size: int = 16,
 ) -> dict[str, pd.DataFrame]:
     """
@@ -937,8 +1244,10 @@ def motif_enrichment(
         Each group is tested independently.
     genome_fasta : str or Path
         Path to genome FASTA file for sequence extraction
-    background : list[str], optional
-        Background regions. If None, the union of all regions is used.
+    background : list[str] or dict[str, list[str]], optional
+        Background regions. Pass a single list to use one shared background for
+        all groups, or a dict keyed like `regions` to use per-group matched
+        backgrounds. If None, the union of all tested regions is used.
     method : {"binomial", "hypergeometric"}, optional
         Statistical test method. If None, uses "hypergeometric" when
         background is None (subset testing), else "binomial".
@@ -946,8 +1255,13 @@ def motif_enrichment(
         P-value threshold for motif matching
     check_rc : bool, default True
         Whether to check both strands (forward and reverse complement)
-    bg_probs : tuple, default (0.25, 0.25, 0.25, 0.25)
-        Background nucleotide probabilities (A, C, G, T)
+    bg_probs : {"auto", "subject", "even"} or tuple, default (0.25, 0.25, 0.25, 0.25)
+        Background nucleotide probabilities (A, C, G, T) used when converting
+        motifs to log-odds scores and computing match thresholds. Use
+        ``"auto"`` to estimate base frequencies from all scanned sequences
+        (foreground plus any provided background), ``"subject"`` as an alias
+        for the same behavior, ``"even"`` for a uniform background, or pass a
+        custom 4-tuple.
     motif_batch_size : int, default 16
         Number of motifs of the same length to process together on GPU.
         Higher values increase GPU parallelism but use more memory.
@@ -975,6 +1289,18 @@ def motif_enrichment(
     ...     motifs, regions, "genome.fa"
     ... )
     >>> results["cluster1"]  # DataFrame with enrichment results
+    >>> matched_bg = gatac.tl.sample_gc_matched_background(
+    ...     regions,
+    ...     genome_fasta="genome.fa",
+    ...     background_pool=all_peaks,
+    ... )
+    >>> results = gatac.tl.motif_enrichment(
+    ...     motifs,
+    ...     regions,
+    ...     "genome.fa",
+    ...     background=matched_bg,
+    ...     bg_probs="auto",
+    ... )
     """
     from scipy.stats import binom, hypergeom
     from tqdm.auto import tqdm
@@ -982,31 +1308,17 @@ def motif_enrichment(
     # Determine method
     if method is None:
         method = "hypergeometric" if background is None else "binomial"
+
+    background_groups = _normalize_background_groups(regions, background)
     
     # Collect all unique regions
-    all_regions_set = set()
-    for region_list in regions.values():
-        all_regions_set.update(region_list)
-    if background is not None:
-        all_regions_set.update(background)
-    all_regions = list(all_regions_set)
+    all_region_groups = list(regions.values())
+    if background_groups is not None:
+        all_region_groups.extend(background_groups.values())
+    all_regions = _ordered_unique_regions(all_region_groups)
     region_to_idx = {r: i for i, r in enumerate(all_regions)}
-    
-    logger.info(f"Fetching {len(all_regions)} sequences...")
-    
-    # Fetch sequences from FASTA (handles gzip via rapidgzip)
-    with _open_fasta(genome_fasta) as genome:
-        sequences = []
-        for region in all_regions:
-            try:
-                chrom, coords = region.split(":")
-                start, end = coords.split("-")
-                start, end = int(start), int(end)
-                seq = str(genome[chrom][start:end].seq)
-                sequences.append(seq)
-            except Exception as e:
-                logger.warning(f"Failed to fetch sequence for {region}: {e}")
-                sequences.append("")  # Empty sequence, will not match any motif
+
+    sequences = _fetch_region_sequences(all_regions, genome_fasta)
     
     # OPTIMIZATION: Encode sequences ONCE upfront and keep on GPU
     logger.info("Encoding sequences for GPU...")
@@ -1018,22 +1330,27 @@ def motif_enrichment(
     else:
         rc_seqs = None
     
-    # OPTIMIZATION: Precompute indices as numpy arrays once
-    bg_indices_np = None
-    if background is not None:
-        bg_indices_np = np.array([region_to_idx[r] for r in background], dtype=np.int32)
-    
     fg_indices_dict = {}
     for group_name, group_regions in regions.items():
         fg_indices_dict[group_name] = np.array(
             [region_to_idx[r] for r in group_regions], dtype=np.int32
         )
+
+    bg_indices_dict = None
+    if background_groups is not None:
+        bg_indices_dict = {}
+        for group_name, group_background in background_groups.items():
+            bg_indices_dict[group_name] = np.array(
+                [region_to_idx[r] for r in group_background], dtype=np.int32
+            )
     
+    resolved_bg_probs = _resolve_bg_probs(bg_probs, sequences)
+
     # OPTIMIZATION: Precompute all thresholds using Numba JIT
     logger.info("Precomputing score thresholds for all motifs...")
     
-    pwm_list = [motif.to_log_odds(bg_probs) for motif in motifs]
-    bg_array = np.array(bg_probs, dtype=np.float64)
+    pwm_list = [motif.to_log_odds(resolved_bg_probs) for motif in motifs]
+    bg_array = np.array(resolved_bg_probs, dtype=np.float64)
     
     # Compute thresholds using JIT-compiled function (parallelizable)
     thresholds = np.empty(len(motifs), dtype=np.float64)
@@ -1058,14 +1375,8 @@ def motif_enrichment(
     n_motifs = len(motifs)
     n_groups = len(regions)
     n_seqs = all_bound.shape[1]
-    
-    # Precompute background statistics for all motifs at once
-    if background is None:
-        total_bg = n_seqs
-        bound_bg = all_bound.sum(axis=1)  # Shape: (n_motifs,)
-    else:
-        total_bg = len(background)
-        bound_bg = all_bound[:, bg_indices_np].sum(axis=1)  # Shape: (n_motifs,)
+
+    default_bound_bg = all_bound.sum(axis=1) if background_groups is None else None
     
     # Preallocate result arrays
     total_results = n_motifs * n_groups
@@ -1083,6 +1394,14 @@ def motif_enrichment(
     for group_name, group_regions in regions.items():
         fg_indices = fg_indices_dict[group_name]
         total_fg = len(fg_indices)
+
+        if background_groups is None:
+            total_bg = n_seqs
+            bound_bg = default_bound_bg
+        else:
+            bg_indices = bg_indices_dict[group_name]
+            total_bg = len(bg_indices)
+            bound_bg = all_bound[:, bg_indices].sum(axis=1)
         
         # Vectorized foreground computation for all motifs
         bound_fg = all_bound[:, fg_indices].sum(axis=1)  # Shape: (n_motifs,)

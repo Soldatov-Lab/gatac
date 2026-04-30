@@ -15,6 +15,7 @@ import gc
 from pathlib import Path
 from typing import Optional, Tuple, List, Union
 
+import anndata as ad
 import cudf
 import cupy as cp
 import cupyx.scipy.sparse as cusp
@@ -24,6 +25,8 @@ import pyarrow.parquet as pq
 import scipy.sparse as sp
 
 logger = logging.getLogger(__name__)
+
+_INTERVAL_FEATURE_PATTERN = r"^(?P<chrom>[^:;]+)[:;](?P<start>\d+)-(?P<end>\d+)$"
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +185,249 @@ def _cleanup_gpu():
     """Free GPU memory pools."""
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
+
+
+def _load_interval_adata(input_data: ad.AnnData | Path):
+    """Load an interval matrix from AnnData or 10x HDF5."""
+    import scanpy as sc
+
+    if isinstance(input_data, ad.AnnData):
+        return input_data.copy()
+
+    input_path = Path(input_data)
+    suffix = input_path.suffix.lower()
+    if suffix == '.h5ad':
+        return sc.read_h5ad(str(input_path))
+    if suffix == '.h5':
+        return sc.read_10x_h5(str(input_path), gex_only=False)
+
+    raise ValueError(
+        f"Unsupported interval-matrix format: '{input_path.suffix}'. "
+        "Expected '.h5ad' or 10x '.h5'."
+    )
+
+
+def _extract_interval_features(var_names: pd.Index) -> pd.DataFrame:
+    """Extract genomic intervals from feature names like ``chr1:100-200``."""
+    feature_names = pd.Index(var_names).astype(str)
+    parsed = feature_names.to_series(
+        index=np.arange(len(feature_names)),
+        name='feature_name',
+    ).str.extract(_INTERVAL_FEATURE_PATTERN)
+
+    parsed = parsed[parsed.notna().all(axis=1)].copy()
+    if parsed.empty:
+        raise ValueError(
+            "No interval-like features found in var_names. "
+            "Expected names like 'chr1:100-200'."
+        )
+
+    parsed['start'] = parsed['start'].astype(np.int64)
+    parsed['end'] = parsed['end'].astype(np.int64)
+    parsed = parsed[parsed['end'] > parsed['start']]
+    if parsed.empty:
+        raise ValueError(
+            "No interval-like features with end > start were found in var_names."
+        )
+
+    parsed.insert(0, 'feature_idx', parsed.index.to_numpy(dtype=np.int32))
+    parsed.insert(1, 'feature_name', feature_names[parsed['feature_idx']].to_numpy())
+    return parsed.reset_index(drop=True)
+
+
+def _load_metrics_dataframe(
+    metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame],
+    filter_query: Optional[str],
+) -> Optional[pd.DataFrame]:
+    """Load cell metrics and optionally apply a pandas query."""
+    if metrics is None:
+        return None
+
+    if isinstance(metrics, cudf.DataFrame):
+        metrics_df = metrics.to_pandas()
+    elif isinstance(metrics, pd.DataFrame):
+        metrics_df = metrics.copy()
+    else:
+        metrics_path = Path(metrics)
+        if not metrics_path.exists():
+            logger.warning(f"Metrics file {metrics_path} not found.")
+            return None
+        logger.info(f"Loading cell metrics from {metrics_path}")
+        metrics_df = pd.read_csv(metrics_path)
+
+    if 'barcode' not in metrics_df.columns:
+        raise ValueError("Metrics table must contain a 'barcode' column.")
+
+    metrics_df['barcode'] = metrics_df['barcode'].astype(str)
+    if filter_query:
+        try:
+            metrics_df = metrics_df.query(filter_query)
+        except Exception as exc:
+            raise ValueError(f"Invalid filter query for metrics: {exc}") from exc
+
+    return metrics_df
+
+
+def _make_tile_matrix_from_interval_matrix(
+    input_data: ad.AnnData | Path,
+    chrom_sizes: dict[str, int],
+    output_path: Optional[Path] = None,
+    tile_size: int = 5000,
+    exclude_chroms: Optional[list] = ["chrM", "chrY", "M", "Y"],
+    min_fragments_per_cell: int = 100,
+    metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame] = None,
+    filter_query: Optional[str] = None,
+    count_strategy: str = "unique",
+    barcode_prefix: Optional[str] = None,
+):
+    """Aggregate interval-like matrix features into fixed genomic tiles."""
+    adata = _load_interval_adata(input_data)
+    interval_features = _extract_interval_features(adata.var_names)
+    input_label = input_data.name if isinstance(input_data, Path) else "AnnData object"
+    logger.info(
+        f"Loaded {input_label}: found {len(interval_features):,} "
+        "interval-like features in var_names"
+    )
+
+    all_chroms = sorted(chrom_sizes.keys())
+    if exclude_chroms is not None:
+        if isinstance(exclude_chroms, str):
+            exclude_chroms = [exclude_chroms]
+        included_chroms = [chrom for chrom in all_chroms if chrom not in exclude_chroms]
+    else:
+        included_chroms = all_chroms
+
+    interval_features = interval_features[
+        interval_features['chrom'].isin(included_chroms)
+    ].reset_index(drop=True)
+    if interval_features.empty:
+        raise ValueError(
+            "No interval-like features remained after chromosome filtering."
+        )
+
+    feature_indices = interval_features['feature_idx'].to_numpy(dtype=np.int32)
+    interval_adata = adata[:, feature_indices]
+    matrix = interval_adata.X
+    if sp.issparse(matrix):
+        matrix = matrix.tocsr()
+    else:
+        matrix = sp.csr_matrix(np.asarray(matrix))
+
+    obs = interval_adata.obs.copy()
+    obs.index = obs.index.astype(str)
+    obs['barcode'] = obs.index
+    obs['row_idx'] = np.arange(matrix.shape[0], dtype=np.int64)
+    obs['n_interval_counts'] = np.asarray(matrix.sum(axis=1)).ravel()
+
+    if 'n_unique' not in obs.columns:
+        if 'n_fragment' in obs.columns:
+            obs['n_unique'] = np.asarray(obs['n_fragment'])
+        else:
+            obs['n_unique'] = obs['n_interval_counts']
+
+    metrics_df = _load_metrics_dataframe(metrics, filter_query)
+    if metrics_df is not None:
+        extra_cols = [column for column in metrics_df.columns if column != 'barcode']
+        obs = obs.merge(
+            metrics_df[['barcode'] + extra_cols],
+            on='barcode',
+            how='inner',
+            suffixes=('', '_metrics'),
+        )
+        if obs.empty:
+            raise ValueError("No cells remained after applying metrics filtering.")
+
+    count_column = next(
+        (
+            column
+            for column in ('n_unique_metrics', 'n_unique', 'n_fragment', 'n_interval_counts')
+            if column in obs.columns
+        ),
+        None,
+    )
+    if count_column is None:
+        raise ValueError("Unable to determine a per-cell count column for filtering.")
+
+    obs = obs[obs[count_column] >= min_fragments_per_cell].copy()
+    if obs.empty:
+        raise ValueError("No cells passed the min_fragments_per_cell filter.")
+
+    row_indices = obs.pop('row_idx').to_numpy(dtype=np.int64)
+    matrix = matrix[row_indices]
+    obs.reset_index(drop=True, inplace=True)
+
+    if count_strategy in ('unique', 'count'):
+        logger.info(
+            "Interval-matrix input detected: preserving input matrix values "
+            "and summing overlapping features per tile."
+        )
+
+    tile_metadata, chrom_offset_df, n_tiles_total = _build_tile_metadata_and_offsets(
+        included_chroms,
+        chrom_sizes,
+        tile_size,
+    )
+    chrom_offsets = dict(
+        zip(
+            chrom_offset_df['chrom'].to_pandas(),
+            chrom_offset_df['tile_offset'].to_pandas(),
+        )
+    )
+
+    start = interval_features['start'].to_numpy(dtype=np.int64)
+    end = interval_features['end'].to_numpy(dtype=np.int64)
+    chrom = interval_features['chrom'].to_numpy(dtype=object)
+    tile_start = np.array([chrom_offsets[c] for c in chrom], dtype=np.int32)
+    tile_start += (start // tile_size).astype(np.int32)
+    tile_end = np.array([chrom_offsets[c] for c in chrom], dtype=np.int32)
+    tile_end += np.maximum((end - 1) // tile_size, 0).astype(np.int32)
+
+    tiles_per_feature = tile_end - tile_start + 1
+    map_rows = np.repeat(
+        np.arange(len(interval_features), dtype=np.int32),
+        tiles_per_feature,
+    )
+    map_cols = np.concatenate(
+        [
+            np.arange(start_idx, end_idx + 1, dtype=np.int32)
+            for start_idx, end_idx in zip(tile_start, tile_end)
+        ]
+    )
+    feature_to_tile = sp.csr_matrix(
+        (
+            np.ones(len(map_rows), dtype=np.uint8),
+            (map_rows, map_cols),
+        ),
+        shape=(len(interval_features), n_tiles_total),
+        dtype=np.uint8,
+    )
+
+    tile_matrix = matrix @ feature_to_tile
+    if not isinstance(tile_matrix, sp.csr_matrix):
+        tile_matrix = tile_matrix.tocsr()
+
+    if count_strategy == 'binarize':
+        tile_matrix.data[:] = 1
+
+    adata = tile_matrix_to_anndata(tile_matrix, obs, tile_metadata)
+    adata.uns['tile_input_kind'] = 'interval_matrix'
+    adata.uns['tile_aggregation'] = 'sum_overlapping_features'
+
+    if barcode_prefix:
+        adata.obs_names = [f"{barcode_prefix}{barcode}" for barcode in adata.obs_names]
+
+    if output_path is not None:
+        adata.write_h5ad(str(output_path))
+        logger.info(
+            f"Created {output_path.name}: {adata.shape[0]:,} cells × "
+            f"{adata.shape[1]:,} tiles from interval matrix"
+        )
+    else:
+        logger.info(
+            f"Created interval-matrix tile AnnData: {adata.shape[0]:,} cells × "
+            f"{adata.shape[1]:,} tiles"
+        )
+    return adata
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +739,7 @@ def tile_matrix_to_anndata(
 
 
 def make_tile_matrix(
-    input_parquet: str | Path,
+    input: str | Path | ad.AnnData,
     chrom_sizes: dict[str, int] | str,
     output_path: Optional[str | Path] = None,
     tile_size: int = 5000,
@@ -505,22 +751,29 @@ def make_tile_matrix(
     barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
     row_groups_per_batch: int = 64,
-) -> 'sc.AnnData':
+) -> ad.AnnData:
     """
-    Process ATAC fragments parquet file and generate tile matrix.
+    Generate a tile matrix from fragments or interval-like feature matrices.
 
-    Streams parquet row-groups in batches so the full file never needs to
-    reside in GPU memory.  Within each batch, tiles are computed for all
-    chromosomes at once (one groupby instead of ~25).
+    For fragment parquet input, row-groups are streamed in batches so the full
+    file never needs to reside in GPU memory. Within each batch, tiles are
+    computed for all chromosomes at once.
+
+    For `.h5ad` or 10x `.h5` input, features with interval-like names such as
+    ``chr1:100-200`` in ``var_names`` are detected and aggregated into fixed
+    tiles by overlap.
 
     Parameters
     ----------
-    input_parquet : str or Path
-        Path to input parquet file containing ATAC fragments
+    input : str, Path, or AnnData
+        Fragment parquet path, interval-matrix `.h5ad` path, 10x `.h5` path,
+        or an in-memory AnnData object containing interval-like features in
+        `var_names`.
     chrom_sizes : dict or str
         Dictionary of chromosome names and their sizes, or a genome name (e.g., 'hg38').
     output_path : str or Path, optional
-        Path for output .h5ad file. If None, uses input filename.
+        Path for output .h5ad file. If None, the function returns the AnnData
+        object without writing to disk.
     tile_size : int
         Size of genomic bins in base pairs (default: 5000)
     min_fragments_per_cell : int
@@ -551,21 +804,29 @@ def make_tile_matrix(
         AnnData object with tile matrix
     """
     from .genome import get_chrom_sizes
-    import scanpy as sc
-
     if isinstance(chrom_sizes, str):
         chrom_sizes = get_chrom_sizes(chrom_sizes)
 
-    input_parquet = Path(input_parquet)
-    if output_path is None:
-        output_path = input_parquet.with_suffix('').with_name(
-            input_parquet.stem + '_tile_matrix.h5ad'
+    input_is_adata = isinstance(input, ad.AnnData)
+    input_path = None if input_is_adata else Path(input)
+    resolved_output_path = Path(output_path) if output_path is not None else None
+
+    if input_is_adata or input_path.suffix.lower() in {'.h5ad', '.h5'}:
+        return _make_tile_matrix_from_interval_matrix(
+            input_data=input if input_is_adata else input_path,
+            chrom_sizes=chrom_sizes,
+            output_path=resolved_output_path,
+            tile_size=tile_size,
+            exclude_chroms=exclude_chroms,
+            min_fragments_per_cell=min_fragments_per_cell,
+            metrics=metrics,
+            filter_query=filter_query,
+            count_strategy=count_strategy,
+            barcode_prefix=barcode_prefix,
         )
-    else:
-        output_path = Path(output_path)
 
     start_time = time.perf_counter()
-    logger.info(f"Processing {input_parquet.name}")
+    logger.info(f"Processing {input_path.name}")
 
     if low_memory:
         row_groups_per_batch = min(row_groups_per_batch, 8)
@@ -597,7 +858,7 @@ def make_tile_matrix(
     # ------------------------------------------------------------------ #
     # 3. Parquet metadata for streaming                                    #
     # ------------------------------------------------------------------ #
-    meta = pq.read_metadata(str(input_parquet))
+    meta = pq.read_metadata(str(input_path))
     n_row_groups = meta.num_row_groups
 
     def _rg_batches():
@@ -636,7 +897,7 @@ def make_tile_matrix(
             con.register('candidate_bc', candidate_df)
             barcode_counts = con.execute(f"""
                 SELECT f.barcode, COUNT(*) as n_unique
-                FROM read_parquet('{str(input_parquet)}') f
+                FROM read_parquet('{str(input_path)}') f
                 INNER JOIN candidate_bc c ON f.barcode = c.barcode
                 WHERE f.chrom IN ({chrom_values})
                 GROUP BY f.barcode
@@ -646,7 +907,7 @@ def make_tile_matrix(
             cell_meta_extra = None
             barcode_counts = con.execute(f"""
                 SELECT barcode, COUNT(*) as n_unique
-                FROM read_parquet('{str(input_parquet)}')
+                FROM read_parquet('{str(input_path)}')
                 WHERE chrom IN ({chrom_values})
                 GROUP BY barcode
                 HAVING COUNT(*) >= {int(min_fragments_per_cell)}
@@ -655,7 +916,7 @@ def make_tile_matrix(
         cell_meta_extra = None
         barcode_counts = con.execute(f"""
             SELECT barcode, COUNT(*) as n_unique
-            FROM read_parquet('{str(input_parquet)}')
+            FROM read_parquet('{str(input_path)}')
             WHERE chrom IN ({chrom_values})
             GROUP BY barcode
             HAVING COUNT(*) >= {int(min_fragments_per_cell)}
@@ -691,7 +952,7 @@ def make_tile_matrix(
 
     for rg in _rg_batches():
         batch = cudf.read_parquet(
-            str(input_parquet), row_groups=rg, columns=frag_columns,
+            str(input_path), row_groups=rg, columns=frag_columns,
         )
 
         # Inner merge: keeps only valid barcodes AND adds cell_idx
@@ -788,11 +1049,18 @@ def make_tile_matrix(
         adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
 
     # Save
-    adata.write_h5ad(str(output_path))
-    total_time = time.perf_counter() - start_time
-    logger.info(
-        f"Created {output_path.name}: {adata.shape[0]:,} cells × "
-        f"{adata.shape[1]:,} tiles ({total_time:.1f}s)"
-    )
+    if resolved_output_path is not None:
+        adata.write_h5ad(str(resolved_output_path))
+        total_time = time.perf_counter() - start_time
+        logger.info(
+            f"Created {resolved_output_path.name}: {adata.shape[0]:,} cells × "
+            f"{adata.shape[1]:,} tiles ({total_time:.1f}s)"
+        )
+    else:
+        total_time = time.perf_counter() - start_time
+        logger.info(
+            f"Created tile AnnData in memory: {adata.shape[0]:,} cells × "
+            f"{adata.shape[1]:,} tiles ({total_time:.1f}s)"
+        )
 
     return adata

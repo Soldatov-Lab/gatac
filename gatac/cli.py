@@ -3,7 +3,7 @@ GATAC Command Line Interface.
 
 Usage:
     gatac convert <input.tsv.gz> [output.parquet]
-    gatac tile <input.parquet> [-o output] [-t tile_size] [-m min_frags]
+    gatac tile <input.parquet|input.h5ad|input.h5> [-o output] [-t tile_size] [-m min_frags]
     gatac gene <input.parquet> -g <annotations.gtf> [-o output]
     gatac features <input.h5ad> [-n n_features] [-o output]
     gatac combine <input.h5ad> [input2.h5ad ...] -o <output.h5ad>
@@ -99,10 +99,16 @@ def tile_command(args):
             sys.exit(1)
 
     try:
+        output_path = args.output
+        if output_path is None:
+            output_path = input_path.with_suffix('').with_name(
+                input_path.stem + '_tile_matrix.h5ad'
+            )
+
         make_tile_matrix(
-            input_parquet=input_path,
+            input=input_path,
             chrom_sizes=genome_arg,
-            output_path=args.output,
+            output_path=output_path,
             tile_size=args.tile_size,
             min_fragments_per_cell=args.min_fragments,
             exclude_chroms=args.exclude_chroms,
@@ -118,6 +124,7 @@ def tile_command(args):
     except Exception as e:
         logging.error(f"Error creating tile matrix: {e}")
         sys.exit(1)
+
 
 
 def features_command(args):
@@ -401,7 +408,7 @@ def main():
     )
     tile_parser.add_argument(
         'input',
-        help='Input .parquet file'
+        help='Input fragments .parquet, interval-matrix .h5ad, or 10x .h5 file'
     )
     tile_parser.add_argument(
         '-o', '--output',

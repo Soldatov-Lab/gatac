@@ -1,15 +1,15 @@
 # `gatac tile`
 
-Build a cell × genomic-tile count matrix from an ATAC-seq fragment Parquet
-file.  The output is an **AnnData** (`.h5ad`) object compatible with Scanpy
-and SnapATAC2.
+Build a cell × genomic-tile count matrix from either an ATAC-seq fragment
+Parquet file or an interval matrix stored as `.h5ad` or 10x `.h5`. The output
+is an **AnnData** (`.h5ad`) object compatible with Scanpy and SnapATAC2.
 
 ---
 
 ## Synopsis
 
 ```
-gatac tile <input.parquet> -g <genome|chr_sizes>
+gatac tile <input.parquet|input.h5ad|input.h5> -g <genome|chr_sizes>
            [-o OUTPUT] [-t TILE_SIZE] [-m MIN_FRAGS]
            [-e CHROMS ...] [--metrics METRICS] [--filter QUERY]
            [--count-strategy STRATEGY] [--barcode-prefix PREFIX]
@@ -24,7 +24,7 @@ gatac tile <input.parquet> -g <genome|chr_sizes>
 
 | Argument | Description |
 |----------|-------------|
-| `input.parquet` | Path to the (filtered) fragment Parquet file |
+| `input` | Path to a fragment `.parquet`, interval-matrix `.h5ad`, or 10x `.h5` file |
 
 ### Options
 
@@ -51,6 +51,12 @@ gatac tile <input.parquet> -g <genome|chr_sizes>
 | `count` | All fragment insertions (not deduplicated) | — |
 | `binarize` | Binary accessibility (0 or 1) | ArchR-compatible |
 
+For `.h5ad` and 10x `.h5` inputs, GATAC detects interval-like features from
+`var_names` using names such as `chr1:100-200` or `chr1;100-200`. Those
+features are aggregated into fixed tiles by overlap. In that mode,
+`unique` and `count` both preserve the original matrix values, while
+`binarize` clips the final tile matrix to `0/1`.
+
 ---
 
 ## Built-in genomes
@@ -72,6 +78,12 @@ Pass a genome name string to use built-in chromosome sizes:
 
 ```bash
 gatac tile pbmc.parquet -g hg38 -t 500 -m 100
+```
+
+### From a 10x peak matrix
+
+```bash
+gatac tile filtered_peak_bc_matrix.h5 -g hg38 -t 500 -o pbmc_tile.h5ad
 ```
 
 ### With quality filtering

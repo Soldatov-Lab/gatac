@@ -155,6 +155,11 @@ You can also pass a genome name string directly:
 adata = ga.pp.make_tile_matrix("pbmc.parquet", chrom_sizes="hg38")
 ```
 
+`make_tile_matrix` also accepts `.h5ad` and 10x `.h5` matrices when their
+feature names contain genomic intervals such as `chr1:100-200` (or
+`chr1;100-200`). In that mode, GATAC keeps only interval-like features and
+aggregates them into fixed tiles by overlap.
+
 Or a custom dict:
 
 ```python
@@ -175,6 +180,14 @@ adata = ga.pp.make_tile_matrix(
     exclude_chroms=["chrM", "chrY"],
 )
 print(adata)  # AnnData object with n_obs × n_vars
+```
+
+```python
+adata = ga.pp.make_tile_matrix(
+    "filtered_peak_bc_matrix.h5",
+    chrom_sizes="hg38",
+    tile_size=500,
+)
 ```
 
 ---

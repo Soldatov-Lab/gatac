@@ -144,6 +144,7 @@ exclude_patterns = [
     "notebooks/README.md",
     "reproducibility/AGENTS.md",
     "reproducibility/GEMINI.md",
+    "reproducibility/.pixi/**",
 ]
 
 # -- Options for HTML output -------------------------------------------------

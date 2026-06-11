@@ -113,9 +113,10 @@ intersphinx_timeout = 5  # seconds; avoids hanging on blocked network in CI/HPC
 copybutton_prompt_text = r">>> |\.\.\. |\$ "
 copybutton_prompt_is_regexp = True
 
-# With SOURCEDIR set to the repo root (see docs/Makefile), Sphinx needs to
-# know which document is the root and which paths to exclude from scanning.
-root_doc = "docs/index"
+# With SOURCEDIR set to the repo root (see docs/Makefile), Sphinx uses a small
+# top-level landing page as the root document and keeps the main docs homepage
+# under docs/index.md.
+root_doc = "index"
 
 templates_path = ["_templates"]
 exclude_patterns = [

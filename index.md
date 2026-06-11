@@ -7,10 +7,10 @@ sd_hide_title: true
 :caption: General
 :maxdepth: 1
 
-installation
-tutorials/index
-changelog
-contributing
+docs/installation
+docs/tutorials/index
+docs/changelog
+docs/contributing
 ```
 
 ```{toctree}
@@ -18,8 +18,8 @@ contributing
 :caption: Reference
 :maxdepth: 2
 
-api/index
-cli/index
+docs/api/index
+docs/cli/index
 ```
 
 ```{toctree}
@@ -27,10 +27,10 @@ cli/index
 :caption: About
 :maxdepth: 1
 
-../reproducibility/README
-license
-credits
+reproducibility/README
+docs/license
+docs/credits
 ```
 
-```{include} _home.md
+```{include} docs/_home_root.md
 ```

@@ -19,7 +19,7 @@ aggregation over datasets that far exceed the size of available GPU RAM.
 ## Installation
 
 ```bash
-uv sync
+uv sync --extra cuda12
 ```
 
 ## CLI Usage

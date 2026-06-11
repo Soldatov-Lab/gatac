@@ -4,11 +4,12 @@ from .tile import make_tile_matrix
 from .gene import make_gene_matrix
 from .features import select_features, select_features_multi
 from .metrics import (
-    load_tss_from_gtf, 
+    load_tss_from_gtf,
     compute_metrics,
     cleanup_gpu_memory
 )
 from .filter import filter_fragments
+from .amulet import detect_doublets
 from .genome import HG38 as _HG38, HG19 as _HG19, MM10 as _MM10, MM39 as _MM39
 
 #: GRCh38 / hg38 chromosome sizes.
@@ -25,14 +26,15 @@ __all__ = [
     "make_parquet_batch",
     "make_tile_matrix",
     "make_gene_matrix",
-    "read_fragments_parquet", 
+    "read_fragments_parquet",
     "select_features",
     "select_features_multi",
     "combine",
-    "load_tss_from_gtf", 
+    "load_tss_from_gtf",
     "compute_metrics",
     "cleanup_gpu_memory",
     "filter_fragments",
+    "detect_doublets",
     "HG38",
     "HG19",
     "MM10",

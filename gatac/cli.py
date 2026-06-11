@@ -9,6 +9,7 @@ Usage:
     gatac combine <input.h5ad> [input2.h5ad ...] -o <output.h5ad>
     gatac metrics <input.parquet> -g <annotations.gtf> [-o output]
     gatac filter <input.parquet> [--metrics metrics.csv] [--filter "query"]
+    gatac doublets <input.parquet> -g <genome> [-o output.csv]
 """
 
 import argparse
@@ -354,6 +355,42 @@ def filter_command(args):
         sys.exit(1)
 
 
+def doublets_command(args):
+    """Handle 'gatac doublets' subcommand."""
+    from .pp.amulet import detect_doublets
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        logging.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+
+    output_path = Path(args.output)
+    if output_path.suffix == "":
+        output_path = input_path.with_name(input_path.stem + "_doublets.csv")
+
+    result = detect_doublets(
+        fragment_path=input_path,
+        chrom_sizes=args.genome,
+        barcodes=None,
+        min_fragments=args.min_fragments,
+        expected_overlap=args.expected_overlap,
+        max_insert_size=args.max_insert,
+        q_threshold=args.q,
+        q_rep_threshold=args.q_rep,
+        repeat_filter=args.repeat_filter,
+        min_overlap_bp=args.min_overlap,
+        n_threads=args.threads,
+    )
+
+    result.to_csv(str(output_path), index=False)
+    n_doublets = int(result["is_doublet"].sum())
+    logging.info(
+        f"Detected {n_doublets:,} doublets "
+        f"({100 * n_doublets / len(result):.2f}% of {len(result):,} cells). "
+        f"Saved to {output_path}"
+    )
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -673,6 +710,73 @@ def main():
         help='Use low memory mode for Parquet reading'
     )
     gene_parser.set_defaults(func=gene_command)
+
+    # Doublets subcommand
+    doublets_parser = subparsers.add_parser(
+        'doublets',
+        help='Detect multiplet/doublet cells using the AMULET Poisson method',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    doublets_parser.add_argument(
+        'input',
+        help='Input fragments .parquet file'
+    )
+    doublets_parser.add_argument(
+        '-g', '--genome',
+        required=True,
+        help='Genome name (e.g., hg38, mm10) or path to chromosome sizes file'
+    )
+    doublets_parser.add_argument(
+        '-o', '--output',
+        help='Output CSV file (default: <input>_doublets.csv)'
+    )
+    doublets_parser.add_argument(
+        '-m', '--min-fragments',
+        type=int,
+        default=100,
+        help='Minimum unique fragments per cell to include'
+    )
+    doublets_parser.add_argument(
+        '--expected-overlap',
+        type=int,
+        default=2,
+        help='Expected number of reads overlapping (default 2)'
+    )
+    doublets_parser.add_argument(
+        '--max-insert',
+        type=int,
+        default=900,
+        help='Maximum fragment insert size in bp (default 900)'
+    )
+    doublets_parser.add_argument(
+        '--q',
+        type=float,
+        default=0.01,
+        help='FDR threshold for doublet calling (default 0.01)'
+    )
+    doublets_parser.add_argument(
+        '--q-rep',
+        type=float,
+        default=0.01,
+        help='FDR threshold for inferring repetitive regions (default 0.01)'
+    )
+    doublets_parser.add_argument(
+        '--repeat-filter',
+        help='BED file of known repetitive regions to exclude'
+    )
+    doublets_parser.add_argument(
+        '--min-overlap',
+        type=int,
+        default=1,
+        help='Minimum overlap length in bp (default 1)'
+    )
+    doublets_parser.add_argument(
+        '-j', '--threads',
+        type=int,
+        default=1,
+        help='Number of parallel workers for overlap detection (default 1)'
+    )
+    doublets_parser.set_defaults(func=doublets_command)
 
     args = parser.parse_args()
     setup_logging(args.verbose)

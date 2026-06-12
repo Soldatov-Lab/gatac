@@ -126,10 +126,18 @@ table.docutils {
   display: block;
 }
 
+/* ── Heading anchor links ─────────────────────────────────────────────────── */
+a.headerlink {
+  color: var(--gatac-green);
+}
+
+a.headerlink:hover {
+  color: var(--gatac-green-dark);
+}
+
 /* ── Dark mode overrides ─────────────────────────────────────────────────── */
 html[data-theme="dark"] {
-  --gatac-green: #3fb950;
-  --gatac-blue:  #58a6ff;
+  --gatac-blue: #58a6ff;
 }
 
 html[data-theme="dark"] code.literal {

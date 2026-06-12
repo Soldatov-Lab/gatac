@@ -1,8 +1,16 @@
 """
 AMULET doublet/multiplet detection for single-cell ATAC-seq.
 
-Implements the original AMULET (Atac-seq MULtiplet Estimation Tool) algorithm
-of Thibodeau et al. (2021) as a GATAC-native preprocessing step.
+Direct port of the AMULET (Atac-seq MULtiplet Estimation Tool) algorithm of
+Thibodeau et al. (2021) to the GATAC data model.
+
+The overlap-detection sweep-line, the per-cell Poisson scoring, the row-sum
+Poisson repeat-inference, and the BH-FDR correction are translated
+line-for-line from the upstream Python source (`FragmentFileOverlapCounter.py`
+and `AMULET.py`). The data flow has been rewritten to operate on GATAC's
+parquet fragment files via DuckDB and to parallelize per-chromosome with a
+worker pool; the optional repeat-filter pass is applied at the raw-read level
+rather than the overlap level.
 
 The method detects cells whose fragments show an abnormally high number of
 overlapping insertions, which is characteristic of doublets or multiplets

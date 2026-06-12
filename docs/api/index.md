@@ -50,8 +50,11 @@ ga.tl.spectral(adata)
 ga.tl.call_peaks(adata, group_by="cell_type", fragment_source="sample.parquet")
 
 # 7. Motif enrichment
-motifs = ga.tl.read_motifs("cisBP_human.meme")
-ga.tl.chromvar(adata, motifs=motifs, genome_fasta="GRCh38.fa")
+ga.tl.chromvar(
+    adata,
+    genome_fasta="GRCh38.fa",
+    motifs_path="cisBP_human.meme",
+)
 ```
 
 ---

@@ -252,24 +252,42 @@ algorithm.  All compute-intensive steps are executed on GPU.
 
 ### Workflow
 
+The high-level `ga.tl.chromvar()` runs the full pipeline in a single call —
+peak bias → background sampling → motif scanning → deviation scoring.
+
+```python
+import gatac as ga
+
+ga.tl.chromvar(
+    adata,
+    genome_fasta="GRCh38.fa",
+    motifs_path="cisBP_human.meme",
+)
+# → stores deviation scores in adata.obsm["chromvar"]
+```
+
+The same result can be obtained by running the four steps individually:
+
 ```python
 import gatac as ga
 
 # 1. Compute peak GC content (used for background sampling)
 ga.tl.compute_peak_bias(adata, genome_fasta="GRCh38.fa")
 
-# 2. Sample background peaks matched on GC content
-bg = ga.tl.sample_bg_peaks(adata, n_bg_samples=200)
+# 2. Sample background peaks matched on GC content + accessibility
+ga.tl.sample_bg_peaks(adata, method="knn", n_iterations=50)
 
 # 3. Load motifs and scan peaks
 motifs = ga.tl.read_motifs("cisBP_human.meme")
+ga.tl.scan_motifs(adata, motifs, "GRCh38.fa")
 
-# 4. Run full chromVAR pipeline
-ga.tl.chromvar(adata, motifs=motifs, genome_fasta="GRCh38.fa")
-# → stores deviation scores in adata.obsm["X_chromvar"]
+# 4. Compute per-cell, per-motif deviation scores
+ga.tl.compute_deviations(adata)
 ```
 
 ### Output
 
-Deviation scores are stored in `adata.obsm["X_chromvar"]` as a cell × motif
-matrix.  Motif names are stored in `adata.uns["chromvar_motifs"]`.
+Deviation scores are stored in `adata.obsm["chromvar"]` as a cell × motif
+matrix.  Motif names (written by `scan_motifs`) are stored in
+`adata.uns["motif_name"]`.  Background peak indices (written by
+`sample_bg_peaks`) are stored in `adata.varm["bg_peaks"]`.

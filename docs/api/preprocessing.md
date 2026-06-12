@@ -29,9 +29,10 @@ larger than GPU memory.
 ## Quality metrics & filtering
 
 Compute TSS enrichment score and fragment-level statistics entirely on GPU
-using a streaming approach, then filter barcodes by quality thresholds.
-`filter_fragments` accepts a pre-computed metrics DataFrame or CSV and a
-Polars query string.
+using a streaming approach, filter barcodes by quality thresholds, and detect
+doublet / multiplet cells with the AMULET Poisson method.  `filter_fragments`
+accepts a pre-computed metrics DataFrame or CSV and a Polars query string;
+`detect_doublets` returns per-cell p/q values and an `is_doublet` flag.
 
 ```{eval-rst}
 .. autosummary::
@@ -40,6 +41,7 @@ Polars query string.
 
    compute_metrics
    filter_fragments
+   detect_doublets
 ```
 
 ---

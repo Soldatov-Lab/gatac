@@ -22,6 +22,7 @@ Global option:
 convert
 metrics
 filter
+doublets
 tile
 gene
 features
@@ -55,6 +56,14 @@ Compute TSS enrichment and fragment QC statistics.
 :shadow: none
 
 Filter barcodes by quality thresholds.
+:::
+
+:::{grid-item-card} {fas}`clone` doublets
+:link: doublets
+:link-type: doc
+:shadow: none
+
+Detect doublet / multiplet cells (AMULET Poisson method).
 :::
 
 :::{grid-item-card} {fas}`th` tile

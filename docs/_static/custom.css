@@ -6,10 +6,16 @@
   --gatac-green-dark:#5a8c00;
   --gatac-gpu:       #76b900;   /* NVIDIA green */
   --pst-color-link-hover: var(--gatac-green);
+  --pst-color-secondary: var(--gatac-green);
+}
+
+html[data-theme="light"] {
+  --pst-color-secondary: var(--gatac-green);
 }
 
 html[data-theme="dark"] {
   --pst-color-link-hover: var(--gatac-green);
+  --pst-color-secondary: var(--gatac-green);
 }
 
 /* ── Logo spacing ────────────────────────────────────────────────────────── */
@@ -133,6 +139,16 @@ a.headerlink {
 
 a.headerlink:hover {
   color: var(--gatac-green-dark);
+}
+
+/* ── Notebook output images ──────────────────────────────────────────────── */
+/* Override the fixed width/height attributes baked into notebook outputs so
+   images scale responsively with the page width.                             */
+.cell_output img,
+.output img {
+  max-width: 100%;
+  height: auto !important;
+  width: auto !important;
 }
 
 /* ── Dark mode overrides ─────────────────────────────────────────────────── */

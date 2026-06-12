@@ -4,7 +4,7 @@
 
 Most of GATAC code was written with AI assistance, used responsibly under strict validation against the expected behavior of the original CPU-based tools being translated. The bulk of the core feature porting/translations and GPU optimization work was carried out with Claude Opus 4.6 and GPT-5.4, while Claude Sonnet 4.6 was used for secondary development tasks.
 
-All AI-assisted implementations were tightly constrained to match reference outputs from [SnapATAC2](https://github.com/scverse/SnapATAC2), [ArchR](https://www.archrproject.com/), [chromVAR](https://greenleaflab.github.io/chromVAR/index.html), and [MACS3](https://github.com/macs3-project/MACS). Results were also thoroughly tested for reproducibility on the [Reproducibility](../reproducibility/README) page and in the associated test suite.
+All AI-assisted implementations were tightly constrained to match reference outputs from [SnapATAC2](https://github.com/scverse/SnapATAC2), [ArchR](https://www.archrproject.com/), [chromVAR](https://greenleaflab.github.io/chromVAR/index.html), and [MACS3](https://github.com/macs3-project/MACS). Results were also thoroughly tested for reproducibility on the [Reproducibility](reproducibility) page and in the associated test suite.
 
 ## Third-party code
 

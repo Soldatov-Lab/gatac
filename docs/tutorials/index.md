@@ -4,11 +4,11 @@
 :hidden:
 :maxdepth: 1
 
-../../notebooks/01_fragment_preprocessing
-../../notebooks/02_embedding_peak_calling
-../../notebooks/03_motif_enrichment
-../../notebooks/04_chromvar
-../../notebooks/05_gsea
+../notebooks/01_fragment_preprocessing
+../notebooks/02_embedding_peak_calling
+../notebooks/03_motif_enrichment
+../notebooks/04_chromvar
+../notebooks/05_gsea
 ```
 
 ---
@@ -20,7 +20,7 @@
 
 :::{grid-item-card} Fragment Processing
 :shadow: none
-:link: ../../notebooks/01_fragment_preprocessing
+:link: ../notebooks/01_fragment_preprocessing
 :link-type: doc
 
 Convert raw fragments into a Parquet-backed workflow, compute QC summaries,
@@ -29,7 +29,7 @@ and inspect the features carried forward into downstream analysis.
 
 :::{grid-item-card} Spectral Embedding, Clustering & Peak Calling
 :shadow: none
-:link: ../../notebooks/02_embedding_peak_calling
+:link: ../notebooks/02_embedding_peak_calling
 :link-type: doc
 
 Build a low-dimensional embedding, identify cell groups, call peaks by
@@ -38,7 +38,7 @@ cluster, and assemble a peak matrix for follow-up analyses.
 
 :::{grid-item-card} Motif Enrichment
 :shadow: none
-:link: ../../notebooks/03_motif_enrichment
+:link: ../notebooks/03_motif_enrichment
 :link-type: doc
 
 Test cluster-specific peak sets for transcription factor motif enrichment and
@@ -47,7 +47,7 @@ inspect the strongest motif signals in accessible regions.
 
 :::{grid-item-card} chromVAR: TF Activity Scores
 :shadow: none
-:link: ../../notebooks/04_chromvar
+:link: ../notebooks/04_chromvar
 :link-type: doc
 
 Compute chromVAR deviation scores from motif annotations and visualize
@@ -56,7 +56,7 @@ transcription factor activity across cells and clusters.
 
 :::{grid-item-card} Preranked GSEA
 :shadow: none
-:link: ../../notebooks/05_gsea
+:link: ../notebooks/05_gsea
 :link-type: doc
 
 Rank marker peaks, derive motif-linked gene sets, and run enrichment analysis

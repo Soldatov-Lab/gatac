@@ -4,7 +4,6 @@ from .tile import make_tile_matrix
 from .gene import make_gene_matrix
 from .features import select_features, select_features_multi
 from .metrics import (
-    load_tss_from_gtf,
     compute_metrics,
     cleanup_gpu_memory
 )
@@ -30,7 +29,6 @@ __all__ = [
     "select_features",
     "select_features_multi",
     "combine",
-    "load_tss_from_gtf",
     "compute_metrics",
     "cleanup_gpu_memory",
     "filter_fragments",

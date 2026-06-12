@@ -28,8 +28,7 @@ import gatac as ga
 ga.pp.make_parquet("sample.tsv.gz")
 
 # 2. Compute QC metrics
-tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
-metrics = ga.pp.compute_metrics("sample.parquet", tss)
+metrics = ga.pp.compute_metrics("sample.parquet", "GRCh38.gtf.gz")
 
 # 3. Build tile matrix (filtered by QC)
 adata = ga.pp.make_tile_matrix(

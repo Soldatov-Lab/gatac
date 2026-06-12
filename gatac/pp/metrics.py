@@ -74,35 +74,20 @@ void compute_tsse_kernel(
 }
 ''', 'compute_tsse_kernel')
 
-def load_tss_from_gtf(gtf_path: str | Path) -> 'pl.DataFrame':
-    """
-    Load TSS locations from a GTF file using Polars.
+def _load_tss_from_gtf(gtf_path: str | Path) -> 'pl.DataFrame':
+    """Load TSS locations from a GTF file using Polars.
 
-    Parameters
-    ----------
-    gtf_path : str or Path
-        Path to the GTF file.
-
-    Returns
-    -------
-    tss_df : pl.DataFrame
-        DataFrame with columns: ['chrom', 'tss', 'strand']
-
-    Examples
-    --------
-    >>> import gatac as ga
-    >>> tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
-    >>> tss.columns
-    ['chrom', 'tss', 'strand']
+    Private helper used by :func:`compute_metrics` when the caller passes a
+    ``gtf_path`` instead of a pre-loaded TSS DataFrame.
     """
 
     import polars as pl
-    
+
     logger.info(f"Loading TSS from {gtf_path} (Polars)")
-    
+
     # GTF columns
     cols = ['chrom', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attribute']
-    
+
     # Read GTF (tab-separated, ignore lines starting with #)
     df = pl.read_csv(
         gtf_path,
@@ -111,10 +96,10 @@ def load_tss_from_gtf(gtf_path: str | Path) -> 'pl.DataFrame':
         has_header=False,
         new_columns=cols,
     ).select(['chrom', 'feature', 'start', 'end', 'strand'])
-    
+
     # Filter for transcripts and compute TSS
     df = df.filter(pl.col('feature') == 'transcript')
-    
+
     # TSS is start-1 for + strand, end-1 for - strand (0-based)
     df = df.with_columns([
         pl.when(pl.col('strand') == '-')
@@ -122,17 +107,17 @@ def load_tss_from_gtf(gtf_path: str | Path) -> 'pl.DataFrame':
           .otherwise(pl.col('start') - 1)
           .alias('tss')
     ])
-    
+
     # Keep unique TSS positions
     tss_df = df.select(['chrom', 'tss', 'strand']).unique()
-    
+
     logger.info(f"Loaded {len(tss_df):,} unique TSSs (Polars)")
     return tss_df
 
 
 def compute_metrics(
     parquet_path: str | Path,
-    tss_df: 'pl.DataFrame',
+    tss_source: Union[str, Path, 'pl.DataFrame'],
     window_size: int = 2000,
     smooth_window: int = 11,
     min_unique_frags: int = 100,
@@ -142,16 +127,19 @@ def compute_metrics(
 ) -> cudf.DataFrame:
     """
     Compute TSS enrichment scores using GPU-accelerated streaming via row groups.
-    
+
     This function streams fragment data in batches of row groups to balance
-    speed and GPU memory usage. 
-    
+    speed and GPU memory usage.
+
     Parameters
     ----------
     parquet_path : str or Path
         Path to the parquet file containing ATAC fragments.
-    tss_df : pl.DataFrame
-        TSS data from load_tss_from_gtf
+    tss_source : str, Path, or pl.DataFrame
+        Either a path to a GTF file (the TSS table is loaded internally)
+        or a pre-built ``polars.DataFrame`` of TSS positions
+        (columns: ``chrom``, ``tss``, ``strand``).  When a pre-built
+        DataFrame is passed, the underlying GTF file is not re-read.
     window_size : int
         Distance around TSS to consider (default: 2000)
     smooth_window : int
@@ -164,7 +152,7 @@ def compute_metrics(
         Chromosomes to exclude from TSS enrichment calculation (default: ["chrM", "M"])
     row_groups_per_batch : int
         Number of parquet row groups to process in each GPU batch (default: 64)
-        
+
     Returns
     -------
     results : cudf.DataFrame
@@ -173,10 +161,10 @@ def compute_metrics(
     Examples
     --------
     >>> import gatac as ga
-    >>> tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
+    >>> # Pass a GTF path directly
     >>> metrics = ga.pp.compute_metrics(
     ...     "pbmc.parquet",
-    ...     tss_df=tss,
+    ...     "GRCh38.gtf.gz",
     ...     min_unique_frags=100,
     ...     exclude_chroms=["chrM", "M"],
     ... )
@@ -186,7 +174,13 @@ def compute_metrics(
 
     import polars as pl
     import pyarrow.parquet as pq
-    
+
+    # Resolve TSS source: accept either a GTF path or a pre-loaded DataFrame.
+    if isinstance(tss_source, (str, Path)):
+        tss_df = _load_tss_from_gtf(tss_source)
+    else:
+        tss_df = tss_source
+
     logger.info(f"Computing metrics (streaming mode, row_groups_per_batch={row_groups_per_batch})")
     parquet_path = Path(parquet_path)
     

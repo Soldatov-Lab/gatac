@@ -237,13 +237,12 @@ def metrics_command(args):
         output_path = input_path.with_suffix('').with_name(input_path.stem + '_metrics.csv')
 
     # Use Polars GPU streaming for out-of-core processing
-    from .pp.metrics import load_tss_from_gtf, compute_metrics
-    
+    from .pp.metrics import compute_metrics
+
     logging.info(f"Loading fragments from {input_path}")
-    tss_df = load_tss_from_gtf(gtf_path)
     results = compute_metrics(
         input_path,
-        tss_df,
+        gtf_path,
         min_unique_frags=args.min_frags,
         row_groups_per_batch=args.batch_size,
     )

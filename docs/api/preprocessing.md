@@ -38,7 +38,6 @@ GPU memory simultaneously.
    :nosignatures:
 
    compute_metrics
-   load_tss_from_gtf
 ```
 
 ---

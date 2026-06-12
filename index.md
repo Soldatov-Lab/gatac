@@ -1,7 +1,3 @@
----
-sd_hide_title: true
----
-
 ```{toctree}
 :hidden:
 :caption: General

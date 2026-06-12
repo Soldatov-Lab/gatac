@@ -5,6 +5,11 @@
   --gatac-green:     #73b301;   /* logo green */
   --gatac-green-dark:#5a8c00;
   --gatac-gpu:       #76b900;   /* NVIDIA green */
+  --pst-color-link-hover: var(--gatac-green);
+}
+
+html[data-theme="dark"] {
+  --pst-color-link-hover: var(--gatac-green);
 }
 
 /* ── Logo spacing ────────────────────────────────────────────────────────── */
@@ -15,7 +20,8 @@
 }
 
 /* ── Toctree caption headings (sidebar section labels) ───────────────────── */
-p.caption .caption-text {
+p.caption .caption-text,
+.bd-sidebar-secondary .onthispage {
   color: var(--gatac-green);
   font-weight: 600;
   text-transform: uppercase;
@@ -76,6 +82,21 @@ div.admonition.tip > p.admonition-title::before {
 .bd-sidebar-primary .nav-link.active {
   border-left: 3px solid var(--gatac-green);
   font-weight: 600;
+}
+
+/* ── Back-to-top button ──────────────────────────────────────────────────── */
+#pst-back-to-top {
+  background-color: var(--gatac-green);
+  color: #fff;
+}
+
+#pst-back-to-top:hover {
+  background-color: var(--gatac-green-dark);
+  color: #fff;
+}
+
+#pst-back-to-top:focus-visible {
+  outline-color: var(--gatac-green);
 }
 
 /* ── Footer ──────────────────────────────────────────────────────────────── */

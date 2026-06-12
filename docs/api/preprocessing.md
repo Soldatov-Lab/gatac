@@ -25,21 +25,6 @@ larger than GPU memory.
    combine
 ```
 
-### Usage example
-
-```python
-import gatac as ga
-
-# Single file
-out = ga.pp.make_parquet("pbmc.tsv.gz")
-
-# Batch with per-sample barcode prefixes
-paths = ga.pp.make_parquet_batch(
-    ["sampleA.tsv.gz", "sampleB.tsv.gz"],
-    barcode_prefix=["A_", "B_"],
-)
-```
-
 ---
 
 ## Quality metrics
@@ -66,24 +51,6 @@ GPU memory simultaneously.
 | `duplicate_fraction` | Fraction of duplicate fragments |
 | `mito_fraction` | Fraction of mitochondrial fragments |
 
-### Usage example
-
-```python
-tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
-
-metrics = ga.pp.compute_metrics(
-    "pbmc.parquet",
-    tss_df=tss,
-    min_unique_frags=100,
-    exclude_chroms=["chrM", "M"],
-)
-
-# Plot QC
-import scanpy as sc
-import pandas as pd
-obs = metrics.to_pandas().set_index("barcode")
-```
-
 ---
 
 ## Fragment filtering
@@ -98,17 +65,6 @@ DataFrame or CSV and a Polars query string.
 
    filter_fragments
    cleanup_gpu_memory
-```
-
-### Usage example
-
-```python
-ga.pp.filter_fragments(
-    "pbmc.parquet",
-    metrics="pbmc_metrics.csv",
-    filter_query="tsse_score > 5 and n_unique > 1000",
-    output_parquet="pbmc_filtered.parquet",
-)
 ```
 
 ---
@@ -160,36 +116,6 @@ feature names contain genomic intervals such as `chr1:100-200` (or
 `chr1;100-200`). In that mode, GATAC keeps only interval-like features and
 aggregates them into fixed tiles by overlap.
 
-Or a custom dict:
-
-```python
-adata = ga.pp.make_tile_matrix(
-    "pbmc.parquet",
-    chrom_sizes={"chr1": 248956422, "chr2": 242193529, ...},
-)
-```
-
-### Usage example
-
-```python
-adata = ga.pp.make_tile_matrix(
-    "pbmc_filtered.parquet",
-    chrom_sizes="hg38",
-    tile_size=500,
-    min_fragments_per_cell=200,
-    exclude_chroms=["chrM", "chrY"],
-)
-print(adata)  # AnnData object with n_obs × n_vars
-```
-
-```python
-adata = ga.pp.make_tile_matrix(
-    "filtered_peak_bc_matrix.h5",
-    chrom_sizes="hg38",
-    tile_size=500,
-)
-```
-
 ---
 
 ## Gene activity matrix
@@ -203,19 +129,6 @@ gene-body regions defined by a GTF annotation.
    :nosignatures:
 
    make_gene_matrix
-```
-
-### Usage example
-
-```python
-adata_gene = ga.pp.make_gene_matrix(
-    "pbmc_filtered.parquet",
-    gene_anno="GRCh38.gtf.gz",
-    id_type="gene",
-    upstream=2000,
-    downstream=0,
-    include_gene_body=True,
-)
 ```
 
 ---
@@ -233,18 +146,4 @@ matrices.
 
    select_features
    select_features_multi
-```
-
-### Usage example
-
-```python
-# Single AnnData
-ga.pp.select_features(adata, n_features=500_000)
-
-# Multi-sample streaming
-ga.pp.select_features_multi(
-    ["sampleA.h5ad", "sampleB.h5ad"],
-    output_path="combined.h5ad",
-    n_features=500_000,
-)
 ```

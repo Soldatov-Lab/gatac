@@ -23,13 +23,10 @@ entry point for UMAP and clustering in ATAC-seq workflows.
    spectral
 ```
 
-#### Usage example
+After computing the embedding, the typical downstream steps are:
 
 ```python
-import gatac as ga
 import scanpy as sc
-
-ga.tl.spectral(adata, n_comps=30)
 
 sc.pp.neighbors(adata, use_rep="X_spectral")
 sc.tl.umap(adata)
@@ -52,13 +49,6 @@ mini-batch Online Variational Bayes.
    MiniBatchLDA
 ```
 
-#### Usage example
-
-```python
-model = ga.tl.lda(adata, n_topics=20, n_epochs=10)
-# Cell × topic matrix stored in adata.obsm["X_lda"]
-```
-
 ---
 
 ## Peak calling
@@ -75,27 +65,6 @@ Call ATAC peaks per cell-type group using the MACS3 algorithm under the hood.
    call_peaks
    merge_peaks
    make_peak_matrix
-```
-
-#### Usage example
-
-```python
-# 1. Call peaks per group
-peaks = ga.tl.call_peaks(
-    adata,
-    group_by="leiden",
-    fragment_source="pbmc.parquet",
-    genome="hg38",
-)
-
-# 2. Merge overlapping peaks across groups
-merged = ga.tl.merge_peaks(adata)
-
-# 3. Build cell × peak count matrix
-peak_adata = ga.tl.make_peak_matrix(
-    peaks=merged,
-    fragments="pbmc.parquet",
-)
 ```
 
 ---
@@ -126,21 +95,6 @@ accelerated binomial test with Benjamini–Hochberg correction.
 | `p_value` | Raw two-sided binomial p-value |
 | `fdr` | Benjamini–Hochberg adjusted p-value |
 
-### Usage example
-
-```python
-markers = ga.tl.marker_peaks(
-    adata,
-    groupby="leiden",
-    reference="rest",
-    min_pct=0.05,
-    min_log2_fc=1.0,
-)
-
-# markers["0"] → Polars DataFrame for cluster 0
-print(markers["0"].head())
-```
-
 ---
 
 ## Motif analysis
@@ -167,11 +121,6 @@ print(markers["0"].head())
 | `pwm` | `ndarray` (L×4) | Position weight matrix [A, C, G, T] |
 | `pfm` | `ndarray` (L×4) | Raw position frequency matrix |
 
-```python
-motifs = ga.tl.read_motifs("cisBP_human.meme", unique=True)
-print(f"Loaded {len(motifs)} motifs")
-```
-
 ---
 
 ### Motif enrichment
@@ -188,24 +137,6 @@ background peaks.
    motif_enrichment
 ```
 
-#### Usage example
-
-```python
-motifs = ga.tl.read_motifs("cisBP_human.meme")
-matched_bg = ga.tl.sample_gc_matched_background(
-   marker_peaks,
-   genome_fasta="GRCh38.fa",
-   background_pool=list(peak_adata.var_names),
-)
-
-enrichment_df = ga.tl.motif_enrichment(
-   motifs,
-   marker_peaks,
-   genome_fasta="GRCh38.fa",
-   background=matched_bg,
-)
-```
-
 ---
 
 ### GSEA motif enrichment
@@ -219,16 +150,6 @@ accelerated with CuPy.
    :nosignatures:
 
    gsea_motif_enrichment
-```
-
-#### Usage example
-
-```python
-gsea_df = ga.tl.gsea_motif_enrichment(
-    rankings=marker_scores,
-    motif_terms=motif_dict,
-    n_perm=1000,
-)
 ```
 
 ---
@@ -250,44 +171,15 @@ algorithm.  All compute-intensive steps are executed on GPU.
    compute_deviations
 ```
 
-### Workflow
-
-The high-level `ga.tl.chromvar()` runs the full pipeline in a single call —
-peak bias → background sampling → motif scanning → deviation scoring.
-
-```python
-import gatac as ga
-
-ga.tl.chromvar(
-    adata,
-    genome_fasta="GRCh38.fa",
-    motifs_path="cisBP_human.meme",
-)
-# → stores deviation scores in adata.obsm["chromvar"]
-```
-
-The same result can be obtained by running the four steps individually:
-
-```python
-import gatac as ga
-
-# 1. Compute peak GC content (used for background sampling)
-ga.tl.compute_peak_bias(adata, genome_fasta="GRCh38.fa")
-
-# 2. Sample background peaks matched on GC content + accessibility
-ga.tl.sample_bg_peaks(adata, method="knn", n_iterations=50)
-
-# 3. Load motifs and scan peaks
-motifs = ga.tl.read_motifs("cisBP_human.meme")
-ga.tl.scan_motifs(adata, motifs, "GRCh38.fa")
-
-# 4. Compute per-cell, per-motif deviation scores
-ga.tl.compute_deviations(adata)
-```
-
 ### Output
 
-Deviation scores are stored in `adata.obsm["chromvar"]` as a cell × motif
-matrix.  Motif names (written by `scan_motifs`) are stored in
-`adata.uns["motif_name"]`.  Background peak indices (written by
-`sample_bg_peaks`) are stored in `adata.varm["bg_peaks"]`.
+The pipeline writes to several `adata` slots:
+
+| Slot | Set by | Contents |
+|------|--------|----------|
+| `adata.obsm["chromvar"]` | `compute_deviations` / `chromvar` | Per-cell, per-motif deviation scores *(cells × motifs)* |
+| `adata.uns["motif_name"]` | `scan_motifs` | Motif identifiers in column order |
+| `adata.varm["bg_peaks"]` | `sample_bg_peaks` | Background peak indices per peak *(n_peaks × n_iterations)* |
+
+To run the four steps individually, see the docstring of
+`compute_deviations` (which lists them end-to-end).

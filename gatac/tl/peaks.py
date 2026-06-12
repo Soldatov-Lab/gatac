@@ -1196,7 +1196,20 @@ def merge_peaks(
         A dataframe with merged, fixed-width, non-overlapping peaks.
         If peaks is an AnnData and inplace=True, returns None and stores in
         `.uns[key_added]`.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> # Operate in-place on an AnnData: stores results in adata.uns["peaks"]
+    >>> ga.tl.merge_peaks(adata, use_rep="gmacs", key_added="peaks")
+    >>> # Or pass a dict of per-group peak DataFrames:
+    >>> peaks_df = ga.tl.merge_peaks(
+    ...     adata.uns["gmacs"],
+    ...     chrom_sizes="hg38",
+    ...     half_width=250,
+    ... )
     """
+
     # Handle AnnData input
     if hasattr(peaks, 'uns'):
         adata = peaks

@@ -21,7 +21,13 @@ logger = logging.getLogger(__name__)
 
 
 def cleanup_gpu_memory():
-    """Force cleanup of GPU memory."""
+    """Force cleanup of GPU memory.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.pp.cleanup_gpu_memory()
+    """
     gc.collect()
     cp.get_default_memory_pool().free_all_blocks()
     cp.get_default_pinned_memory_pool().free_all_blocks()
@@ -71,17 +77,25 @@ void compute_tsse_kernel(
 def load_tss_from_gtf(gtf_path: str | Path) -> 'pl.DataFrame':
     """
     Load TSS locations from a GTF file using Polars.
-    
+
     Parameters
     ----------
     gtf_path : str or Path
         Path to the GTF file.
-        
+
     Returns
     -------
     tss_df : pl.DataFrame
         DataFrame with columns: ['chrom', 'tss', 'strand']
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
+    >>> tss.columns
+    ['chrom', 'tss', 'strand']
     """
+
     import polars as pl
     
     logger.info(f"Loading TSS from {gtf_path} (Polars)")
@@ -155,7 +169,21 @@ def compute_metrics(
     -------
     results : cudf.DataFrame
         DataFrame with columns: ['barcode', 'tsse_score', 'n_unique', 'duplicate_fraction', 'mito_fraction']
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
+    >>> metrics = ga.pp.compute_metrics(
+    ...     "pbmc.parquet",
+    ...     tss_df=tss,
+    ...     min_unique_frags=100,
+    ...     exclude_chroms=["chrM", "M"],
+    ... )
+    >>> metrics.columns.tolist()
+    ['barcode', 'tsse_score', 'n_unique', 'duplicate_fraction', 'mito_fraction']
     """
+
     import polars as pl
     import pyarrow.parquet as pq
     

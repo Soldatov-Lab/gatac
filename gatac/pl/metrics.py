@@ -53,6 +53,12 @@ def qc_metrics(
     -------
     matplotlib.figure.Figure
         The figure containing all three panels.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> metrics = ga.pp.compute_metrics("pbmc.parquet", tss)
+    >>> fig = ga.pl.qc_metrics(metrics, tsse_threshold=5.0, n_unique_threshold=1000)
     """
     import pandas as pd
 

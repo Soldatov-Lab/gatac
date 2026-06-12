@@ -47,7 +47,7 @@ ga.pp.select_features(adata, n_features=500_000)
 ga.tl.spectral(adata)
 
 # 6. Call peaks
-ga.tl.call_peaks(adata, group_by="cell_type", fragment_source="sample.parquet")
+ga.tl.call_peaks(adata, groupby="cell_type", parquet_path="sample.parquet")
 
 # 7. Motif enrichment
 ga.tl.chromvar(

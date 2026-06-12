@@ -600,7 +600,18 @@ def detect_doublets(
     behaviour of the original AMULET v1.1 tool (``human_autosomes.txt``).
     AMULET's Poisson model assumes a uniform single-copy background
     signal which is not valid for chrX, chrY, chrM, or unplaced contigs.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> result = ga.pp.detect_doublets("pbmc.parquet", chrom_sizes="hg38")
+    >>> result.columns.tolist()
+    ['cell_id', 'p_value', 'q_value', 'is_doublet']
+    >>> # Filter cells to keep only singlets
+    >>> doublets = set(result.loc[result["is_doublet"], "cell_id"])
+    >>> keep = adata[~adata.obs_names.isin(doublets)].copy()
     """
+
     if isinstance(chrom_sizes, str):
         chrom_sizes = get_chrom_sizes(chrom_sizes)
 

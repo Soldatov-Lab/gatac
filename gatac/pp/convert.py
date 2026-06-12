@@ -49,6 +49,13 @@ def make_parquet(
     -------
     Path
         Path to the created Parquet file.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> out = ga.pp.make_parquet("pbmc.tsv.gz")
+    >>> # Or with a sample-specific barcode prefix
+    >>> out = ga.pp.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1#")
     """
     input_path = Path(input_path)
     if output_path is None:
@@ -129,6 +136,20 @@ def make_parquet_batch(
     Exception
         Re-raises the first worker exception encountered so the caller
         can handle it.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> # Convert multiple samples in parallel
+    >>> paths = ga.pp.make_parquet_batch(
+    ...     ["sampleA.tsv.gz", "sampleB.tsv.gz"],
+    ...     output_dir="parquet/",
+    ... )
+    >>> # With per-sample barcode prefixes (must match input order)
+    >>> paths = ga.pp.make_parquet_batch(
+    ...     ["sampleA.tsv.gz", "sampleB.tsv.gz"],
+    ...     barcode_prefix=["A_", "B_"],
+    ... )
     """
     input_paths = [Path(p) for p in input_paths]
 

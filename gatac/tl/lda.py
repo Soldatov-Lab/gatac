@@ -58,7 +58,16 @@ class MiniBatchLDA:
         Random seed.
     verbose : bool
         Print epoch progress.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> model = ga.tl.MiniBatchLDA(n_topics=20, n_epochs=10, verbose=True)
+    >>> model.fit_transform(peak_adata.X, binarize=True)
+    >>> # Inspect the most-weighted peaks per topic
+    >>> top = model.top_peaks(peak_adata.var_names, n_top=20)
     """
+
 
     def __init__(
         self,
@@ -457,7 +466,16 @@ def lda(
 
         - ``adata.obsm[key_saved]``: topic proportions *(n_cells, n_topics)*
         - ``adata.varm['lda_topics']``: peak loadings per topic *(n_peaks, n_topics)*
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> model = ga.tl.lda(adata, n_topics=20, n_epochs=10)
+    >>> # Cell × topic proportions are stored in adata.obsm["X_lda"]
+    >>> adata.obsm["X_lda"].shape
+    (n_cells, 20)
     """
+
     X = adata.X if layer is None else adata.layers[layer]
     model = MiniBatchLDA(
         n_topics=n_topics,

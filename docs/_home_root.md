@@ -61,25 +61,24 @@ View Tutorials
 Convert raw TSV.GZ fragment files to columnar Parquet for fast GPU streaming,
 with optional barcode prefixing for multi-sample projects.
 
-[→ CLI: convert](cli/convert)
+<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/preprocessing.html#fragment-i-o">→ API: pp</a>
 :::
 
-:::{grid-item-card} {fas}`chart-bar` Quality Metrics
+:::{grid-item-card} {fas}`filter` Quality & Filtering
 :shadow: none
 
-Stream-compute **TSS enrichment**, unique fragment count, duplicate rate, and
-mito fraction entirely on GPU without loading the full file into memory.
+GPU QC metrics (**TSSe**, unique fragments, duplicate & mito fraction) plus
+threshold-based barcode filtering via a Polars query engine.
 
-[→ CLI: metrics](cli/metrics)
+<a href="cli/metrics.html">→ CLI: metrics</a> · <a href="cli/filter.html">→ CLI: filter</a> · <a href="api/preprocessing.html#quality-metrics-filtering">→ API: pp</a>
 :::
 
-:::{grid-item-card} {fas}`filter` Fragment Filtering
+:::{grid-item-card} {fas}`clone` Doublet Detection
 :shadow: none
 
-Filter barcodes by arbitrary metric thresholds (e.g. `tsse_score > 5`) using a
-Polars query engine backed by GPU execution.
+Flag doublet / multiplet cells via the **AMULET** Poisson overlap test.
 
-[→ CLI: filter](cli/filter)
+<a href="cli/doublets.html">→ CLI: doublets</a> · <a href="api/preprocessing.html#quality-metrics-filtering">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`th` Tile Matrix
@@ -88,7 +87,7 @@ Polars query engine backed by GPU execution.
 Bin the genome into fixed-size tiles and produce a sparse cell × bin count
 matrix compatible with SnapATAC2.
 
-[→ CLI: tile](cli/tile)
+<a href="cli/tile.html">→ CLI: tile</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`dna` Gene Activity
@@ -97,7 +96,7 @@ matrix compatible with SnapATAC2.
 Score gene activity from paired insertion counts over promoter + gene body
 regions using a GTF annotation.
 
-[→ CLI: gene](cli/gene)
+<a href="cli/gene.html">→ CLI: gene</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`sliders` Feature Selection
@@ -106,7 +105,7 @@ regions using a GTF annotation.
 GPU-accelerated selection of the most accessible genomic features across one
 or many h5ad files using streaming aggregation.
 
-[→ CLI: features](cli/features)
+<a href="cli/features.html">→ CLI: features</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`project-diagram` Spectral Embedding
@@ -115,7 +114,7 @@ or many h5ad files using streaming aggregation.
 Spectral decomposition of the cell × feature matrix for dimensionality
 reduction, UMAP, and clustering.
 
-<a href="api/tools#spectral-embedding">→ API: tl.spectral</a>
+<a href="api/tools.html#dimensionality-reduction">→ API: tl</a>
 :::
 
 :::{grid-item-card} {fas}`mountain` Peak Calling
@@ -124,7 +123,7 @@ reduction, UMAP, and clustering.
 Call peaks per cell-type group, merge overlapping peaks across groups, and
 build a cell × peak count matrix.
 
-<a href="api/tools#call-peaks">→ API: tl.call_peaks</a>
+<a href="api/tools.html#peak-calling-marker-peaks">→ API: tl</a>
 :::
 
 :::{grid-item-card} {fas}`dna` Motif Analysis
@@ -133,7 +132,7 @@ build a cell × peak count matrix.
 Scan peaks for TF binding motifs (MEME format), run motif enrichment tests,
 and compute chromVAR deviation scores.
 
-<a href="api/tools#chromvar">→ API: tl.chromvar</a>
+<a href="api/tools.html#chromvar">→ API: tl</a>
 :::
 
 ::::

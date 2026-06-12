@@ -6,25 +6,21 @@ Starting from raw fragment files, it produces analysis-ready sparse matrices
 [scverse](https://scverse.org) ecosystem — AnnData, Scanpy, and SnapATAC2.
 Computations are offloaded to the GPU via [RAPIDS cuDF](https://rapids.ai),
 [CuPy](https://cupy.dev), and [cuML](https://docs.rapids.ai/api/cuml/stable/),
-delivering 10× speedups over CPU-only workflows on typical single-cell
+delivering 10–50× speedups over CPU-only workflows on typical single-cell
 datasets.
 
-GATAC workflow takes advantage of [Apache Parquet](https://parquet.apache.org) file format. Parquet's columnar layout and
-built-in compression make it an ideal staging format for GPU-based pipelines:
-columns are read independently, so only the genomic coordinates actually needed
-for a given operation are transferred to device memory. RAPIDS cuDF can read
-Parquet directly into GPU memory with zero CPU round-trips, enabling streaming
-aggregation over datasets that far exceed the size of available GPU RAM.
+---
 
 ::::{grid} 1 1 2 2
 :gutter: 3
 
-:::{grid-item-card} GPU-Accelerated ATAC-seq Processing
+:::{grid-item-card} Parquet-Native Pipeline
 :shadow: none
 
-**GATAC** is a GPU-accelerated toolkit for ATAC-seq data processing — from raw
-fragment files to analysis-ready matrices.  It leverages **RAPIDS cuDF**,
-**CuPy**, and **cuML** to deliver 10–50× speedups over CPU-only tools.
+GATAC uses [Apache Parquet](https://parquet.apache.org) as its staging format.
+Columnar layout and built-in compression let RAPIDS cuDF stream data directly
+into GPU memory with zero CPU round-trips — enabling aggregation over datasets
+that far exceed available GPU RAM.
 
 +++
 ```{button-link} installation.html
@@ -37,7 +33,10 @@ Get started
 :::{grid-item-card} Ecosystem Integration
 :shadow: none
 
-GATAC [reproduces](reproducibility) the core operations and functions of established tools like **SnapATAC2**, **ArchR**, **MACS3**, and **chromVAR** within a unified framework. It produces standard **AnnData** objects that are fully compatible with the **scverse** ecosystem.
+GATAC [reproduces](reproducibility) the core operations of established tools
+like **SnapATAC2**, **ArchR**, **MACS3**, and **chromVAR** within a unified
+framework. It produces standard **AnnData** objects fully compatible with the
+**scverse** ecosystem.
 
 +++
 ```{button-link} tutorials/index.html

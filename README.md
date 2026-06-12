@@ -55,6 +55,12 @@ gatac gene fragments.parquet -g annotations.gtf
 # Generate gene activity matrix with filtering
 gatac gene fragments.parquet -g annotations.gtf --metrics metrics.csv --filter "tsse_score > 5"
 
+# Generate ArchR-style distance-weighted gene activity SCORE matrix
+gatac genescore fragments.parquet -g annotations.gtf
+
+# Gene score with a custom gene model (function of distance x to the TSS)
+gatac genescore fragments.parquet -g annotations.gtf --gene-model "exp(-abs(x)/10000) + exp(-1)"
+
 # Feature selection (single file)
 gatac features tile_matrix.h5ad -n 500000
 
@@ -108,6 +114,19 @@ adata_gene = ga.pp.make_gene_matrix(
     gene_anno="annotations.gtf",
     metrics=metrics,
     filter_query="tsse_score > 5"
+)
+
+# Create ArchR-style distance-weighted gene activity SCORE matrix
+# (faithful GPU port of ArchR addGeneScoreMatrix; defaults match ArchR)
+adata_score = ga.pp.make_gene_score_matrix(
+    "fragments.parquet",
+    gene_anno="annotations.gtf",      # GTF/GFF, or CSV: symbol,seqnames,start,end,strand
+    gene_model="exp(-abs(x)/5000) + exp(-1)",
+    tile_size=500,
+    extend_upstream=(1000, 100000),
+    extend_downstream=(1000, 100000),
+    use_gene_boundaries=True,
+    scale_to=10000,
 )
 
 # Filter fragments by minimum fragment count

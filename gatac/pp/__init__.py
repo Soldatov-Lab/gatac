@@ -2,6 +2,7 @@ from .convert import make_parquet, make_parquet_batch
 from .process import read_fragments_parquet, combine
 from .tile import make_tile_matrix
 from .gene import make_gene_matrix
+from .genescore import make_gene_score_matrix
 from .features import select_features, select_features_multi
 from .metrics import (
     load_tss_from_gtf,
@@ -26,6 +27,7 @@ __all__ = [
     "make_parquet_batch",
     "make_tile_matrix",
     "make_gene_matrix",
+    "make_gene_score_matrix",
     "read_fragments_parquet",
     "select_features",
     "select_features_multi",

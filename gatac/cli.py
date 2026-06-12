@@ -291,6 +291,52 @@ def gene_command(args):
         sys.exit(1)
 
 
+def genescore_command(args):
+    """Handle 'gatac genescore' subcommand."""
+    from .pp.genescore import make_gene_score_matrix
+
+    input_path = Path(args.input)
+    anno_path = Path(args.gtf)
+
+    if not input_path.exists():
+        logging.error(f"Input file not found: {input_path}")
+        sys.exit(1)
+    if not anno_path.exists():
+        logging.error(f"Gene annotation file not found: {anno_path}")
+        sys.exit(1)
+
+    try:
+        make_gene_score_matrix(
+            input_parquet=input_path,
+            gene_anno=anno_path,
+            output_path=args.output,
+            gene_model=args.gene_model,
+            tile_size=args.tile_size,
+            extend_upstream=tuple(args.extend_upstream),
+            extend_downstream=tuple(args.extend_downstream),
+            gene_upstream=args.gene_upstream,
+            gene_downstream=args.gene_downstream,
+            use_gene_boundaries=args.use_gene_boundaries,
+            use_tss=args.use_tss,
+            ceiling=args.ceiling,
+            gene_scale_factor=args.gene_scale_factor,
+            scale_to=args.scale_to,
+            exclude_chroms=args.exclude_chroms,
+            min_fragments_per_cell=args.min_fragments,
+            metrics=args.metrics,
+            filter_query=args.filter_query,
+            barcode_prefix=args.barcode_prefix,
+            low_memory=args.low_memory,
+            cell_batch_size=args.cell_batch_size,
+        )
+    except ValueError as e:
+        logging.error(str(e))
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Error creating gene score matrix: {e}")
+        sys.exit(1)
+
+
 def filter_command(args):
     """Handle 'gatac filter' subcommand."""
     import glob
@@ -710,6 +756,61 @@ def main():
         help='Use low memory mode for Parquet reading'
     )
     gene_parser.set_defaults(func=gene_command)
+
+    # Gene score subcommand (ArchR-style distance-weighted gene activity)
+    genescore_parser = subparsers.add_parser(
+        'genescore',
+        help='Generate ArchR-style distance-weighted gene activity score matrix',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    genescore_parser.add_argument('input', help='Input .parquet file')
+    genescore_parser.add_argument(
+        '-g', '--gtf', required=True,
+        help='GTF/GFF annotation, or CSV with columns symbol,seqnames,start,end,strand'
+    )
+    genescore_parser.add_argument('-o', '--output', help='Output .h5ad file')
+    genescore_parser.add_argument(
+        '--gene-model', default='exp(-abs(x)/5000) + exp(-1)',
+        help='ArchR geneModel expression in x (signed distance to TSS)'
+    )
+    genescore_parser.add_argument('--tile-size', type=int, default=500, help='Tile size (bp)')
+    genescore_parser.add_argument(
+        '--extend-upstream', type=int, nargs=2, default=[1000, 100000],
+        metavar=('MIN', 'MAX'), help='Min/max bp upstream extension'
+    )
+    genescore_parser.add_argument(
+        '--extend-downstream', type=int, nargs=2, default=[1000, 100000],
+        metavar=('MIN', 'MAX'), help='Min/max bp downstream extension'
+    )
+    genescore_parser.add_argument('--gene-upstream', type=int, default=5000,
+                                  help='bp the gene body is grown upstream')
+    genescore_parser.add_argument('--gene-downstream', type=int, default=0,
+                                  help='bp the gene body is grown downstream')
+    genescore_parser.add_argument(
+        '--no-gene-boundaries', action='store_false', dest='use_gene_boundaries',
+        default=True, help='Disable neighbouring-gene boundary clipping'
+    )
+    genescore_parser.add_argument('--use-tss', action='store_true',
+                                  help='Build model on 1bp TSS instead of gene body')
+    genescore_parser.add_argument('--ceiling', type=int, default=4,
+                                  help='Max insertions counted per tile')
+    genescore_parser.add_argument('--gene-scale-factor', type=float, default=5.0,
+                                  help='Inverse-gene-width weighting scale factor')
+    genescore_parser.add_argument('--scale-to', type=float, default=10000.0,
+                                  help='Per-cell normalisation target')
+    genescore_parser.add_argument('-e', '--exclude-chroms', nargs='+',
+                                  default=['chrY', 'chrM'], help='Chromosomes to exclude')
+    genescore_parser.add_argument('-m', '--min-fragments', type=int, default=100,
+                                  help='Min fragments per cell')
+    genescore_parser.add_argument('--metrics', help='CSV of quality metrics for filtering')
+    genescore_parser.add_argument('--filter', dest='filter_query',
+                                  help='Filtering query string (e.g., "tsse_score > 5")')
+    genescore_parser.add_argument('--barcode-prefix', help='Prefix to add to barcodes')
+    genescore_parser.add_argument('--low-memory', action='store_true',
+                                  help='Use low memory mode for Parquet reading')
+    genescore_parser.add_argument('--cell-batch-size', type=int, default=None,
+                                  help='Process cells in column batches (lower GPU memory)')
+    genescore_parser.set_defaults(func=genescore_command)
 
     # Doublets subcommand
     doublets_parser = subparsers.add_parser(

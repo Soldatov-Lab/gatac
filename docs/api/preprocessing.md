@@ -22,7 +22,6 @@ larger than GPU memory.
    make_parquet
    make_parquet_batch
    read_fragments_parquet
-   combine
 ```
 
 ---
@@ -41,15 +40,6 @@ GPU memory simultaneously.
    compute_metrics
    load_tss_from_gtf
 ```
-
-### Computed metrics
-
-| Column | Description |
-|--------|-------------|
-| `tsse_score` | TSS enrichment score |
-| `n_unique` | Number of unique fragments per barcode |
-| `duplicate_fraction` | Fraction of duplicate fragments |
-| `mito_fraction` | Fraction of mitochondrial fragments |
 
 ---
 
@@ -80,41 +70,11 @@ cell.  The default count strategy (`"unique"`) is compatible with SnapATAC2.
    :nosignatures:
 
    make_tile_matrix
-```
-
-### Count strategies
-
-| Strategy | Description |
-|----------|-------------|
-| `"unique"` | Count unique insertions per tile (SnapATAC2-compatible, **default**) |
-| `"count"` | Count all fragment insertions |
-| `"binarize"` | Binary accessibility (0/1) |
-
-### Built-in genomes
-
-GATAC ships chromosome-size dictionaries for common reference genomes:
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
    HG38
    HG19
    MM10
    MM39
 ```
-
-You can also pass a genome name string directly:
-
-```python
-adata = ga.pp.make_tile_matrix("pbmc.parquet", chrom_sizes="hg38")
-```
-
-`make_tile_matrix` also accepts `.h5ad` and 10x `.h5` matrices when their
-feature names contain genomic intervals such as `chr1:100-200` (or
-`chr1;100-200`). In that mode, GATAC keeps only interval-like features and
-aggregates them into fixed tiles by overlap.
 
 ---
 
@@ -133,11 +93,11 @@ gene-body regions defined by a GTF annotation.
 
 ---
 
-## Feature selection
+## h5ad processing
 
-Select the most accessible genomic features from a tile matrix.  GPU-
-accelerated quantile-based selection following the ArchR approach for binary
-matrices.
+Operations on existing cell × feature `.h5ad` matrices: combine multiple
+samples into a single file, and select the most accessible genomic features
+across one or many matrices.
 
 ```{eval-rst}
 .. autosummary::
@@ -146,4 +106,5 @@ matrices.
 
    select_features
    select_features_multi
+   combine
 ```

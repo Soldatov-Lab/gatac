@@ -27,7 +27,7 @@ fragment files to analysis-ready matrices.  It leverages **RAPIDS cuDF**,
 **CuPy**, and **cuML** to deliver 10–50× speedups over CPU-only tools.
 
 +++
-```{button-link} installation
+```{button-link} installation.html
 :color: primary
 :outline:
 Get started
@@ -40,7 +40,7 @@ Get started
 GATAC [reproduces](reproducibility) the core operations and functions of established tools like **SnapATAC2**, **ArchR**, **MACS3**, and **chromVAR** within a unified framework. It produces standard **AnnData** objects that are fully compatible with the **scverse** ecosystem.
 
 +++
-```{button-link} tutorials/index
+```{button-link} tutorials/index.html
 :color: success
 :outline:
 View Tutorials

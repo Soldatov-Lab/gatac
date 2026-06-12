@@ -8,7 +8,6 @@ Implementation:
 from __future__ import annotations
 
 import logging
-import gc
 from pathlib import Path
 from typing import Optional, List
 
@@ -17,20 +16,9 @@ import cupy as cp
 import cupyx
 import numpy as np
 
+from ._utils import cleanup_gpu_memory
+
 logger = logging.getLogger(__name__)
-
-
-def cleanup_gpu_memory():
-    """Force cleanup of GPU memory.
-
-    Examples
-    --------
-    >>> import gatac as ga
-    >>> ga.pp.cleanup_gpu_memory()
-    """
-    gc.collect()
-    cp.get_default_memory_pool().free_all_blocks()
-    cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
 _TSSE_KERNEL = cp.RawKernel(r'''

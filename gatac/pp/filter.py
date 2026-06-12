@@ -6,7 +6,6 @@ This module provides functions to filter fragment data based on cell quality met
 from __future__ import annotations
 
 import logging
-import gc
 from pathlib import Path
 from typing import Optional, Union, List
 
@@ -14,14 +13,9 @@ import cudf
 import cupy as cp
 import pandas as pd
 
+from ._utils import cleanup_gpu_memory
+
 logger = logging.getLogger(__name__)
-
-
-def cleanup_gpu_memory():
-    """Force cleanup of GPU memory."""
-    gc.collect()
-    cp.get_default_memory_pool().free_all_blocks()
-    cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
 def filter_fragments(

@@ -1,12 +1,7 @@
 # API Reference
 
 GATAC's Python API is organized into two namespaces that mirror the
-preprocessing → analysis workflow:
-
-| Namespace | Description |
-|-----------|-------------|
-| `gatac.pp` | **Preprocessing** — fragment I/O, matrix building, QC metrics, filtering |
-| `gatac.tl` | **Tools** — spectral embedding, peak calling, motif analysis, chromVAR, LDA |
+preprocessing → analysis workflow.
 
 ```{toctree}
 :maxdepth: 2
@@ -15,6 +10,29 @@ preprocessing → analysis workflow:
 preprocessing
 tools
 ```
+
+::::{grid} 1 1 2 2
+:gutter: 2
+
+:::{grid-item-card} {fas}`cogs` Preprocessing — `gatac.pp`
+:link: preprocessing
+:link-type: doc
+:shadow: none
+
+Fragment I/O, tile/gene matrix construction, QC metrics, filtering, and
+feature selection.
+:::
+
+:::{grid-item-card} {fas}`chart-line` Tools — `gatac.tl`
+:link: tools
+:link-type: doc
+:shadow: none
+
+Spectral embedding, LDA, peak calling, marker peaks, motif enrichment,
+chromVAR, and GSEA.
+:::
+
+::::
 
 ---
 
@@ -56,29 +74,3 @@ ga.tl.chromvar(
 )
 ```
 
----
-
-## Submodule pages
-
-::::{grid} 1 1 2 2
-:gutter: 2
-
-:::{grid-item-card} {fas}`cogs` Preprocessing — `gatac.pp`
-:link: preprocessing
-:link-type: doc
-:shadow: none
-
-Fragment I/O, tile/gene matrix construction, QC metrics, filtering, and
-feature selection.
-:::
-
-:::{grid-item-card} {fas}`chart-line` Tools — `gatac.tl`
-:link: tools
-:link-type: doc
-:shadow: none
-
-Spectral embedding, LDA, peak calling, marker peaks, motif enrichment,
-chromVAR, and GSEA.
-:::
-
-::::

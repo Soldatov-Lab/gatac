@@ -8,10 +8,10 @@ scoring, and topic modelling.
 
 ## Dimensionality reduction
 
-### Spectral embedding
-
 Compute a spectral decomposition of the cell × feature matrix — the standard
-entry point for UMAP and clustering in ATAC-seq workflows.
+entry point for UMAP and clustering in ATAC-seq workflows (`spectral`) — or
+model topics over the peak-accessibility matrix with GPU-accelerated
+mini-batch Online Variational Bayes (`lda`, `MiniBatchLDA`).
 
 ```{eval-rst}
 .. currentmodule:: gatac.tl
@@ -21,30 +21,18 @@ entry point for UMAP and clustering in ATAC-seq workflows.
    :nosignatures:
 
    spectral
-```
-
----
-
-### Latent Dirichlet Allocation
-
-Topic modelling of the peak-accessibility matrix using GPU-accelerated
-mini-batch Online Variational Bayes.
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
    lda
    MiniBatchLDA
 ```
 
 ---
 
-## Peak calling
+## Peak calling & marker peaks
 
 Call ATAC peaks per cell-type group using the MACS3 algorithm under the hood,
-merge them into a non-overlapping set, and count fragments over peaks.
+merge them into a non-overlapping set, count fragments over peaks, and
+identify differentially accessible peaks between groups using a GPU-
+accelerated binomial test with Benjamini–Hochberg correction.
 
 ```{eval-rst}
 .. autosummary::
@@ -54,20 +42,6 @@ merge them into a non-overlapping set, and count fragments over peaks.
    call_peaks
    merge_peaks
    make_peak_matrix
-```
-
----
-
-## Marker peaks
-
-Identify differentially accessible peaks between groups using a GPU-
-accelerated binomial test with Benjamini–Hochberg correction.
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
    marker_peaks
    get_marker_peaks
 ```

@@ -1,7 +1,3 @@
----
-sd_hide_title: true
----
-
 ```{toctree}
 :hidden:
 :caption: General
@@ -27,10 +23,10 @@ cli/index
 :caption: About
 :maxdepth: 1
 
-../reproducibility/README
+reproducibility
 license
 credits
 ```
 
-```{include} _home.md
+```{include} _home_root.md
 ```

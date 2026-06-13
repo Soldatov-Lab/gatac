@@ -40,10 +40,18 @@ def read_fragments_parquet(
     """
     Read ATAC fragments from Parquet file optimized for GPU memory.
 
-    Note: Parquet files contain intrinsic schema metadata. This function 
+    Note: Parquet files contain intrinsic schema metadata. This function
     expects the file to contain columns matching FRAGMENT_DTYPES keys:
     ['chrom', 'start', 'end', 'barcode', 'count'].
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> df = ga.pp.read_fragments_parquet("pbmc.parquet")
+    >>> df.columns.tolist()
+    ['chrom', 'start', 'end', 'barcode', 'count']
     """
+
     if columns is None:
         columns = list(FRAGMENT_DTYPES.keys())
         
@@ -74,7 +82,16 @@ def combine(
         List of paths to h5ad files
     output_path : str or Path
         Output path for combined h5ad file
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.pp.combine(
+    ...     ["sampleA.h5ad", "sampleB.h5ad"],
+    ...     "combined.h5ad",
+    ... )
     """
+
     input_paths = [Path(p) for p in input_paths]
     output_path = Path(output_path)
 

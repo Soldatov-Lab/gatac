@@ -1,8 +1,16 @@
 """
 AMULET doublet/multiplet detection for single-cell ATAC-seq.
 
-Implements the original AMULET (Atac-seq MULtiplet Estimation Tool) algorithm
-of Thibodeau et al. (2021) as a GATAC-native preprocessing step.
+Direct port of the AMULET (Atac-seq MULtiplet Estimation Tool) algorithm of
+Thibodeau et al. (2021) to the GATAC data model.
+
+The overlap-detection sweep-line, the per-cell Poisson scoring, the row-sum
+Poisson repeat-inference, and the BH-FDR correction are translated
+line-for-line from the upstream Python source (`FragmentFileOverlapCounter.py`
+and `AMULET.py`). The data flow has been rewritten to operate on GATAC's
+parquet fragment files via DuckDB and to parallelize per-chromosome with a
+worker pool; the optional repeat-filter pass is applied at the raw-read level
+rather than the overlap level.
 
 The method detects cells whose fragments show an abnormally high number of
 overlapping insertions, which is characteristic of doublets or multiplets
@@ -592,7 +600,18 @@ def detect_doublets(
     behaviour of the original AMULET v1.1 tool (``human_autosomes.txt``).
     AMULET's Poisson model assumes a uniform single-copy background
     signal which is not valid for chrX, chrY, chrM, or unplaced contigs.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> result = ga.pp.detect_doublets("pbmc.parquet", chrom_sizes="hg38")
+    >>> result.columns.tolist()
+    ['cell_id', 'p_value', 'q_value', 'is_doublet']
+    >>> # Filter cells to keep only singlets
+    >>> doublets = set(result.loc[result["is_doublet"], "cell_id"])
+    >>> keep = adata[~adata.obs_names.isin(doublets)].copy()
     """
+
     if isinstance(chrom_sizes, str):
         chrom_sizes = get_chrom_sizes(chrom_sizes)
 

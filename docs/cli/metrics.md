@@ -76,10 +76,9 @@ gatac metrics pbmc.parquet -g GRCh38.gtf.gz \
 ```python
 import gatac as ga
 
-tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
 metrics = ga.pp.compute_metrics(
     "pbmc.parquet",
-    tss_df=tss,
+    "GRCh38.gtf.gz",
     min_unique_frags=100,
     row_groups_per_batch=64,
 )

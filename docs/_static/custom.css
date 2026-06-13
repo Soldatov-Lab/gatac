@@ -5,6 +5,17 @@
   --gatac-green:     #73b301;   /* logo green */
   --gatac-green-dark:#5a8c00;
   --gatac-gpu:       #76b900;   /* NVIDIA green */
+  --pst-color-link-hover: var(--gatac-green);
+  --pst-color-secondary: var(--gatac-green);
+}
+
+html[data-theme="light"] {
+  --pst-color-secondary: var(--gatac-green);
+}
+
+html[data-theme="dark"] {
+  --pst-color-link-hover: var(--gatac-green);
+  --pst-color-secondary: var(--gatac-green);
 }
 
 /* ── Logo spacing ────────────────────────────────────────────────────────── */
@@ -15,7 +26,8 @@
 }
 
 /* ── Toctree caption headings (sidebar section labels) ───────────────────── */
-p.caption .caption-text {
+p.caption .caption-text,
+.bd-sidebar-secondary .onthispage {
   color: var(--gatac-green);
   font-weight: 600;
   text-transform: uppercase;
@@ -78,6 +90,21 @@ div.admonition.tip > p.admonition-title::before {
   font-weight: 600;
 }
 
+/* ── Back-to-top button ──────────────────────────────────────────────────── */
+#pst-back-to-top {
+  background-color: var(--gatac-green);
+  color: #fff;
+}
+
+#pst-back-to-top:hover {
+  background-color: var(--gatac-green-dark);
+  color: #fff;
+}
+
+#pst-back-to-top:focus-visible {
+  outline-color: var(--gatac-green);
+}
+
 /* ── Footer ──────────────────────────────────────────────────────────────── */
 footer.bd-footer {
   border-top: 1px solid var(--pst-color-border);
@@ -105,10 +132,28 @@ table.docutils {
   display: block;
 }
 
+/* ── Heading anchor links ─────────────────────────────────────────────────── */
+a.headerlink {
+  color: var(--gatac-green);
+}
+
+a.headerlink:hover {
+  color: var(--gatac-green-dark);
+}
+
+/* ── Notebook output images ──────────────────────────────────────────────── */
+/* Override the fixed width/height attributes baked into notebook outputs so
+   images scale responsively with the page width.                             */
+.cell_output img,
+.output img {
+  max-width: 100%;
+  height: auto !important;
+  width: auto !important;
+}
+
 /* ── Dark mode overrides ─────────────────────────────────────────────────── */
 html[data-theme="dark"] {
-  --gatac-green: #3fb950;
-  --gatac-blue:  #58a6ff;
+  --gatac-blue: #58a6ff;
 }
 
 html[data-theme="dark"] code.literal {

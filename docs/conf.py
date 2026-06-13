@@ -113,39 +113,16 @@ intersphinx_timeout = 5  # seconds; avoids hanging on blocked network in CI/HPC
 copybutton_prompt_text = r">>> |\.\.\. |\$ "
 copybutton_prompt_is_regexp = True
 
-# With SOURCEDIR set to the repo root (see docs/Makefile), Sphinx uses a small
-# top-level landing page as the root document and keeps the main docs homepage
-# under docs/index.md.
+# Top-level landing page; main content lives next to conf.py in the docs/ tree.
 root_doc = "index"
 
 templates_path = ["_templates"]
 exclude_patterns = [
-    "docs/_build",
-    "docs/_templates/**",
-    "**/Thumbs.db",
-    "**/.DS_Store",
-    "**/.ipynb_checkpoints",
-    # Non-docs repo content
-    "gatac/**",
-    "tests/**",
-    "data/**",
-    "refs/**",
-    ".git/**",
-    ".venv/**",
-    ".pytest_cache/**",
-    "__pycache__/**",
-    "*.log",
-    # Top-level files not part of the docs
-    "*.py",
-    "*.toml",
-    "*.lock",
-    "AGENTS.md",
-    "GEMINI.md",
-    "README.md",
-    "notebooks/README.md",
-    "reproducibility/AGENTS.md",
-    "reproducibility/GEMINI.md",
-    "reproducibility/.pixi/**",
+    "_build",
+    "_templates/**",
+    "Thumbs.db",
+    ".DS_Store",
+    ".ipynb_checkpoints",
 ]
 
 # -- Options for HTML output -------------------------------------------------

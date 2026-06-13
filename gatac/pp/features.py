@@ -200,7 +200,14 @@ def select_features(
     -------
     adata : AnnData or None
         Modified AnnData if inplace=False, else None
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.pp.select_features(adata, n_features=500_000)
+    >>> # adata.var["selected"] is now a boolean mask of the chosen features
     """
+
     logger.info(f"Selecting features from {adata.shape[1]:,} total")
 
     # Detect if matrix is binary
@@ -281,7 +288,17 @@ def select_features_multi(
         Chunk size for row processing (default: 6000)
     binarize : bool
         Whether to binarize the output matrix (default: True)
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.pp.select_features_multi(
+    ...     ["sampleA.h5ad", "sampleB.h5ad"],
+    ...     output_path="combined.h5ad",
+    ...     n_features=500_000,
+    ... )
     """
+
     import anndata as ad
     import pandas as pd
     import scanpy as sc

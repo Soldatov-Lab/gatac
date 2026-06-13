@@ -22,31 +22,17 @@ larger than GPU memory.
    make_parquet
    make_parquet_batch
    read_fragments_parquet
-   combine
-```
-
-### Usage example
-
-```python
-import gatac as ga
-
-# Single file
-out = ga.pp.make_parquet("pbmc.tsv.gz")
-
-# Batch with per-sample barcode prefixes
-paths = ga.pp.make_parquet_batch(
-    ["sampleA.tsv.gz", "sampleB.tsv.gz"],
-    barcode_prefix=["A_", "B_"],
-)
 ```
 
 ---
 
-## Quality metrics
+## Quality metrics & filtering
 
 Compute TSS enrichment score and fragment-level statistics entirely on GPU
-using a streaming approach — the full fragment file never needs to reside in
-GPU memory simultaneously.
+using a streaming approach, filter barcodes by quality thresholds, and detect
+doublet / multiplet cells with the AMULET Poisson method.  `filter_fragments`
+accepts a pre-computed metrics DataFrame or CSV and a Polars query string;
+`detect_doublets` returns per-cell p/q values and an `is_doublet` flag.
 
 ```{eval-rst}
 .. autosummary::
@@ -54,69 +40,20 @@ GPU memory simultaneously.
    :nosignatures:
 
    compute_metrics
-   load_tss_from_gtf
-```
-
-### Computed metrics
-
-| Column | Description |
-|--------|-------------|
-| `tsse_score` | TSS enrichment score |
-| `n_unique` | Number of unique fragments per barcode |
-| `duplicate_fraction` | Fraction of duplicate fragments |
-| `mito_fraction` | Fraction of mitochondrial fragments |
-
-### Usage example
-
-```python
-tss = ga.pp.load_tss_from_gtf("GRCh38.gtf.gz")
-
-metrics = ga.pp.compute_metrics(
-    "pbmc.parquet",
-    tss_df=tss,
-    min_unique_frags=100,
-    exclude_chroms=["chrM", "M"],
-)
-
-# Plot QC
-import scanpy as sc
-import pandas as pd
-obs = metrics.to_pandas().set_index("barcode")
-```
-
----
-
-## Fragment filtering
-
-Filter barcodes by quality thresholds.  Accepts a pre-computed metrics
-DataFrame or CSV and a Polars query string.
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
    filter_fragments
-   cleanup_gpu_memory
-```
-
-### Usage example
-
-```python
-ga.pp.filter_fragments(
-    "pbmc.parquet",
-    metrics="pbmc_metrics.csv",
-    filter_query="tsse_score > 5 and n_unique > 1000",
-    output_parquet="pbmc_filtered.parquet",
-)
+   detect_doublets
 ```
 
 ---
 
-## Tile matrix
+## Matrix processing
 
-Bin the genome into fixed-size windows and accumulate fragment insertions per
-cell.  The default count strategy (`"unique"`) is compatible with SnapATAC2.
+Build cell × feature matrices from QC-filtered fragments, and post-process the
+resulting `.h5ad` files.  Includes fixed-width genomic bins (`make_tile_matrix`,
+compatible with SnapATAC2's count strategy), gene activity scores over a GTF
+annotation (`make_gene_matrix`), and operations on existing `.h5ad` files:
+combining samples (`combine`) and selecting the most accessible genomic
+features across one or many matrices (`select_features`, `select_features_multi`).
 
 ```{eval-rst}
 .. autosummary::
@@ -124,127 +61,8 @@ cell.  The default count strategy (`"unique"`) is compatible with SnapATAC2.
    :nosignatures:
 
    make_tile_matrix
-```
-
-### Count strategies
-
-| Strategy | Description |
-|----------|-------------|
-| `"unique"` | Count unique insertions per tile (SnapATAC2-compatible, **default**) |
-| `"count"` | Count all fragment insertions |
-| `"binarize"` | Binary accessibility (0/1) |
-
-### Built-in genomes
-
-GATAC ships chromosome-size dictionaries for common reference genomes:
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
-   HG38
-   HG19
-   MM10
-   MM39
-```
-
-You can also pass a genome name string directly:
-
-```python
-adata = ga.pp.make_tile_matrix("pbmc.parquet", chrom_sizes="hg38")
-```
-
-`make_tile_matrix` also accepts `.h5ad` and 10x `.h5` matrices when their
-feature names contain genomic intervals such as `chr1:100-200` (or
-`chr1;100-200`). In that mode, GATAC keeps only interval-like features and
-aggregates them into fixed tiles by overlap.
-
-Or a custom dict:
-
-```python
-adata = ga.pp.make_tile_matrix(
-    "pbmc.parquet",
-    chrom_sizes={"chr1": 248956422, "chr2": 242193529, ...},
-)
-```
-
-### Usage example
-
-```python
-adata = ga.pp.make_tile_matrix(
-    "pbmc_filtered.parquet",
-    chrom_sizes="hg38",
-    tile_size=500,
-    min_fragments_per_cell=200,
-    exclude_chroms=["chrM", "chrY"],
-)
-print(adata)  # AnnData object with n_obs × n_vars
-```
-
-```python
-adata = ga.pp.make_tile_matrix(
-    "filtered_peak_bc_matrix.h5",
-    chrom_sizes="hg38",
-    tile_size=500,
-)
-```
-
----
-
-## Gene activity matrix
-
-Score gene activity by counting paired fragment insertions over promoter and
-gene-body regions defined by a GTF annotation.
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
    make_gene_matrix
-```
-
-### Usage example
-
-```python
-adata_gene = ga.pp.make_gene_matrix(
-    "pbmc_filtered.parquet",
-    gene_anno="GRCh38.gtf.gz",
-    id_type="gene",
-    upstream=2000,
-    downstream=0,
-    include_gene_body=True,
-)
-```
-
----
-
-## Feature selection
-
-Select the most accessible genomic features from a tile matrix.  GPU-
-accelerated quantile-based selection following the ArchR approach for binary
-matrices.
-
-```{eval-rst}
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
    select_features
    select_features_multi
-```
-
-### Usage example
-
-```python
-# Single AnnData
-ga.pp.select_features(adata, n_features=500_000)
-
-# Multi-sample streaming
-ga.pp.select_features_multi(
-    ["sampleA.h5ad", "sampleB.h5ad"],
-    output_path="combined.h5ad",
-    n_features=500_000,
-)
+   combine
 ```

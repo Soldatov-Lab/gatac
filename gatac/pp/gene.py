@@ -733,7 +733,20 @@ def make_gene_matrix(
     -------
     adata : AnnData
         AnnData object with gene activity matrix
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> adata_gene = ga.pp.make_gene_matrix(
+    ...     "pbmc_filtered.parquet",
+    ...     gene_anno="GRCh38.gtf.gz",
+    ...     id_type="gene",
+    ...     upstream=2000,
+    ...     downstream=0,
+    ...     include_gene_body=True,
+    ... )
     """
+
     from .process import read_fragments_parquet
     import scanpy as sc
 

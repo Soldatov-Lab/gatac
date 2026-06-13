@@ -6,28 +6,24 @@ Starting from raw fragment files, it produces analysis-ready sparse matrices
 [scverse](https://scverse.org) ecosystem — AnnData, Scanpy, and SnapATAC2.
 Computations are offloaded to the GPU via [RAPIDS cuDF](https://rapids.ai),
 [CuPy](https://cupy.dev), and [cuML](https://docs.rapids.ai/api/cuml/stable/),
-delivering 10× speedups over CPU-only workflows on typical single-cell
+delivering 10–50× speedups over CPU-only workflows on typical single-cell
 datasets.
 
-GATAC workflow takes advantage of [Apache Parquet](https://parquet.apache.org) file format. Parquet's columnar layout and
-built-in compression make it an ideal staging format for GPU-based pipelines:
-columns are read independently, so only the genomic coordinates actually needed
-for a given operation are transferred to device memory. RAPIDS cuDF can read
-Parquet directly into GPU memory with zero CPU round-trips, enabling streaming
-aggregation over datasets that far exceed the size of available GPU RAM.
+---
 
 ::::{grid} 1 1 2 2
 :gutter: 3
 
-:::{grid-item-card} GPU-Accelerated ATAC-seq Processing
+:::{grid-item-card} Parquet-Native Pipeline
 :shadow: none
 
-**GATAC** is a GPU-accelerated toolkit for ATAC-seq data processing — from raw
-fragment files to analysis-ready matrices.  It leverages **RAPIDS cuDF**,
-**CuPy**, and **cuML** to deliver 10–50× speedups over CPU-only tools.
+GATAC uses [Apache Parquet](https://parquet.apache.org) as its staging format.
+Columnar layout and built-in compression let RAPIDS cuDF stream data directly
+into GPU memory with zero CPU round-trips — enabling aggregation over datasets
+that far exceed available GPU RAM.
 
 +++
-```{button-link} docs/installation.html
+```{button-link} installation.html
 :color: primary
 :outline:
 Get started
@@ -37,10 +33,13 @@ Get started
 :::{grid-item-card} Ecosystem Integration
 :shadow: none
 
-GATAC [reproduces](reproducibility/README.html) the core operations and functions of established tools like **SnapATAC2**, **ArchR**, **MACS3**, and **chromVAR** within a unified framework. It produces standard **AnnData** objects that are fully compatible with the **scverse** ecosystem.
+GATAC [reproduces](reproducibility) the core operations of established tools
+like **SnapATAC2**, **ArchR**, **MACS3**, and **chromVAR** within a unified
+framework. It produces standard **AnnData** objects fully compatible with the
+**scverse** ecosystem.
 
 +++
-```{button-link} docs/tutorials/index.html
+```{button-link} tutorials/index.html
 :color: success
 :outline:
 View Tutorials
@@ -62,25 +61,24 @@ View Tutorials
 Convert raw TSV.GZ fragment files to columnar Parquet for fast GPU streaming,
 with optional barcode prefixing for multi-sample projects.
 
-[→ CLI: convert](docs/cli/convert.html)
+<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/preprocessing.html#fragment-i-o">→ API: pp</a>
 :::
 
-:::{grid-item-card} {fas}`chart-bar` Quality Metrics
+:::{grid-item-card} {fas}`filter` Quality & Filtering
 :shadow: none
 
-Stream-compute **TSS enrichment**, unique fragment count, duplicate rate, and
-mito fraction entirely on GPU without loading the full file into memory.
+GPU QC metrics (**TSSe**, unique fragments, duplicate & mito fraction) plus
+threshold-based barcode filtering via a Polars query engine.
 
-[→ CLI: metrics](docs/cli/metrics.html)
+<a href="cli/metrics.html">→ CLI: metrics</a> · <a href="cli/filter.html">→ CLI: filter</a> · <a href="api/preprocessing.html#quality-metrics-filtering">→ API: pp</a>
 :::
 
-:::{grid-item-card} {fas}`filter` Fragment Filtering
+:::{grid-item-card} {fas}`clone` Doublet Detection
 :shadow: none
 
-Filter barcodes by arbitrary metric thresholds (e.g. `tsse_score > 5`) using a
-Polars query engine backed by GPU execution.
+Flag doublet / multiplet cells via the **AMULET** Poisson overlap test.
 
-[→ CLI: filter](docs/cli/filter.html)
+<a href="cli/doublets.html">→ CLI: doublets</a> · <a href="api/preprocessing.html#quality-metrics-filtering">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`th` Tile Matrix
@@ -89,7 +87,7 @@ Polars query engine backed by GPU execution.
 Bin the genome into fixed-size tiles and produce a sparse cell × bin count
 matrix compatible with SnapATAC2.
 
-[→ CLI: tile](docs/cli/tile.html)
+<a href="cli/tile.html">→ CLI: tile</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`dna` Gene Activity
@@ -98,7 +96,7 @@ matrix compatible with SnapATAC2.
 Score gene activity from paired insertion counts over promoter + gene body
 regions using a GTF annotation.
 
-[→ CLI: gene](docs/cli/gene.html)
+<a href="cli/gene.html">→ CLI: gene</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`sliders` Feature Selection
@@ -107,7 +105,7 @@ regions using a GTF annotation.
 GPU-accelerated selection of the most accessible genomic features across one
 or many h5ad files using streaming aggregation.
 
-[→ CLI: features](docs/cli/features.html)
+<a href="cli/features.html">→ CLI: features</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`project-diagram` Spectral Embedding
@@ -116,7 +114,7 @@ or many h5ad files using streaming aggregation.
 Spectral decomposition of the cell × feature matrix for dimensionality
 reduction, UMAP, and clustering.
 
-<a href="docs/api/tools.html#spectral-embedding">→ API: tl.spectral</a>
+<a href="api/tools.html#dimensionality-reduction">→ API: tl</a>
 :::
 
 :::{grid-item-card} {fas}`mountain` Peak Calling
@@ -125,7 +123,7 @@ reduction, UMAP, and clustering.
 Call peaks per cell-type group, merge overlapping peaks across groups, and
 build a cell × peak count matrix.
 
-<a href="docs/api/tools.html#call-peaks">→ API: tl.call_peaks</a>
+<a href="api/tools.html#peak-calling-marker-peaks">→ API: tl</a>
 :::
 
 :::{grid-item-card} {fas}`dna` Motif Analysis
@@ -134,7 +132,7 @@ build a cell × peak count matrix.
 Scan peaks for TF binding motifs (MEME format), run motif enrichment tests,
 and compute chromVAR deviation scores.
 
-<a href="docs/api/tools.html#chromvar">→ API: tl.chromvar</a>
+<a href="api/tools.html#chromvar">→ API: tl</a>
 :::
 
 ::::

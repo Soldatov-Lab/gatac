@@ -4,13 +4,10 @@ from .tile import make_tile_matrix
 from .gene import make_gene_matrix
 from .genescore import make_gene_score_matrix
 from .features import select_features, select_features_multi
-from .metrics import (
-    load_tss_from_gtf,
-    compute_metrics,
-    cleanup_gpu_memory
-)
+from .metrics import compute_metrics
 from .filter import filter_fragments
 from .amulet import detect_doublets
+from ._utils import cleanup_gpu_memory
 from .genome import HG38 as _HG38, HG19 as _HG19, MM10 as _MM10, MM39 as _MM39
 
 #: GRCh38 / hg38 chromosome sizes.
@@ -32,7 +29,6 @@ __all__ = [
     "select_features",
     "select_features_multi",
     "combine",
-    "load_tss_from_gtf",
     "compute_metrics",
     "cleanup_gpu_memory",
     "filter_fragments",

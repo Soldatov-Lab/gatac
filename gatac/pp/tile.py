@@ -802,7 +802,31 @@ def make_tile_matrix(
     -------
     adata : AnnData
         AnnData object with tile matrix
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> # From a GATAC parquet fragment file, using a built-in genome
+    >>> adata = ga.pp.make_tile_matrix(
+    ...     "pbmc_filtered.parquet",
+    ...     chrom_sizes="hg38",
+    ...     tile_size=500,
+    ...     min_fragments_per_cell=200,
+    ...     exclude_chroms=["chrM", "chrY"],
+    ... )
+    >>> # Or with a custom chromosome-sizes dict
+    >>> adata = ga.pp.make_tile_matrix(
+    ...     "pbmc_filtered.parquet",
+    ...     chrom_sizes={"chr1": 248956422, "chr2": 242193529},
+    ... )
+    >>> # From a 10x .h5 (or interval-like .h5ad) input
+    >>> adata = ga.pp.make_tile_matrix(
+    ...     "filtered_peak_bc_matrix.h5",
+    ...     chrom_sizes="hg38",
+    ...     tile_size=500,
+    ... )
     """
+
     from .genome import get_chrom_sizes
     if isinstance(chrom_sizes, str):
         chrom_sizes = get_chrom_sizes(chrom_sizes)

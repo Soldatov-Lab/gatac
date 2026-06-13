@@ -1,3 +1,5 @@
+.DS_Store
+
 data/*
 refs/*
 uv.lock
@@ -15,6 +17,7 @@ GEMINI.md
 __pycache__/
 
 # doc build related
+_build/
 docs/_build/
 docs/api/generated/
 

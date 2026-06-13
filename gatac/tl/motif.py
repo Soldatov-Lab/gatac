@@ -244,6 +244,21 @@ class DNAMotif:
         Transcription factor family
     pwm : np.ndarray
         Position weight matrix of shape (length, 4) with columns [A, C, G, T]
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from gatac.tl import DNAMotif
+    >>> pwm = np.array([
+    ...     [0.10, 0.10, 0.70, 0.10],   # strong G
+    ...     [0.70, 0.10, 0.10, 0.10],   # strong A
+    ...     [0.10, 0.10, 0.10, 0.70],   # strong T
+    ...     [0.25, 0.25, 0.25, 0.25],   # ambiguous
+    ... ])
+    >>> motif = DNAMotif(id="MA0001.1", pwm=pwm, name="Example-TF")
+    >>> len(motif)
+    4
+    >>> motif.info_content()  # total bits of information
     """
     
     def __init__(
@@ -391,21 +406,29 @@ class DNAMotif:
 def read_motifs(filename: Union[str, Path], unique: bool = True) -> list[DNAMotif]:
     """
     Read motifs from a MEME format file.
-    
+
     Parameters
     ----------
     filename : str or Path
         Path to MEME format file
     unique : bool, default True
-        A transcription factor may have multiple motifs. If True, 
+        A transcription factor may have multiple motifs. If True,
         only the motifs with the highest information content will be selected.
         This matches snapatac2's cis_bp(unique=True) behavior.
-        
+
     Returns
     -------
     list[DNAMotif]
         List of parsed motifs
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> motifs = ga.tl.read_motifs("cisBP_human.meme", unique=True)
+    >>> print(f"Loaded {len(motifs)} motifs")
+    >>> motifs[0].id, motifs[0].name
     """
+
     path = Path(filename)
     with open(path, 'r') as f:
         content = f.read()
@@ -431,17 +454,25 @@ def read_motifs(filename: Union[str, Path], unique: bool = True) -> list[DNAMoti
 def parse_meme(content: str) -> list[DNAMotif]:
     """
     Parse MEME format content into motifs.
-    
+
     Parameters
     ----------
     content : str
         MEME format file content
-        
+
     Returns
     -------
     list[DNAMotif]
         List of parsed motifs
+
+    Examples
+    --------
+    >>> from pathlib import Path
+    >>> from gatac.tl import parse_meme
+    >>> content = Path("cisBP_human.meme").read_text()
+    >>> motifs = parse_meme(content)
     """
+
     motifs = []
     
     # Split by MOTIF keyword

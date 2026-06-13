@@ -80,8 +80,7 @@ import gatac as ga
 ga.pp.make_parquet("fragments.tsv.gz")
 
 # Compute metrics (Streaming Polars GPU)
-tss = ga.pp.load_tss_from_gtf("annotations.gtf")
-metrics = ga.pp.compute_metrics("fragments.parquet", tss)
+metrics = ga.pp.compute_metrics("fragments.parquet", "annotations.gtf")
 
 # Create tile matrix (pre-filtered by unique fragments)
 adata = ga.pp.make_tile_matrix(

@@ -43,6 +43,11 @@ def fragment_size_distribution(
     -------
     matplotlib.axes.Axes
         The axes containing the plot.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ax = ga.pl.fragment_size_distribution("pbmc.parquet")
     """
     fragment_sizes = duckdb.sql(
         f"""

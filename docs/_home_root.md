@@ -90,13 +90,14 @@ matrix compatible with SnapATAC2.
 <a href="cli/tile.html">→ CLI: tile</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
-:::{grid-item-card} {fas}`dna` Gene Activity
+:::{grid-item-card} {fas}`dna` Gene Processing
 :shadow: none
 
 Score gene activity from paired insertion counts over promoter + gene body
-regions using a GTF annotation.
+regions, or compute ArchR-style distance-weighted gene scores — all from a GTF
+annotation.
 
-<a href="cli/gene.html">→ CLI: gene</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
+<a href="cli/gene.html">→ CLI: gene</a> · <a href="cli/genescore.html">→ CLI: genescore</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`sliders` Feature Selection

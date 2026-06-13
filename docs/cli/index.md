@@ -25,6 +25,7 @@ filter
 doublets
 tile
 gene
+genescore
 features
 combine
 ```
@@ -80,6 +81,14 @@ Build a cell × genomic-tile count matrix.
 :shadow: none
 
 Build a cell × gene activity matrix.
+:::
+
+:::{grid-item-card} {fas}`ruler-horizontal` genescore
+:link: genescore
+:link-type: doc
+:shadow: none
+
+Build an ArchR-style distance-weighted gene score matrix.
 :::
 
 :::{grid-item-card} {fas}`sliders` features

@@ -142,7 +142,11 @@ def sample_bias_matched_indices(
     replace: bool = True,
     rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """Sample candidate indices whose bias distribution matches the target."""
+    """Sample candidate indices whose bias distribution matches the target.
+
+    The result does not depend on the order of `candidate_bias`: ties in bias
+    space are broken at random rather than by array position.
+    """
     target_array = _as_2d_bias_array(target_bias)
     candidate_array = _as_2d_bias_array(candidate_bias)
 
@@ -162,6 +166,23 @@ def sample_bias_matched_indices(
         )
 
     rng = np.random.default_rng() if rng is None else rng
+
+    # Break ties in bias space at random rather than by array position.
+    #
+    # `_query_bias_knn` returns a fixed number of neighbours, so whenever more
+    # candidates sit at the *same* bias value than the query asks for, it has to
+    # choose among equidistant ones - and both the cuML and the cKDTree backend
+    # resolve that by array position. Ties are the norm, not an edge case: a
+    # fixed-width peak set quantises GC content to (width + 1) distinct values,
+    # so a pool of 10^5-10^6 peaks collapses onto a few hundred levels and each
+    # tie group is easily an order of magnitude larger than `knn_neighbors`.
+    # Without this permutation the sampler draws only from whichever tie-group
+    # members happen to sit earliest in `candidate_bias`, which makes the output
+    # a function of the caller's ordering: hand it a pool sorted by p-value and
+    # the "matched background" is built preferentially from the most significant
+    # candidates, biasing every downstream enrichment toward the null.
+    permutation = rng.permutation(candidate_array.shape[0])
+    candidate_array = candidate_array[permutation]
 
     sampled_target_indices = rng.choice(
         target_array.shape[0],
@@ -227,4 +248,5 @@ def sample_bias_matched_indices(
         if not replace:
             used_mask[sampled_indices[i]] = True
 
-    return sampled_indices
+    # `sampled_indices` addresses the permuted array; map back to caller order.
+    return permutation[sampled_indices]

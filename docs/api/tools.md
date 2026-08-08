@@ -63,6 +63,7 @@ sets, and run GSEA on motif rankings.
    DNAMotif
    sample_gc_matched_background
    motif_enrichment
+   motif_enrichment_regression
    gsea_motif_enrichment
 ```
 

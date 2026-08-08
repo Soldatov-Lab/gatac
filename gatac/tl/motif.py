@@ -1790,3 +1790,376 @@ def gsea_motif_enrichment(
     else:
         logger.info(f"Running GSEA ({backend}) on provided rankings...")
         return _run_one(rankings).to_pandas()
+
+
+# =============================================================================
+# Regression-based motif enrichment (MEIRLOP-style)
+# =============================================================================
+
+
+def _dinucleotide_frequencies(encoded: cp.ndarray) -> np.ndarray:
+    """
+    Per-sequence frequencies of the 16 dinucleotides.
+
+    Parameters
+    ----------
+    encoded : cp.ndarray
+        (n, L) int8 encoded sequences, -1 for non-ACGT.
+
+    Returns
+    -------
+    np.ndarray
+        (n, 16) float32 frequencies, normalised over valid dinucleotides only so
+        that N runs and ragged sequence ends do not shift the composition.
+    """
+    a, b = encoded[:, :-1], encoded[:, 1:]
+    valid = (a >= 0) & (b >= 0)
+    # -1 codes collapse into bucket 16, which is then discarded.
+    code = cp.where(valid, a.astype(cp.int16) * 4 + b.astype(cp.int16), 16)
+    total = cp.maximum(valid.sum(axis=1), 1).astype(cp.float32)
+    out = cp.empty((encoded.shape[0], 16), dtype=cp.float32)
+    for k in range(16):
+        out[:, k] = (code == k).sum(axis=1) / total
+    return cp.asnumpy(out)
+
+
+def _fit_logistic_batch(
+    X: cp.ndarray,
+    Y: cp.ndarray,
+    col: int,
+    max_iter: int,
+    tol: float,
+    ridge: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Newton-Raphson (IRLS) logistic fits sharing one design matrix.
+
+    One outcome per row of ``Y``; every motif reuses ``X``, so the Hessian is the
+    same shape for all of them and the whole batch is solved with one
+    ``cp.linalg.solve``.
+
+    Returns
+    -------
+    (coef, se, converged)
+        Coefficient and standard error for design column ``col``, plus a
+        per-motif convergence flag.
+    """
+    n_motifs, n_params = Y.shape[0], X.shape[1]
+    beta = cp.zeros((n_motifs, n_params), dtype=cp.float64)
+    eye = cp.eye(n_params, dtype=cp.float64)[None]
+    hessian = cp.tile(eye, (n_motifs, 1, 1))
+    converged = cp.zeros(n_motifs, dtype=bool)
+
+    for _ in range(max_iter):
+        # clip keeps exp() finite for separated fits instead of returning NaN
+        eta = cp.clip(beta @ X.T, -30.0, 30.0)
+        mu = 1.0 / (1.0 + cp.exp(-eta))
+        w = cp.clip(mu * (1.0 - mu), 1e-10, None)
+        grad = (Y - mu) @ X
+        hessian = cp.einsum("np,mn,nq->mpq", X, w, X) + eye * ridge
+        step = cp.linalg.solve(hessian, grad[:, :, None])[:, :, 0]
+        beta += step
+        converged = cp.abs(step).max(axis=1) < tol
+        if bool(converged.all()):
+            break
+
+    se = cp.sqrt(cp.diagonal(cp.linalg.inv(hessian), axis1=1, axis2=2))
+    return (
+        cp.asnumpy(beta[:, col]),
+        cp.asnumpy(se[:, col]),
+        cp.asnumpy(converged),
+    )
+
+
+def motif_enrichment_regression(
+    motifs: list[DNAMotif],
+    regions: list[str],
+    scores: np.ndarray,
+    genome_fasta: Union[str, Path],
+    covariates: Union[
+        Literal["dinucleotide", "gc", "none"], np.ndarray, None
+    ] = "dinucleotide",
+    pvalue: float = 1e-5,
+    check_rc: bool = True,
+    bg_probs: Union[
+        Literal["auto", "subject", "even"],
+        tuple[float, float, float, float],
+    ] = (0.25, 0.25, 0.25, 0.25),
+    motif_batch_size: int = 16,
+    region_chunk_size: int = 64_000,
+    fit_batch_size: int = 24,
+    max_iter: int = 50,
+    tol: float = 1e-8,
+) -> pd.DataFrame:
+    """
+    Motif enrichment as logistic regression on a continuous score (MEIRLOP-style).
+
+    Instead of comparing a foreground list against a matched background pool,
+    this models motif presence across *every* region as a function of a
+    continuous per-region score, adjusting for sequence composition:
+
+    .. math::
+        \\mathrm{logit}\\, P(\\text{motif present in region } i)
+          = b_0 + b_s \\cdot \\text{score}_i + \\sum_c b_c d_{ic}
+
+    The reported statistic is :math:`b_s`, one number per motif. Positive means
+    the motif is more likely in regions with a higher score.
+
+    Why use this over :func:`motif_enrichment`
+    ------------------------------------------
+    * **No background pool.** Nothing has to be sampled or matched, so the result
+      does not depend on how a pool was drawn.
+    * **No significance cut.** Regions are not binned into foreground and
+      background, so effect size is preserved. On a typical differential-
+      accessibility contrast the thresholded approach discards >99% of regions.
+    * **Composition is modelled, not sampled.** GC- or CpG-driven differences
+      between region sets are absorbed by the covariates.
+
+    What it does *not* fix
+    ----------------------
+    A PWM hit is a score threshold, not the presence of a binding site: a
+    GC-rich window can clear the threshold without containing the motif. The
+    covariates mitigate this but do not remove it. Motifs whose consensus is
+    collinear with the composition gradient being tested (a GC-box in a
+    GC-driven contrast) are **not identifiable** by this or any related method,
+    and their coefficients should not be reported as factor-level results.
+
+    Parameters
+    ----------
+    motifs : list[DNAMotif]
+        Motifs to test.
+    regions : list[str]
+        Region strings in ``"chr:start-end"`` format. Pass all regions, not a
+        selected subset -- using the full set is the point of the method.
+    scores : np.ndarray
+        One continuous score per region, in the same order. A DESeq2 Wald
+        statistic or log2 fold change is the usual choice. Standardised
+        internally. Non-finite entries are dropped with their regions.
+    genome_fasta : str or Path
+        Genome FASTA for sequence extraction.
+    covariates : {"dinucleotide", "gc", "none"} or np.ndarray, default "dinucleotide"
+        Composition adjustment. ``"dinucleotide"`` uses 15 of the 16
+        dinucleotide frequencies (the 16th is dropped because they sum to one
+        and would be collinear with the intercept); this also pins mononucleotide
+        content. ``"gc"`` uses GC fraction and CpG observed/expected only.
+        ``"none"`` fits score alone. An array of shape ``(n_regions, k)`` is used
+        as given -- it must not contain a constant column.
+    pvalue : float, default 1e-5
+        Threshold for calling a motif present in a region. Stricter than
+        MEIRLOP's default, which admits considerably more partial matches.
+    check_rc : bool, default True
+        Scan both strands.
+    bg_probs : {"auto", "subject", "even"} or tuple, default (0.25, 0.25, 0.25, 0.25)
+        Background base frequencies for the log-odds conversion, as in
+        :func:`motif_enrichment`. Note ``"auto"`` requires holding all sequences
+        in memory at once.
+    motif_batch_size : int, default 16
+        Motifs scanned together on the GPU.
+    region_chunk_size : int, default 64000
+        Regions per scanning chunk. Scanning allocates a score tensor
+        proportional to ``chunk x motif_batch_size x length``; the default keeps
+        that within a few GB. Lower it if scanning runs out of memory.
+    fit_batch_size : int, default 24
+        Motifs fitted together. Each batch holds an ``(n_regions, n_params)``
+        design and a ``(batch, n_regions)`` outcome block on the GPU.
+    max_iter : int, default 50
+        Maximum IRLS iterations.
+    tol : float, default 1e-8
+        Convergence tolerance on the maximum coefficient step.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per motif, sorted by ``z``, with columns:
+
+        - ``id``, ``name``, ``family``: motif identity
+        - ``coefficient``: :math:`b_s`, the score effect on the logit scale
+        - ``std error``, ``z``, ``p-value``, ``adjusted p-value`` (BH)
+        - ``n regions with motif``, ``fraction with motif``
+        - ``converged``: False if the fit hit ``max_iter`` or was degenerate.
+          Non-converged rows get a p-value of 1.0 and must not be interpreted.
+
+    See Also
+    --------
+    motif_enrichment : matched-background-pool enrichment test.
+
+    Examples
+    --------
+    >>> import gatac
+    >>> motifs = gatac.tl.read_motifs("motifs.meme")
+    >>> res = gatac.tl.motif_enrichment_regression(
+    ...     motifs,
+    ...     regions=de["peak"].tolist(),
+    ...     scores=de["stat"].to_numpy(),
+    ...     genome_fasta="genome.fa",
+    ... )
+    >>> res.head()
+    """
+    from scipy.stats import norm
+    from tqdm.auto import tqdm
+
+    scores = np.asarray(scores, dtype=np.float64)
+    if len(regions) != len(scores):
+        raise ValueError(
+            f"regions and scores must be the same length; got {len(regions)} "
+            f"and {len(scores)}"
+        )
+    if len(motifs) == 0:
+        raise ValueError("no motifs supplied")
+
+    user_covariates = None
+    if isinstance(covariates, np.ndarray):
+        user_covariates = np.asarray(covariates, dtype=np.float64)
+        if user_covariates.ndim != 2 or len(user_covariates) != len(regions):
+            raise ValueError(
+                "covariates array must have shape (n_regions, k); got "
+                f"{user_covariates.shape}"
+            )
+        covariate_mode = "user"
+    else:
+        covariate_mode = "none" if covariates in (None, "none") else str(covariates)
+        if covariate_mode not in ("dinucleotide", "gc", "none"):
+            raise ValueError(
+                "covariates must be 'dinucleotide', 'gc', 'none', or an array; "
+                f"got {covariates!r}"
+            )
+
+    finite = np.isfinite(scores)
+    if not finite.any():
+        raise ValueError("no finite scores")
+    if not finite.all():
+        logger.info(f"Dropping {int((~finite).sum())} regions with non-finite scores")
+
+    kept_idx = np.flatnonzero(finite)
+    kept_regions = [regions[i] for i in kept_idx]
+    n_regions = len(kept_regions)
+    n_motifs = len(motifs)
+
+    resolved_bg_probs = bg_probs
+    if isinstance(bg_probs, str):
+        # "auto"/"subject" need global base frequencies, so sequences are fetched
+        # once here; the chunked pass below re-fetches per chunk.
+        logger.info("Resolving background base frequencies from all sequences...")
+        resolved_bg_probs = _resolve_bg_probs(
+            bg_probs, _fetch_region_sequences(kept_regions, genome_fasta)
+        )
+
+    logger.info(f"Computing thresholds for {n_motifs} motifs...")
+    pwm_list = [m.to_log_odds(resolved_bg_probs) for m in motifs]
+    bg_array = np.array(resolved_bg_probs, dtype=np.float64)
+    thresholds = np.array(
+        [_compute_score_threshold_jit(pwm, bg_array, pvalue, 1e-4) for pwm in pwm_list],
+        dtype=np.float64,
+    )
+
+    presence = np.zeros((n_motifs, n_regions), dtype=bool)
+    dinuc = (
+        np.zeros((n_regions, 16), dtype=np.float32)
+        if covariate_mode in ("dinucleotide", "gc")
+        else None
+    )
+
+    logger.info(
+        f"Scanning {n_motifs} motifs across {n_regions} regions "
+        f"in chunks of {region_chunk_size}..."
+    )
+    n_chunks = (n_regions + region_chunk_size - 1) // region_chunk_size
+    for start in tqdm(
+        range(0, n_regions, region_chunk_size), total=n_chunks, desc="Scanning"
+    ):
+        stop = min(start + region_chunk_size, n_regions)
+        sequences = _fetch_region_sequences(kept_regions[start:stop], genome_fasta)
+        encoded, lengths = _encode_sequences_batch(sequences)
+        rc = _reverse_complement_encoded(encoded) if check_rc else None
+        presence[:, start:stop] = _scan_motifs_batch_gpu(
+            encoded, lengths, pwm_list, thresholds, rc,
+            motif_batch_size=motif_batch_size, show_progress=False,
+        )
+        if dinuc is not None:
+            dinuc[start:stop] = _dinucleotide_frequencies(encoded)
+        del encoded, lengths, rc, sequences
+        mempool.free_all_blocks()
+
+    def _standardise(a: np.ndarray) -> np.ndarray:
+        sd = a.std(axis=0)
+        return (a - a.mean(axis=0)) / np.where(sd == 0, 1.0, sd)
+
+    design = [np.ones(n_regions), _standardise(scores[kept_idx])]
+    if covariate_mode == "dinucleotide":
+        design.append(_standardise(dinuc[:, :15].astype(np.float64)))
+        n_cov = 15
+    elif covariate_mode == "gc":
+        gc = dinuc[:, [5, 6, 9, 10]].sum(axis=1).astype(np.float64)  # CC CG GC GG
+        cg = dinuc[:, 6].astype(np.float64)                          # CpG
+        c_plus_g = np.clip(gc, 1e-9, None)
+        design.append(_standardise(np.column_stack([gc, cg / c_plus_g])))
+        n_cov = 2
+    elif covariate_mode == "user":
+        design.append(_standardise(user_covariates[kept_idx]))
+        n_cov = user_covariates.shape[1]
+    else:
+        n_cov = 0
+
+    X_np = np.column_stack(design).astype(np.float64)
+    usable = np.isfinite(X_np).all(axis=1)
+    if not usable.all():
+        logger.info(f"Dropping {int((~usable).sum())} regions with non-finite design")
+        X_np = X_np[usable]
+        presence = presence[:, usable]
+    logger.info(
+        f"Design {X_np.shape}: intercept + score"
+        + (f" + {n_cov} covariates" if n_cov else "")
+    )
+    if np.linalg.matrix_rank(X_np) < X_np.shape[1]:
+        raise ValueError(
+            "design matrix is rank-deficient -- covariates are collinear with the "
+            "intercept or with each other"
+        )
+
+    X = cp.asarray(X_np)
+    coefs = np.empty(n_motifs, dtype=np.float64)
+    ses = np.empty(n_motifs, dtype=np.float64)
+    converged = np.empty(n_motifs, dtype=bool)
+
+    logger.info(f"Fitting {n_motifs} logistic models...")
+    n_batches = (n_motifs + fit_batch_size - 1) // fit_batch_size
+    for start in tqdm(
+        range(0, n_motifs, fit_batch_size), total=n_batches, desc="Fitting"
+    ):
+        stop = min(start + fit_batch_size, n_motifs)
+        Y = cp.asarray(presence[start:stop].astype(np.float64))
+        coefs[start:stop], ses[start:stop], converged[start:stop] = (
+            _fit_logistic_batch(X, Y, 1, max_iter, tol, ridge=1e-8)
+        )
+        del Y
+        mempool.free_all_blocks()
+    del X
+    mempool.free_all_blocks()
+
+    # A separated or degenerate fit produces a huge coefficient with a huge
+    # standard error; flag it rather than reporting a z of 0.001 as "not significant".
+    ok = converged & np.isfinite(coefs) & np.isfinite(ses) & (ses > 0)
+    z = np.divide(coefs, ses, out=np.full(n_motifs, np.nan), where=ok)
+    p = np.where(ok, 2.0 * norm.sf(np.abs(np.nan_to_num(z))), 1.0)
+
+    n_failed = int((~ok).sum())
+    if n_failed:
+        logger.warning(
+            f"{n_failed} motif(s) failed to converge and are reported with "
+            "p-value 1.0; inspect the 'converged' column"
+        )
+
+    result = pd.DataFrame({
+        "id": [m.id for m in motifs],
+        "name": [m.name for m in motifs],
+        "family": [m.family for m in motifs],
+        "coefficient": coefs,
+        "std error": ses,
+        "z": z,
+        "p-value": p,
+        "adjusted p-value": _p_adjust_bh(p),
+        "n regions with motif": presence.sum(axis=1).astype(np.int64),
+        "fraction with motif": presence.mean(axis=1),
+        "converged": ok,
+    })
+    return result.sort_values("z", ascending=False).reset_index(drop=True)

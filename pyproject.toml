@@ -16,6 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Seurat's approximate neighbour search, for `snn_cluster(knn="annoy")` /
+# `iterative_lsi(cluster_params={"knn": "annoy"})`. Only needed to reproduce
+# ArchR's clustering; the default exact GPU search needs nothing extra.
+archr-compat = [
+    "annoy>=1.17",
+]
 cuda12 = [
     "cudf-cu12==26.02.*",
     "cudf-polars-cu12==26.02.*",

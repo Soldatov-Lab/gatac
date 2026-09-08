@@ -52,15 +52,27 @@ Known differences from Seurat/ArchR
 * **No ``n.start`` restarts.** Seurat runs Louvain 10 times and keeps the best
   modularity; cuGraph exposes no equivalent, so a single run is used.
 * **Approximate vs exact kNN.** Seurat's default ``nn.method="annoy"`` is
-  approximate; cuML's brute-force search here is exact, so a handful of
-  neighbours can differ near ties.
-* **The embedding is quantised** to 4 decimals before the graph is built, which
-  damps — but does not remove — the effect of a nondeterministic upstream
-  eigensolver; see the ``quantize`` parameter for the measurements. ArchR needs
-  no such step, running on a deterministic CPU solver, though its clustering is
-  no more stable across *seeds* than this is across runs.
-* **Self-loops dropped** before Louvain. Seurat's SNN carries a unit diagonal;
-  it shifts modularity by a constant and cuGraph rejects self-loops in places.
+  approximate; cuML's brute-force search here is exact, and they disagree on
+  about 5 % of neighbours. That is not a rounding detail — it is the single
+  largest source of disagreement with ``addIterativeLSI``, larger than
+  Leiden-vs-Louvain. Pass ``knn="annoy"`` to match ArchR's search; the ``knn``
+  parameter of :func:`snn_cluster` carries the measurements.
+* **The embedding is quantised** to 2 decimals before the graph is built (see
+  the ``quantize`` parameter for the measurements behind that choice). It was
+  introduced to damp a nondeterministic upstream eigensolver; ``lsi``'s
+  ``deterministic=True`` path now removes that source of variation at the root,
+  so quantisation is kept for its (separately measured) agreement with ArchR
+  rather than as a reproducibility crutch. ArchR needs no such step, running on
+  a deterministic CPU solver, though its clustering is no more stable across
+  *seeds* than this is across runs.
+* **Self-loops dropped** before community detection. Seurat's SNN carries a
+  unit diagonal, and cuGraph rejects self-loops in places. This is not a
+  mismatch with Seurat: its Louvain (``src/RModularityOptimizer.cpp``) reads
+  only the strict lower triangle of the graph, so the diagonal never reaches
+  the optimiser there either. Checked rather than assumed — given the same
+  neighbour lists, :func:`snn_graph` and ``Seurat::FindNeighbors`` (5.5.0)
+  produced graphs with the same 432,912 edges and the same partition at every
+  Leiden seed tried.
 """
 
 from __future__ import annotations
@@ -100,7 +112,19 @@ def _import_cugraph():
     return cugraph
 
 
-def _knn_indices(X: np.ndarray, k: int) -> np.ndarray:
+#: Seurat's ``FindNeighbors`` default tree count, and the value the
+#: measurements in :func:`snn_cluster` were taken at.
+_ANNOY_TREES = 50
+
+_ANNOY_HINT = (
+    "knn='annoy' needs the `annoy` package, which is not installed.\n"
+    "Install it with\n"
+    "    uv add annoy\n"
+    "or use the default exact search, knn='exact'."
+)
+
+
+def _knn_exact(X: np.ndarray, k: int) -> np.ndarray:
     """Exact euclidean kNN indices, ``(n, k)``, self included."""
     from cuml.neighbors import NearestNeighbors  # noqa: PLC0415
 
@@ -111,11 +135,57 @@ def _knn_indices(X: np.ndarray, k: int) -> np.ndarray:
     return cp.asnumpy(idx).astype(np.int32)
 
 
+def _knn_annoy(X: np.ndarray, k: int, *, random_state: int,
+               n_trees: int = _ANNOY_TREES) -> np.ndarray:
+    """
+    Annoy's approximate kNN — the search ``Seurat::FindNeighbors`` uses.
+
+    Not a performance choice: this runs on the CPU and is slower than the
+    exact GPU search. It exists because ArchR's iterative LSI is measurably a
+    function of *which* approximation Annoy makes; see the ``knn`` parameter of
+    :func:`snn_cluster`.
+
+    Built single-threaded and from an explicit seed, so the index — and
+    therefore the neighbour lists — are reproducible. Trees are random, so this
+    does not reproduce ``RcppAnnoy``'s own lists (measured 95 % neighbour
+    overlap with them, the same as the exact search has); what carries over is
+    the error *structure*, which is what the downstream agreement depends on.
+    """
+    try:
+        from annoy import AnnoyIndex  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(_ANNOY_HINT) from exc
+
+    Xh = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+    n, d = Xh.shape
+    index = AnnoyIndex(d, "euclidean")
+    index.set_seed(int(random_state))
+    for i in range(n):
+        index.add_item(i, Xh[i])
+    index.build(n_trees, n_jobs=1)
+    idx = np.empty((n, k), dtype=np.int32)
+    for i in range(n):
+        idx[i] = index.get_nns_by_item(i, k, search_k=-1)
+    return idx
+
+
+def _knn_indices(X: np.ndarray, k: int, *, knn: str = "exact",
+                 random_state: int = 0) -> np.ndarray:
+    """Euclidean kNN indices, ``(n, k)``, self included; see *knn* choices."""
+    if knn == "exact":
+        return _knn_exact(X, k)
+    if knn == "annoy":
+        return _knn_annoy(X, k, random_state=random_state)
+    raise ValueError(f"knn must be 'exact' or 'annoy' (got {knn!r}).")
+
+
 def snn_graph(
     embedding: np.ndarray,
     *,
     k: int = 20,
     prune: float = 1.0 / 15.0,
+    knn: str = "exact",
+    random_state: int = 0,
 ) -> cusp.csr_matrix:
     """
     Shared-nearest-neighbour graph, following ``Seurat::ComputeSNN``.
@@ -134,6 +204,11 @@ def snn_graph(
         Neighbours per cell (Seurat's ``k.param``).
     prune
         Jaccard weight at or below which edges are dropped (``prune.SNN``).
+    knn
+        ``"exact"`` (cuML, GPU) or ``"annoy"`` (CPU, Seurat's search). See the
+        ``knn`` parameter of :func:`snn_cluster`.
+    random_state
+        Seeds the Annoy index; ignored by the exact search.
 
     Returns
     -------
@@ -141,7 +216,7 @@ def snn_graph(
         Symmetric weighted graph, ``n_cells x n_cells``.
     """
     n = embedding.shape[0]
-    idx = _knn_indices(embedding, k)
+    idx = _knn_indices(embedding, k, knn=knn, random_state=random_state)
 
     rows = cp.repeat(cp.arange(n, dtype=cp.int32), k)
     cols = cp.asarray(idx.ravel())
@@ -328,6 +403,7 @@ def snn_cluster(
     n_outlier: int = 5,
     knn_assign: int = 10,
     flavor: str = "leiden",
+    knn: str = "exact",
     quantize: int | None = 2,
     max_resolution_retries: int = 3,
     random_state: int = 0,
@@ -362,6 +438,41 @@ def snn_cluster(
         agreed *better* (ARI 0.928 vs 0.900) — and cuGraph lets us seed Leiden
         while its Louvain takes no seed, so Leiden is also the reproducible
         choice. See *Known differences*.
+    knn
+        Neighbour search: ``"exact"`` (default, cuML on the GPU) or
+        ``"annoy"`` (CPU, the approximate search ``Seurat::FindNeighbors``
+        uses and therefore the one behind every ArchR ``addClusters`` result).
+
+        This is an ArchR-compatibility switch, not a speed one — ``"annoy"``
+        is the slower, less accurate search. It is offered because ArchR's
+        iterative LSI turns out to depend on *which* approximation its
+        neighbour search makes. Measured on the 4,437-cell PBMC oracle, with
+        everything else held fixed and each arm scored by the feature set the
+        *next* LSI round selects (ArchR's own seed-to-seed Jaccard, the bar, is
+        0.927):
+
+        =============================  =============  =============
+        neighbour search               J vs seed 1    J vs seed 2
+        =============================  =============  =============
+        exact (cuML)                   0.889          0.856
+        exact (Seurat's RANN)          0.861          0.831
+        pynndescent (approximate)      0.892          0.889
+        exact, 5 % random perturbation 0.896-0.906    0.860-0.874
+        Seurat's own Annoy lists       0.955          0.909
+        **annoy (this option)**        **0.957-0.960**  **0.911-0.914**
+        =============================  =============  =============
+
+        Note what the control rows say: perturbing the exact lists at Annoy's
+        own error rate does *not* reproduce the gain, and a different
+        approximate search does not either — so this is Annoy's particular
+        error structure, not approximation in general, and not agreement with
+        one ArchR draw (both ArchR seeds improve). Accuracy is not the axis:
+        raising Annoy's ``n_trees`` to 200 moves it back towards the exact
+        search *and* back down to 0.906.
+
+        The cost is that the search leaves the GPU: 0.43 s here against ~0.01 s
+        exact, scaling with cell count. Hence the default stays ``"exact"`` and
+        this is opt-in, per run and per call.
     quantize
         Round the embedding to this many decimals before building the graph.
         ``None`` disables it.
@@ -405,7 +516,8 @@ def snn_cluster(
         cuGraph's resolution does not map onto Seurat's on every graph; see the
         note in the source. ``0`` disables the retry and raises instead.
     random_state
-        Seed. Consumed by Leiden; cuGraph's Louvain accepts none.
+        Seed. Consumed by Leiden and by the Annoy index; cuGraph's Louvain
+        accepts none.
 
     Returns
     -------
@@ -419,6 +531,8 @@ def snn_cluster(
     >>> z = (emb - emb.mean(0)) / emb.std(0)
     >>> labels = snn_cluster(z, resolution=2.0, max_clusters=6)
     """
+    if knn not in ("exact", "annoy"):
+        raise ValueError(f"knn must be 'exact' or 'annoy' (got {knn!r}).")
     emb = np.ascontiguousarray(np.asarray(embedding, dtype=np.float32))
     if emb.ndim != 2:
         raise ValueError(f"embedding must be 2-D, got shape {emb.shape}.")
@@ -432,7 +546,7 @@ def snn_cluster(
             f"Need more cells than neighbours: n_cells={n}, k={k}."
         )
 
-    graph = snn_graph(emb, k=k, prune=prune)
+    graph = snn_graph(emb, k=k, prune=prune, knn=knn, random_state=random_state)
 
     # cuGraph's `resolution` is not interchangeable with Seurat's on every
     # graph. On a small dense SNN graph (measured: 643 cells, 264k edges) both

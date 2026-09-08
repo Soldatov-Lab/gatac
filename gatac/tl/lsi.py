@@ -31,10 +31,16 @@ Notes on fidelity
 * **Projection re-computes depth for the cells being projected** and reuses
   only the training ``row_sums``/``n_train`` for the IDF, plus the *fitted*
   ``binarize`` and feature subset. See :func:`project_lsi`.
+* **The result is bitwise reproducible** for a given ``random_state``, in one
+  process and across fresh ones. That needed more than seeding: cuSPARSE's
+  SpMV is not run-to-run deterministic, so the solver runs on a fixed-order
+  product of its own (see ``_csr_spmv_kernel``). ``deterministic=False``
+  restores ``cupyx``'s ``svds``, which is reproducible at no seed.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import Literal
@@ -124,6 +130,181 @@ def _launch_warp_per_row(kernel, n_rows: int, *args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Deterministic sparse matrix-vector product
+# ---------------------------------------------------------------------------
+#
+# cuSPARSE's SpMV is not run-to-run deterministic. Measured on the 27 M-nonzero
+# TF-IDF matrix of the 4,437-cell PBMC fixture, eight repeats of ``X @ v`` with
+# a byte-identical input vector gave eight different results (max |d| 2.9e-3 on
+# values of order 1e3); the same held for ``Xᵀ @ v`` and for the SpMM path with
+# a single column. That — not the eigensolver's random start — is where LSI's
+# irreproducibility comes from: seeding the start vector only halved the
+# run-to-run spread of the embedding (max |Δu| 1.7e-5 → 6.6e-6), because every
+# Lanczos step re-randomises the low bits again. Every dense primitive the
+# solver otherwise uses (gemv, gemm, nrm2, dot, eigh) *was* bitwise
+# reproducible over 5 repeats of the same test.
+#
+# One warp per row with a strided partial sum and a fixed ``__shfl_down_sync``
+# reduction tree fixes the summation order, so the result is bitwise
+# reproducible. Accumulating in double costs nothing on a memory-bound kernel
+# and buys accuracy rather than spending it: against ArchR's float64 irlba on
+# the 643-cell G0 fixture, LSIMethod 2 held its 1.8e-7 worst-case relative
+# singular-value error, where a float32 accumulator drifted to 1.5e-6.
+_csr_spmv_kernel = cp.RawKernel(
+    r"""
+    extern "C" __global__
+    void csr_spmv(const float* __restrict__ data,
+                  const int* __restrict__ indices,
+                  const int* __restrict__ indptr,
+                  const float* __restrict__ x,
+                  float* __restrict__ y, const int n_rows) {
+        int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int lane = threadIdx.x & 31;
+        if (warp >= n_rows) return;
+
+        int s = indptr[warp], e = indptr[warp + 1];
+        double acc = 0.0;
+        for (int j = s + lane; j < e; j += 32)
+            acc += (double)data[j] * (double)x[indices[j]];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) y[warp] = (float)acc;
+    }
+    """,
+    "csr_spmv",
+)
+
+
+def _spmv(A: cusp.csr_matrix, x: cp.ndarray, out: cp.ndarray) -> cp.ndarray:
+    """``out = A @ x`` for a float32 CSR *A*, with a fixed summation order."""
+    _launch_warp_per_row(
+        _csr_spmv_kernel, A.shape[0],
+        A.data, A.indices, A.indptr, x, out, np.int32(A.shape[0]),
+    )
+    return out
+
+
+# The dense-right-hand-side counterpart. One warp per row still, but eight
+# accumulators deep so a k=30 product reads each row four times rather than
+# thirty; that is what keeps it competitive with cuSPARSE's SpMM while summing
+# in a fixed order.
+_CSR_SPMM_TILE = 8
+_csr_spmm_kernel = cp.RawKernel(
+    r"""
+    extern "C" __global__
+    void csr_spmm(const float* __restrict__ data,
+                  const int* __restrict__ indices,
+                  const int* __restrict__ indptr,
+                  const float* __restrict__ B,
+                  float* __restrict__ C,
+                  const int n_rows, const int n_cols) {
+        const int TILE = 8;
+        int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int lane = threadIdx.x & 31;
+        if (warp >= n_rows) return;
+
+        int s = indptr[warp], e = indptr[warp + 1];
+        for (int c0 = 0; c0 < n_cols; c0 += TILE) {
+            int cn = min(TILE, n_cols - c0);
+            double acc[TILE];
+            #pragma unroll
+            for (int t = 0; t < TILE; ++t) acc[t] = 0.0;
+            for (int j = s + lane; j < e; j += 32) {
+                double v = (double)data[j];
+                const float* brow = B + (size_t)indices[j] * n_cols + c0;
+                #pragma unroll
+                for (int t = 0; t < TILE; ++t)
+                    if (t < cn) acc[t] += v * (double)brow[t];
+            }
+            #pragma unroll
+            for (int t = 0; t < TILE; ++t) {
+                double a = acc[t];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    a += __shfl_down_sync(0xffffffff, a, off);
+                if (lane == 0 && t < cn)
+                    C[(size_t)warp * n_cols + c0 + t] = (float)a;
+            }
+        }
+    }
+    """,
+    "csr_spmm",
+)
+
+
+def _spmm(A: cusp.csr_matrix, B: cp.ndarray) -> cp.ndarray:
+    """``A @ B`` for float32 CSR *A* and dense ``(A.shape[1], c)`` *B*."""
+    B = cp.ascontiguousarray(B, dtype=cp.float32)
+    out = cp.empty((A.shape[0], B.shape[1]), dtype=cp.float32)
+    _launch_warp_per_row(
+        _csr_spmm_kernel, A.shape[0],
+        A.data, A.indices, A.indptr, B, out,
+        np.int32(A.shape[0]), np.int32(B.shape[1]),
+    )
+    return out
+
+
+def _gram_operator(
+    X: cusp.csr_matrix,
+) -> tuple[cusla.LinearOperator, cusp.csr_matrix]:
+    """
+    The smaller of ``X Xᵀ`` / ``Xᵀ X`` as a deterministic LinearOperator.
+
+    This is the operator ``cupyx``'s ``svds`` builds internally, rebuilt here
+    so the two products go through :func:`_spmv` instead of cuSPARSE. Applying
+    ``Xᵀ`` deterministically needs its rows contiguous, so the transpose is
+    materialised — the cost is a second copy of the matrix (15 ms and 217 MB on
+    the PBMC fixture) and it is why ``deterministic=False`` exists.
+
+    Returns the operator and that transpose, which the caller needs again to
+    recover the singular vectors on the other side.
+    """
+    if X.dtype != cp.float32:
+        raise TypeError(
+            f"the deterministic solver needs a float32 matrix, got {X.dtype}."
+        )
+    XT = X.T.tocsr()
+    m, n = X.shape
+    # m <= n: y = X (Xᵀ v), an (m, m) operator; otherwise y = Xᵀ (X v).
+    first, second = (XT, X) if m <= n else (X, XT)
+    p = min(m, n)
+    tmp = cp.empty(first.shape[0], dtype=cp.float32)
+
+    def matvec(v):
+        shp = v.shape
+        vf = cp.ascontiguousarray(v.ravel(), dtype=cp.float32)
+        _spmv(first, vf, tmp)
+        y = _spmv(second, tmp, cp.empty(p, dtype=cp.float32))
+        return y.reshape(-1, 1) if len(shp) == 2 else y
+
+    return (
+        cusla.LinearOperator(shape=(p, p), matvec=matvec, dtype=cp.float32),
+        XT,
+    )
+
+
+@contextlib.contextmanager
+def _cupy_seed(seed: int):
+    """
+    Scope CuPy's global RNG to *seed*, restoring the caller's state on exit.
+
+    ``cupyx``'s ``svds`` gives no way to pass a starting vector: it calls
+    ``eigsh`` without ``v0``, and ``eigsh`` then draws one from
+    ``cupy.random.random`` — so ``random_state`` reached the LSI metadata but
+    never the solver. Seeding the global stream is the only handle on that, and
+    restoring the previous state afterwards keeps the call from perturbing the
+    caller's own draws.
+    """
+    prev = cp.random.get_random_state()
+    try:
+        cp.random.set_random_state(cp.random.RandomState(seed))
+        yield
+    finally:
+        cp.random.set_random_state(prev)
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
@@ -148,6 +329,7 @@ class LSIModel:
     method: int
     scale_to: float
     binarize: bool
+    deterministic: bool = True       #: whether the *reproducible* solver ran
     random_state: int = 0
     depth_cor: np.ndarray | None = None      #: |r| with log10 depth, per component
     dims_dropped: np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
@@ -331,12 +513,83 @@ def _flip_signs(u: cp.ndarray, vt: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
     return u * signs, vt * signs[:, None]
 
 
+def _augment_orthonormal(x: cp.ndarray, n_aug: int, rng) -> cp.ndarray:
+    """
+    Pad *x* with *n_aug* columns orthonormal to it (``svds``' own fallback).
+
+    Only reached when the Gram spectrum is rank-deficient at the requested
+    ``n_comps``. ``svds`` draws these from CuPy's global RNG; drawing them from
+    a seeded host generator instead keeps the padded columns reproducible too.
+    """
+    if n_aug <= 0:
+        return x
+    m, n = x.shape
+    y = cp.empty((m, n + n_aug), dtype=x.dtype)
+    y[:, :n] = x
+    for i in range(n, n + n_aug):
+        v = cp.asarray(rng.random(m), dtype=x.dtype)
+        v -= v @ y[:, :i].conj() @ y[:, :i].T
+        y[:, i] = v / cp.linalg.norm(v)
+    return y
+
+
+def _svd_deterministic(
+    X: cusp.csr_matrix, n_comps: int, *, tol: float, ncv: int, random_state: int
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """
+    ``svds``' algorithm with every source of run-to-run variation removed.
+
+    Identical in structure to ``cupyx.scipy.sparse.linalg.svds`` — thick-restart
+    Lanczos on the smaller Gram operator, then one product to recover the other
+    side — but the Gram apply goes through :func:`_gram_operator` rather than
+    cuSPARSE, and the Lanczos start vector is drawn from a seeded host
+    generator and handed to ``eigsh`` as ``v0`` rather than left to CuPy's
+    global RNG. Both are needed: see the comment above ``_csr_spmv_kernel``.
+    """
+    gram, XT = _gram_operator(X)
+    m, n = X.shape
+    rng = np.random.default_rng(random_state)
+    v0 = cp.asarray(rng.random(gram.shape[0]), dtype=cp.float32)
+
+    w, x = cusla.eigsh(
+        gram, k=n_comps, which="LM", ncv=ncv, tol=tol, v0=v0,
+        return_eigenvectors=True,
+    )
+    del gram
+
+    # Below svds' own rank cutoff the singular value is reported as zero and
+    # the vector replaced by an arbitrary orthonormal one; mirror that.
+    w = cp.maximum(w, 0)
+    cutoff = 1e3 * float(np.finfo(np.float32).eps) * float(w.max())
+    above = w > cutoff
+    n_large = int(above.sum())
+    s = cp.zeros_like(w)
+    s[:n_large] = cp.sqrt(w[above])
+    x = cp.ascontiguousarray(x[:, above])
+
+    if m <= n:                      # gram was X Xᵀ, so x holds the left vectors
+        u, v = x, _spmm(XT, x) / s[:n_large]
+    else:                           # gram was Xᵀ X, so x holds the right ones
+        v, u = x, _spmm(X, x) / s[:n_large]
+    del XT
+    u = _augment_orthonormal(u, n_comps - n_large, rng)
+    v = _augment_orthonormal(v, n_comps - n_large, rng)
+    return u, s, v.conj().T
+
+
+def _deterministic_available(X, deterministic: bool) -> bool:
+    """Whether :func:`_svd` can take the reproducible path for this operand."""
+    return bool(deterministic) and cusp.isspmatrix_csr(X) and X.dtype == cp.float32
+
+
 def _svd(
     X,
     n_comps: int,
     *,
     tol: float = 1e-5,
     ncv: int | None = None,
+    random_state: int = 0,
+    deterministic: bool = True,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """
     Truncated SVD of a sparse matrix or LinearOperator, descending.
@@ -351,8 +604,16 @@ def _svd(
     Randomized SVD is not offered: against a float64 ARPACK reference it lost
     the trailing components on both CPU and GPU.
 
+    With *deterministic* (the default) and a resident float32 CSR matrix the
+    same algorithm is run through :func:`_svd_deterministic`, which is bitwise
+    reproducible for a given ``random_state``. ``svds`` itself is not, at any
+    seed. A streamed :class:`~gatac.tl._gpu.ChunkedMatrix` operator cannot take
+    that path — the transpose it needs is exactly what does not fit — so it
+    falls back to ``svds`` with the global RNG scoped to ``random_state``,
+    which controls the start vector but not cuSPARSE.
+
     Component signs are pinned by :func:`_flip_signs`, without which the
-    output is not reproducible run to run.
+    output is not reproducible run to run even when everything else is.
     """
     n_rows, n_cols = X.shape
     max_k = min(n_rows, n_cols) - 1
@@ -364,7 +625,21 @@ def _svd(
     if ncv is None:
         ncv = min(max_k, max(4 * n_comps + 1, n_comps + 60))
 
-    u, s, vt = cusla.svds(X, k=n_comps, tol=tol, ncv=ncv)
+    if _deterministic_available(X, deterministic):
+        u, s, vt = _svd_deterministic(
+            X, n_comps, tol=tol, ncv=ncv, random_state=random_state
+        )
+    else:
+        if deterministic:
+            logger.info(
+                "Deterministic SVD unavailable for this operand "
+                f"({type(X).__name__}); seeding the solver's start vector "
+                "only. cuSPARSE's SpMV remains nondeterministic, so repeated "
+                "runs will differ at ~1e-5 in the embedding."
+            )
+        with _cupy_seed(random_state):
+            u, s, vt = cusla.svds(X, k=n_comps, tol=tol, ncv=ncv)
+
     order = cp.argsort(s)[::-1]
     u, s, vt = u[:, order], s[order], vt[order]
     # svds leaves each component's sign arbitrary and does not reproduce it
@@ -390,6 +665,27 @@ def scale_dims(
     ArchR applies this before clustering and before its ``corCutOff`` filter,
     but the stored ``matSVD`` itself is unscaled — scaling happens on the way
     out, in ``getReducedDims(scaleDims = TRUE)``.
+
+    A consequence worth knowing about, because it is a property of ArchR's
+    algorithm rather than of this port: z-scoring across dimensions **mixes the
+    columns**, so the scaled embedding is not invariant to the arbitrary sign
+    of an SVD component. Measured on the 4,437-cell PBMC oracle at iteration 1,
+    where GATAC and ArchR agree on every determined component to |r| = 1.000000
+    (29 of 30; the 30th sits inside a flat trailing spectrum and is not
+    determined by either): 11 of those components come back with opposite
+    signs, and the mean per-cell distance between the two scaled embeddings is
+    10.20 — against 0.204, fifty times smaller, once the signs are aligned.
+
+    There is no canonical sign to align *to*. ArchR takes whatever irlba's
+    random start produces, and its own signs move between its own seeds: on the
+    same fixture, seed 1 vs seed 2 flipped 15 of 29 determined components, seed
+    1 vs seed 3 flipped 20, seed 2 vs seed 3 flipped 16 — a wider spread than
+    GATAC's rule shows against any of them (10, 13, 17). So ArchR's clustering,
+    and therefore the features its next iteration selects, depend in part on its
+    solver's RNG; that is one of the mechanisms behind its ~0.93 seed-to-seed
+    feature Jaccard. :func:`_flip_signs` pins GATAC's sign to the data instead,
+    which is the reproducible choice but does not, and cannot, reproduce any
+    particular ArchR run.
 
     Parameters
     ----------
@@ -475,6 +771,7 @@ def compute_lsi(
     tol: float = 1e-5,
     ncv: int | None = None,
     random_state: int = 0,
+    deterministic: bool = True,
     chunk_size: int | None = None,
 ) -> LSIModel:
     """
@@ -520,6 +817,21 @@ def compute_lsi(
         Solver controls; see :func:`_svd`.
     random_state
         Seed for the Lanczos starting vector.
+    deterministic
+        Use the reproducible solver path: a seeded Lanczos start vector and a
+        fixed-order sparse matrix-vector product, so two runs at the same
+        ``random_state`` give bitwise-identical output. ``False`` restores
+        ``cupyx``'s ``svds``, which is not reproducible at any seed.
+
+        Two caveats, part of the contract rather than footnotes. It costs a
+        **second copy of the fitted matrix on device** — the transpose the
+        fixed-order product needs. And a **streamed (``chunk_size``) run cannot
+        take this path at all**: that transpose is exactly what does not fit,
+        so the request is downgraded to seeding the start vector, with cuSPARSE
+        still nondeterministic underneath. The downgrade is logged, and it is
+        the *effective* mode, not the requested one, that lands in
+        ``LSIModel.deterministic`` and in the ``uns`` params — so a run can be
+        asked afterwards whether it was actually reproducible.
     chunk_size
         Stream the matrix from host memory in row chunks of this size instead
         of holding it in VRAM.
@@ -634,7 +946,10 @@ def compute_lsi(
             X_fit, method=method, scale_to=scale_to, binarize=binarize,
             idf=idf, inv_depth=inv_depth_train,
         )
-        u, s, vt = _svd(X_fit, n_comps, tol=tol, ncv=ncv)
+        used_deterministic = _deterministic_available(X_fit, deterministic)
+        u, s, vt = _svd(X_fit, n_comps, tol=tol, ncv=ncv,
+                        random_state=random_state,
+                        deterministic=deterministic)
         del X_fit
     else:
         Xf = X_train[:, idx].tocsr() if n_kept < n_features else X_train.tocsr()
@@ -644,7 +959,10 @@ def compute_lsi(
         )
         store, op = ChunkedMatrix(Xf, chunk_size), None
         op = store.as_operator()
-        u, s, vt = _svd(op, n_comps, tol=tol, ncv=ncv)
+        used_deterministic = _deterministic_available(op, deterministic)
+        u, s, vt = _svd(op, n_comps, tol=tol, ncv=ncv,
+                        random_state=random_state,
+                        deterministic=deterministic)
         del store, op, Xf
 
     cp.get_default_memory_pool().free_all_blocks()
@@ -663,6 +981,7 @@ def compute_lsi(
         method=method,
         scale_to=float(scale_to),
         binarize=bool(binarize),
+        deterministic=used_deterministic,
         random_state=random_state,
         n_held_out=n_held_out,
         n_empty_cells=n_empty,
@@ -803,7 +1122,18 @@ def _project(
         binarize=model.binarize, idf=idf, inv_depth=inv_depth,
     )
 
-    emb = Xg.dot(cp.asarray(model.feature_loadings))
+    # Deterministic on purpose: this is the step that places the held-out
+    # depth-outlier cells back into the embedding, so cuSPARSE's
+    # nondeterministic SpMM here would make the *output* of an otherwise
+    # bitwise-reproducible fit differ run to run — measured at 1e-4 absolute on
+    # the 179 held-out cells of the PBMC fixture, with the 4,258 fitted cells
+    # already identical.
+    loadings = cp.asarray(model.feature_loadings, dtype=cp.float32)
+    emb = (
+        _spmm(Xg, loadings)
+        if Xg.dtype == cp.float32
+        else Xg.dot(loadings)
+    )
     out = cp.asnumpy(emb).astype(np.float32)
     del Xg, emb, idf, inv_depth, depth
     cp.get_default_memory_pool().free_all_blocks()
@@ -1239,6 +1569,7 @@ def lsi(
     ncv: int | None = None,
     store_model: bool = False,
     random_state: int = 0,
+    deterministic: bool = True,
     inplace: bool = True,
     chunk_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1313,6 +1644,21 @@ def lsi(
         ``n_vars × n_comps`` (73 MB at 606k features, k=30).
     random_state
         Seed for the Lanczos starting vector.
+    deterministic
+        Use the reproducible solver path: a seeded Lanczos start vector and a
+        fixed-order sparse matrix-vector product, so two runs at the same
+        ``random_state`` give bitwise-identical output. ``False`` restores
+        ``cupyx``'s ``svds``, which is not reproducible at any seed.
+
+        Two caveats, part of the contract rather than footnotes. It costs a
+        **second copy of the fitted matrix on device** — the transpose the
+        fixed-order product needs. And a **streamed (``chunk_size``) run cannot
+        take this path at all**: that transpose is exactly what does not fit,
+        so the request is downgraded to seeding the start vector, with cuSPARSE
+        still nondeterministic underneath. The downgrade is logged, and it is
+        the *effective* mode, not the requested one, that lands in
+        ``LSIModel.deterministic`` and in the ``uns`` params — so a run can be
+        asked afterwards whether it was actually reproducible.
     inplace
         Store the result on *adata* and return ``None``; otherwise return
         ``(embedding, singular_values)``.
@@ -1391,6 +1737,7 @@ def lsi(
         tol=tol,
         ncv=ncv,
         random_state=random_state,
+        deterministic=deterministic,
         chunk_size=chunk_size,
     )
 
@@ -1421,6 +1768,7 @@ def lsi(
             tol=tol,
             ncv=ncv,
             random_state=random_state,
+            deterministic=model.deterministic,
             features=features if isinstance(features, str) else "array",
         ),
     }
@@ -1436,6 +1784,7 @@ def lsi(
             "scale_to": model.scale_to,
             "binarize": model.binarize,
             "scale_by_sv": bool(scale_by_sv),
+            "deterministic": model.deterministic,
             "random_state": model.random_state,
         }
     adata.uns["lsi"] = uns
@@ -1482,6 +1831,8 @@ def model_from_adata(adata, uns_key: str = "lsi") -> LSIModel:
         method=int(stored["method"]),
         scale_to=float(stored["scale_to"]),
         binarize=bool(stored["binarize"]),
+        # absent in models written before the reproducible solver existed
+        deterministic=bool(stored.get("deterministic", False)),
         random_state=int(stored["random_state"]),
     )
 
@@ -1506,6 +1857,7 @@ def iterative_lsi(
     tol: float = 1e-5,
     ncv: int | None = None,
     random_state: int = 0,
+    deterministic: bool = True,
     inplace: bool = True,
     chunk_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1551,7 +1903,11 @@ def iterative_lsi(
     cluster_params
         Overrides for the built-in clusterer, e.g.
         ``{"resolution": 2.0, "max_clusters": 6, "k": 20, "flavor": "leiden"}``.
-        Defaults are ArchR's iterative-LSI ``clusterParams``.
+        Defaults are ArchR's iterative-LSI ``clusterParams``. Every keyword of
+        :func:`~gatac.tl._clustering.snn_cluster` is accepted, ``quantize`` and
+        ``max_resolution_retries`` included; the values actually used are
+        recorded in ``uns["iterative_lsi"]["params"]`` under a ``cluster_``
+        prefix.
     cluster_fn
         Replace the built-in clusterer entirely. Receives the scaled,
         depth-filtered embedding and must return one integer label per cell.
@@ -1563,6 +1919,21 @@ def iterative_lsi(
         :func:`lsi`.
     random_state
         Seed for the solver and the clusterer.
+    deterministic
+        Use the reproducible solver path: a seeded Lanczos start vector and a
+        fixed-order sparse matrix-vector product, so two runs at the same
+        ``random_state`` give bitwise-identical output. ``False`` restores
+        ``cupyx``'s ``svds``, which is not reproducible at any seed.
+
+        Two caveats, part of the contract rather than footnotes. It costs a
+        **second copy of the fitted matrix on device** — the transpose the
+        fixed-order product needs. And a **streamed (``chunk_size``) run cannot
+        take this path at all**: that transpose is exactly what does not fit,
+        so the request is downgraded to seeding the start vector, with cuSPARSE
+        still nondeterministic underneath. The downgrade is logged, and it is
+        the *effective* mode, not the requested one, that lands in
+        ``LSIModel.deterministic`` and in the ``uns`` params — so a run can be
+        asked afterwards whether it was actually reproducible.
     inplace
         Store on *adata* and return ``None``, else return
         ``(embedding, singular_values)``.
@@ -1603,6 +1974,10 @@ def iterative_lsi(
     n_cells, n_vars = X.shape
     depth = _resolve_depth(adata, depth_key)
 
+    # Every keyword `snn_cluster` takes, so that `cluster_params` can reach
+    # all of them: `quantize` and `max_resolution_retries` were previously
+    # unreachable from here, which made them impossible to ablate through the
+    # public API even though both change the partition.
     params = {
         "k": 20,
         "resolution": 2.0,
@@ -1611,6 +1986,9 @@ def iterative_lsi(
         "n_outlier": 5,
         "knn_assign": 10,
         "flavor": "leiden",
+        "knn": "exact",
+        "quantize": 2,
+        "max_resolution_retries": 3,
     }
     if cluster_params:
         unknown = set(cluster_params) - set(params)
@@ -1676,6 +2054,7 @@ def iterative_lsi(
             tol=tol,
             ncv=ncv,
             random_state=random_state,
+            deterministic=deterministic,
             chunk_size=chunk_size,
         )
         if it == iterations:
@@ -1786,6 +2165,7 @@ def iterative_lsi(
             tol=tol,
             ncv=ncv,
             random_state=random_state,
+            deterministic=model.deterministic,
             cluster_fn=cluster_fn,
             **{f"cluster_{k}": v for k, v in params.items()},
         ),
@@ -1802,6 +2182,7 @@ def iterative_lsi(
             "scale_to": model.scale_to,
             "binarize": model.binarize,
             "scale_by_sv": True,
+            "deterministic": model.deterministic,
             "random_state": model.random_state,
         }
     adata.uns["iterative_lsi"] = uns

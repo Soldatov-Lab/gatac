@@ -49,7 +49,14 @@ from ._gpu import ChunkedMatrix, _to_gpu_csr
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["lsi", "LSIModel", "project_lsi", "model_from_adata"]
+__all__ = [
+    "lsi",
+    "LSIModel",
+    "project_lsi",
+    "model_from_adata",
+    "initial_features",
+    "cluster_var_features",
+]
 
 #: ArchR's ``LSIMethod`` string aliases.
 _METHOD_ALIASES = {
@@ -719,6 +726,212 @@ def project_lsi(model: LSIModel, X_new) -> np.ndarray:
             "retained features; their embedding rows are zero."
         )
     return emb
+
+# ---------------------------------------------------------------------------
+# Iterative-LSI feature selection (ArchR addIterativeLSI / .identifyVarFeatures)
+# ---------------------------------------------------------------------------
+#
+# Per-cluster pseudo-bulk accumulation with one warp per cell and an atomicAdd
+# per nonzero. This avoids both temporaries the naive form needs: the
+# nnz-sized row-id array a searchsorted approach builds, and the
+# n_clusters x n_features int64 bincount.
+#
+# float32 accumulation is exact here: the values added are small integers
+# (1 when binarizing, otherwise raw counts), and integers below 2^24 are
+# represented exactly. The normalisation and variance that follow run in
+# float64, so a near-tie in the variance ranking is not decided by float32.
+_cluster_sums_kernel = cp.RawKernel(
+    r"""
+    extern "C" __global__
+    void cluster_sums(const float* data, const int* indices, const int* indptr,
+                      const int* cluster, float* group,
+                      const int n_features, const int binarize,
+                      const int n_rows) {
+        int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int lane = threadIdx.x & 31;
+        if (warp >= n_rows) return;
+
+        float* row = group + (long long)cluster[warp] * (long long)n_features;
+        int s = indptr[warp], e = indptr[warp + 1];
+        for (int j = s + lane; j < e; j += 32) {
+            atomicAdd(row + indices[j], binarize ? 1.0f : data[j]);
+        }
+    }
+    """,
+    "cluster_sums",
+)
+
+
+def initial_features(
+    accessibility: np.ndarray,
+    n_features: int = 25_000,
+    *,
+    total_features: int = 500_000,
+    filter_quantile: float = 0.995,
+) -> np.ndarray:
+    """
+    ArchR's ``firstSelection = "top"`` initial feature set.
+
+    A rank *window*, not a quantile trim of the whole distribution — which is
+    why :func:`gatac.pp.select_features` cannot be reused here. Transcribed
+    from ``addIterativeLSI`` (ArchR 1.0.3)::
+
+        nFeature <- varFeatures[1]
+        rmTop    <- floor((1 - filterQuantile) * totalFeatures)
+        if (sum(totalAcc$rowSums > 0) > 2.25 * varFeatures) {
+            topIdx <- head(order(rowSums, decreasing = TRUE),
+                           nFeature + rmTop)[-seq_len(rmTop)]
+        } else {
+            topIdx <- head(order(rowSums, decreasing = TRUE), nFeature)
+        }
+        topFeatures <- totalAcc[sort(topIdx), ]
+
+    Note the guard: the most accessible ``rmTop`` features are skipped **only**
+    when enough features are non-zero, otherwise ArchR falls back to a plain
+    top-N (printing "Not Enough Non-Zero Features to Filter!"). ``rmTop`` is
+    computed from the ``total_features`` *parameter*, not from how many
+    features the matrix actually has.
+
+    Zero-accessibility features are not removed here; ``.computeLSI`` drops
+    them later via its own ``rowSm > 0`` check, so removing them at this step
+    would diverge from ArchR.
+
+    Parameters
+    ----------
+    accessibility
+        Per-feature accessibility (ArchR's ``totalAcc$rowSums``). For a
+        binarized tile matrix this is the number of cells per feature.
+    n_features
+        ArchR's ``varFeatures`` — the window width.
+    total_features
+        ArchR's ``totalFeatures``, used only to size the skipped head.
+    filter_quantile
+        ArchR's ``filterQuantile``.
+
+    Returns
+    -------
+    np.ndarray
+        Selected feature indices, ascending.
+    """
+    acc = np.asarray(accessibility)
+    n_nonzero = int((acc > 0).sum())
+    rm_top = int(np.floor((1.0 - filter_quantile) * total_features))
+
+    # R's order() is stable, so ties keep ascending index order
+    order = np.argsort(-acc, kind="stable")
+    if n_nonzero > 2.25 * n_features:
+        top = order[rm_top : rm_top + n_features]
+    else:
+        logger.info(
+            f"Only {n_nonzero:,} non-zero feature(s) for n_features="
+            f"{n_features:,}; not enough to skip the top {rm_top:,} "
+            "(ArchR: Not Enough Non-Zero Features to Filter!)."
+        )
+        top = order[:n_features]
+    return np.sort(top)
+
+
+def cluster_var_features(
+    X_pool,
+    clusters: np.ndarray,
+    n_features: int = 25_000,
+    *,
+    scale_to: float = 1e4,
+    binarize: bool = True,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ArchR's per-cluster variable features (``selectionMethod = "var"``).
+
+    Transcribed from ``ArchR:::.identifyVarFeatures``, whose ``groupMat`` is
+    **features × clusters**::
+
+        groupMat <- log2(t(t(groupMat) / colSums(groupMat)) * scaleTo + 1)
+        var      <- matrixStats::rowVars(groupMat)
+        idx      <- sort(head(order(var, decreasing = TRUE), nFeature))
+
+    So the normalisation is per *cluster* — each cluster's pseudo-bulk sums to
+    ``scale_to`` — and the variance is per *feature* across clusters. This
+    implementation accumulates the transpose (clusters × features), so **both
+    reductions flip**: ``sum(axis=1, keepdims=True)`` and
+    ``var(axis=0, ddof=1)``. Writing ArchR's R idiom against this orientation
+    would score clusters instead of features.
+
+    ``ddof=1`` matches ``matrixStats::rowVars``.
+
+    Parameters
+    ----------
+    X_pool
+        Cells × features matrix restricted to the accessibility pool from
+        :func:`initial_features` — ArchR scores over that pool, not over every
+        feature in the matrix.
+    clusters
+        Integer cluster label per cell.
+    n_features
+        How many features to keep.
+    scale_to
+        ArchR's ``scaleTo``.
+    binarize
+        Accumulate presence rather than counts.
+    chunk_size
+        Stream the matrix from host memory in row chunks of this size.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(selected_indices_ascending, variance_per_pool_feature)``.
+    """
+    labels = np.asarray(clusters)
+    if labels.shape[0] != X_pool.shape[0]:
+        raise ValueError(
+            f"clusters has length {labels.shape[0]} but X_pool has "
+            f"{X_pool.shape[0]} rows."
+        )
+    uniq, codes = np.unique(labels, return_inverse=True)
+    k = len(uniq)
+    if k < 2:
+        raise ValueError(
+            "Variable-feature selection needs at least 2 clusters "
+            f"(got {k}). ArchR returns the previous feature set in this case."
+        )
+    n_pool = X_pool.shape[1]
+    group = cp.zeros((k, n_pool), dtype=cp.float32)
+    codes_gpu = cp.asarray(codes.astype(np.int32))
+
+    def _accumulate(Xg: cusp.csr_matrix, code_slice: cp.ndarray) -> None:
+        _launch_warp_per_row(
+            _cluster_sums_kernel, Xg.shape[0],
+            Xg.data.astype(cp.float32, copy=False),
+            Xg.indices.astype(cp.int32, copy=False),
+            Xg.indptr.astype(cp.int32, copy=False),
+            code_slice, group, np.int32(n_pool),
+            np.int32(bool(binarize)), np.int32(Xg.shape[0]),
+        )
+
+    if chunk_size is None:
+        _accumulate(_to_gpu_csr(X_pool), codes_gpu)
+    else:
+        Xh = X_pool.tocsr()
+        for start in range(0, Xh.shape[0], chunk_size):
+            end = min(start + chunk_size, Xh.shape[0])
+            _accumulate(_to_gpu_csr(Xh[start:end]), codes_gpu[start:end])
+            cp.get_default_memory_pool().free_all_blocks()
+
+    # float64 from here: a near-tie in the variance ranking should not be
+    # decided by float32 rounding, and the group matrix is only k x n_pool.
+    g = group.astype(cp.float64)
+    del group
+    totals = g.sum(axis=1, keepdims=True)
+    totals = cp.where(totals == 0, cp.float64(1.0), totals)
+    g = cp.log2(g / totals * cp.float64(scale_to) + cp.float64(1.0))
+    var = cp.asnumpy(g.var(axis=0, ddof=1))
+    del g
+    cp.get_default_memory_pool().free_all_blocks()
+
+    n_sel = min(n_features, n_pool)
+    idx = np.argsort(-var, kind="stable")[:n_sel]
+    return np.sort(idx), var
+
 
 # ---------------------------------------------------------------------------
 # Public API

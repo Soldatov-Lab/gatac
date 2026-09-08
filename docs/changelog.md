@@ -15,6 +15,10 @@
 - Latent semantic indexing — GPU TF-IDF plus truncated SVD (`tl.lsi`),
   reproducing ArchR's `.computeLSI` for all three `LSIMethod` variants,
   with projection of new cells onto a fitted embedding (`tl.project_lsi`).
+- Iterative LSI (`tl.iterative_lsi`), a port of ArchR's `addIterativeLSI`:
+  iterative feature selection driven by per-cluster accessibility variance,
+  with GPU SNN + Leiden/Louvain clustering between rounds. Adds a cuGraph
+  dependency to the CUDA extras; `tl.lsi` itself does not require it.
 - Peak calling, peak merging, and peak matrix construction.
 - Marker peak detection with GPU-accelerated binomial test and BH correction.
 - Motif scanning from MEME format files.

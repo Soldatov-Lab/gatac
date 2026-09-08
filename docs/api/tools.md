@@ -17,7 +17,11 @@ Online Variational Bayes (`lda`, `MiniBatchLDA`).
 
 `lsi` reproduces `ArchR:::.computeLSI` component for component, including its
 three `LSIMethod` variants, its depth-outlier hold-out, and the
-depth-correlation dimension filter.
+depth-correlation dimension filter. `iterative_lsi` is the port of
+`ArchR::addIterativeLSI`: it clusters on a first embedding, keeps the features
+whose per-cluster accessibility varies most, and redoes the decomposition on
+those — so each round selects for the structure the previous round found. It
+requires cuGraph for the clustering step; `lsi` does not.
 
 ```{eval-rst}
 .. currentmodule:: gatac.tl
@@ -28,6 +32,7 @@ depth-correlation dimension filter.
 
    spectral
    lsi
+   iterative_lsi
    project_lsi
    model_from_adata
    lda

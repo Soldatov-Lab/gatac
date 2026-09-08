@@ -20,7 +20,18 @@ from .chromvar import (
     compute_peak_bias,
 )
 from .spectral import spectral
-from .lsi import lsi, iterative_lsi, project_lsi, model_from_adata, LSIModel
+from .lsi import (
+    lsi,
+    iterative_lsi,
+    project_lsi,
+    model_from_adata,
+    LSIModel,
+    initial_features,
+    accessibility_pool,
+    cluster_var_features,
+    feature_accessibility,
+    scale_dims,
+)
 from .lda import lda, MiniBatchLDA
 
 __all__ = [
@@ -46,6 +57,11 @@ __all__ = [
     "project_lsi",
     "model_from_adata",
     "LSIModel",
+    "initial_features",
+    "accessibility_pool",
+    "cluster_var_features",
+    "feature_accessibility",
+    "scale_dims",
     "lda",
     "MiniBatchLDA",
 ]

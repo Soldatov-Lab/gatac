@@ -9,9 +9,15 @@ scoring, and topic modelling.
 ## Dimensionality reduction
 
 Compute a spectral decomposition of the cell × feature matrix — the standard
-entry point for UMAP and clustering in ATAC-seq workflows (`spectral`) — or
-model topics over the peak-accessibility matrix with GPU-accelerated
-mini-batch Online Variational Bayes (`lda`, `MiniBatchLDA`).
+entry point for UMAP and clustering in ATAC-seq workflows (`spectral`) — run
+TF-IDF followed by a truncated SVD, the Signac/ArchR latent semantic indexing
+(`lsi`, with `project_lsi` to place new cells on a fitted embedding) — or model
+topics over the peak-accessibility matrix with GPU-accelerated mini-batch
+Online Variational Bayes (`lda`, `MiniBatchLDA`).
+
+`lsi` reproduces `ArchR:::.computeLSI` component for component, including its
+three `LSIMethod` variants, its depth-outlier hold-out, and the
+depth-correlation dimension filter.
 
 ```{eval-rst}
 .. currentmodule:: gatac.tl
@@ -21,6 +27,9 @@ mini-batch Online Variational Bayes (`lda`, `MiniBatchLDA`).
    :nosignatures:
 
    spectral
+   lsi
+   project_lsi
+   model_from_adata
    lda
    MiniBatchLDA
 ```

@@ -49,7 +49,7 @@ from ._gpu import ChunkedMatrix, _to_gpu_csr
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LSIModel"]
+__all__ = ["lsi", "LSIModel", "project_lsi", "model_from_adata"]
 
 #: ArchR's ``LSIMethod`` string aliases.
 _METHOD_ALIASES = {
@@ -719,3 +719,373 @@ def project_lsi(model: LSIModel, X_new) -> np.ndarray:
             "retained features; their embedding rows are zero."
         )
     return emb
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def _resolve_features(adata, features) -> np.ndarray | None:
+    """Resolve the feature selector to a boolean mask, or None for all."""
+    if features is None:
+        return None
+    if isinstance(features, str):
+        if features not in adata.var.columns:
+            raise KeyError(
+                f"Column '{features}' not found in adata.var. Call "
+                "`pp.select_features` first, pass a boolean array, or set "
+                "`features=None` to use every feature."
+            )
+        return adata.var[features].to_numpy().astype(bool)
+    mask = np.asarray(features)
+    if mask.dtype == bool:
+        if mask.shape[0] != adata.n_vars:
+            raise ValueError(
+                f"Boolean feature mask has length {mask.shape[0]}, expected "
+                f"{adata.n_vars}."
+            )
+        return mask
+    out = np.zeros(adata.n_vars, dtype=bool)
+    out[mask] = True
+    return out
+
+
+def _resolve_depth(adata, depth_key: str) -> np.ndarray | None:
+    """
+    Total fragments per cell, for the depth-correlation filter.
+
+    ArchR correlates each component against ``nFrags``; the GATAC analogue is
+    the ``n_unique`` column written by :func:`gatac.pp.compute_metrics`. Using
+    the nonzero count of whichever feature submatrix was selected instead drops
+    components ArchR keeps.
+    """
+    if depth_key and depth_key in adata.obs.columns:
+        return adata.obs[depth_key].to_numpy(dtype=np.float64)
+    return None
+
+
+def _jsonable(value):
+    """Coerce a parameter value to something ``h5py`` can store, or drop it."""
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if value is None:
+        return "None"
+    if isinstance(value, (tuple, list)) and all(
+        isinstance(v, (bool, int, float)) for v in value
+    ):
+        return np.asarray(value)
+    return None
+
+
+def _pack_params(**kwargs) -> dict:
+    """
+    Build the ``uns`` params dict, dropping anything unserialisable.
+
+    Callables (``cluster_fn``) and arbitrary objects would make ``write_h5ad``
+    fail, so they never reach ``uns``: a callable is recorded as a flag plus its
+    qualified name, and anything else non-scalar is dropped with a debug note.
+    """
+    out: dict = {}
+    for key, value in kwargs.items():
+        if callable(value):
+            out[f"{key}_supplied"] = True
+            out[f"{key}_name"] = getattr(value, "__qualname__", repr(value))
+            continue
+        coerced = _jsonable(value)
+        if coerced is None:
+            logger.debug(f"Dropping unserialisable param {key!r} from uns.")
+            continue
+        out[key] = coerced
+    return out
+
+
+def _align_loadings(
+    model: LSIModel, feat_mask: np.ndarray | None, n_vars: int
+) -> np.ndarray:
+    """
+    Scatter the fitted loadings onto the full var axis.
+
+    ``varm`` requires its first axis to be exactly ``n_vars``, but the model is
+    fitted over a subset (the feature mask composed with the model's own
+    retained-feature ``idx``). Unfitted features get zeros rather than NaN, so a
+    stray downstream matmul contributes nothing instead of poisoning the result;
+    which rows are real is recoverable from the stored mask.
+    """
+    n_comps = model.feature_loadings.shape[1]
+    full = np.zeros((n_vars, n_comps), dtype=np.float32)
+    base = np.where(feat_mask)[0] if feat_mask is not None else np.arange(n_vars)
+    full[base[model.idx]] = model.feature_loadings
+    return full
+
+
+def _fitted_mask(
+    model: LSIModel, feat_mask: np.ndarray | None, n_vars: int
+) -> np.ndarray:
+    """Boolean mask over the full var axis of the features actually fitted."""
+    out = np.zeros(n_vars, dtype=bool)
+    base = np.where(feat_mask)[0] if feat_mask is not None else np.arange(n_vars)
+    out[base[model.idx]] = True
+    return out
+
+
+def lsi(
+    adata,
+    n_comps: int = 30,
+    *,
+    method: int | str = 2,
+    features: str | np.ndarray | None = "selected",
+    binarize: bool = True,
+    scale_to: float = 1e4,
+    outlier_quantiles: tuple[float, float] | None = None,
+    depth_cor_cutoff: float | None = 0.75,
+    depth_key: str = "n_unique",
+    scale_by_sv: bool = True,
+    tol: float = 1e-5,
+    ncv: int | None = None,
+    store_model: bool = False,
+    random_state: int = 0,
+    inplace: bool = True,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    GPU-accelerated LSI: TF-IDF followed by truncated SVD.
+
+    A port of ``ArchR:::.computeLSI``, and the same computation Signac performs
+    with ``RunTFIDF`` + ``RunSVD``. For the iterative feature-selection variant
+    (``ArchR::addIterativeLSI``) see :func:`gatac.tl.iterative_lsi`.
+
+    Parameters
+    ----------
+    adata
+        AnnData with a sparse cell × feature matrix in ``adata.X`` — a tile or
+        peak matrix, count-valued or binary.
+    n_comps
+        Number of components. Must be smaller than both the number of fitted
+        cells and the number of retained features. Note that the solver's cost
+        is driven far more by ``n_comps`` than by cell count: components beyond
+        the rank the data supports sit in a near-degenerate tail that the
+        eigensolver then has to separate. ``uns["lsi"]["singular_values"]``
+        shows where your own spectrum flattens.
+    method
+        ArchR's ``LSIMethod``: ``1`` (``"tf-logidf"``), ``2``
+        (``"log(tf-idf)"``, the default) or ``3`` (``"logtf-logidf"``). String
+        aliases are accepted. ``2`` is the default because it is what
+        ``addIterativeLSI`` uses — only the internal ``.computeLSI`` defaults to
+        1 — and it is also Signac's ``RunTFIDF(method = 1)``. Methods 1 and 3
+        span the same subspace on ATAC-scale data; 2 is genuinely different, and
+        is the only one that produces the familiar depth-correlated first
+        component.
+    features
+        Which features to use. ``"selected"`` (default) reads the boolean mask
+        in ``adata.var["selected"]`` and requires a prior
+        :func:`gatac.pp.select_features`; a boolean or integer array selects
+        directly; ``None`` uses every feature.
+    binarize
+        Treat every nonzero as 1, as ArchR does by default. This also
+        determines what per-cell depth means — the number of nonzero features
+        when binarizing, the sum of counts otherwise — because ArchR binarizes
+        before computing it. GATAC tile matrices are ``uint16`` unless built
+        with ``count_strategy="binarize"``, so leaving this ``True`` on a count
+        matrix is the faithful choice, not a no-op.
+    scale_to
+        ArchR's ``scaleTo``; only used by ``method=2``.
+    outlier_quantiles
+        Depth quantiles whose tails are held out of the fit and projected back
+        in afterwards. ``None`` (default) fits every cell: for a one-shot
+        embedding you asked for an embedding of your cells, not of 96 % of
+        them. Pass ``(0.02, 0.98)`` for exact ``.computeLSI`` parity.
+    depth_cor_cutoff
+        Drop components whose absolute correlation with ``log10`` sequencing
+        depth exceeds this (ArchR's ``corCutOff``, default 0.75). ``None``
+        keeps every component; the correlations are reported either way.
+    depth_key
+        ``adata.obs`` column holding total fragments per cell, used only for
+        the depth correlation. Defaults to ``"n_unique"``, written by
+        :func:`gatac.pp.compute_metrics`. Falls back to the selected
+        submatrix's per-cell depth, with a warning, when absent.
+    scale_by_sv
+        Return ``V @ diag(d)``, as ArchR's ``matSVD`` does, rather than the
+        orthonormal ``V``.
+    tol, ncv
+        Solver controls. ``tol=1e-5`` matches irlba, the solver ArchR and
+        Signac use, rather than CuPy's machine-precision default; ``ncv=None``
+        picks a Krylov basis of ``max(4 * n_comps + 1, n_comps + 60)``, which
+        measured 29–47 % faster than CuPy's default at 200k–500k cells with no
+        loss of accuracy.
+    store_model
+        Also store the feature loadings and the metadata needed to project new
+        cells. Off by default: aligned to the full var axis the loadings are
+        ``n_vars × n_comps`` (73 MB at 606k features, k=30).
+    random_state
+        Seed for the Lanczos starting vector.
+    inplace
+        Store the result on *adata* and return ``None``; otherwise return
+        ``(embedding, singular_values)``.
+    chunk_size
+        Stream the matrix from host memory in row chunks of this many cells
+        instead of holding it in VRAM. A float32 CSR costs about 8 bytes per
+        nonzero on device, so this is rarely needed — a 46 GB card holds
+        roughly 5 billion nonzeros resident.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray] | None
+        ``None`` when ``inplace=True``, having written:
+
+        * ``adata.obsm["X_lsi"]`` — the embedding, one row per cell
+        * ``adata.uns["lsi"]`` — singular values, per-component depth
+          correlation, dropped components, the parameters used, and the model
+          when ``store_model=True``
+        * ``adata.varm["LSI"]`` — feature loadings, when ``store_model=True``
+
+        Otherwise ``(embedding, singular_values)``.
+
+    Notes
+    -----
+    Cells with no signal in the selected features raise rather than producing
+    a degenerate row, matching :func:`gatac.tl.spectral`. Held-out depth
+    outliers are projected back in, so the embedding always has one row per
+    cell in the original order.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.pp.select_features(adata, n_features=50_000)
+    >>> ga.tl.lsi(adata, n_comps=30)
+    >>> adata.obsm["X_lsi"].shape
+    (n_cells, 30)
+
+    For exact ArchR ``.computeLSI`` parity, including its depth-outlier
+    hold-out:
+
+    >>> ga.tl.lsi(adata, n_comps=30, method=1, outlier_quantiles=(0.02, 0.98))
+    """
+    method_id = _resolve_method(method)
+    feat_mask = _resolve_features(adata, features)
+
+    X = adata.X
+    if feat_mask is not None:
+        n_sel = int(feat_mask.sum())
+        if n_sel == 0:
+            raise ValueError(
+                "The feature selection is empty; nothing to decompose."
+            )
+        logger.info(
+            f"Running LSI on {adata.n_obs:,} cells x {n_sel:,} selected "
+            f"features (method {method_id})."
+        )
+        X = X[:, feat_mask]
+    else:
+        logger.info(
+            f"Running LSI on {adata.n_obs:,} cells x {adata.n_vars:,} features "
+            f"(method {method_id})."
+        )
+
+    depth = _resolve_depth(adata, depth_key)
+
+    model = compute_lsi(
+        X,
+        n_comps,
+        method=method_id,
+        scale_to=scale_to,
+        binarize=binarize,
+        outlier_quantiles=outlier_quantiles,
+        depth=depth,
+        depth_cor_cutoff=depth_cor_cutoff,
+        scale_by_sv=scale_by_sv,
+        tol=tol,
+        ncv=ncv,
+        random_state=random_state,
+        chunk_size=chunk_size,
+    )
+
+    logger.info(
+        f"LSI complete: {model.embedding.shape[1]} component(s) kept "
+        f"(top singular value {model.singular_values[0]:.4g})."
+    )
+
+    if not inplace:
+        return model.embedding, model.singular_values
+
+    adata.obsm["X_lsi"] = model.embedding
+    uns: dict = {
+        "singular_values": model.singular_values,
+        "depth_cor": model.depth_cor,
+        "dims_dropped": model.dims_dropped,
+        "n_held_out": model.n_held_out,
+        "n_zero_depth_projected": model.n_zero_depth_projected,
+        "params": _pack_params(
+            n_comps=n_comps,
+            method=method_id,
+            binarize=binarize,
+            scale_to=scale_to,
+            outlier_quantiles=outlier_quantiles,
+            depth_cor_cutoff=depth_cor_cutoff,
+            depth_key=depth_key,
+            scale_by_sv=scale_by_sv,
+            tol=tol,
+            ncv=ncv,
+            random_state=random_state,
+            features=features if isinstance(features, str) else "array",
+        ),
+    }
+    if store_model:
+        adata.varm["LSI"] = _align_loadings(model, feat_mask, adata.n_vars)
+        uns["model"] = {
+            "loadings_key": "LSI",
+            "feature_mask": _fitted_mask(model, feat_mask, adata.n_vars),
+            "row_sums": model.row_sums,
+            "n_train": model.n_train,
+            "singular_values": model.singular_values,
+            "method": model.method,
+            "scale_to": model.scale_to,
+            "binarize": model.binarize,
+            "scale_by_sv": bool(scale_by_sv),
+            "random_state": model.random_state,
+        }
+    adata.uns["lsi"] = uns
+    return None
+
+
+def model_from_adata(adata, uns_key: str = "lsi") -> LSIModel:
+    """
+    Rebuild an :class:`LSIModel` from an AnnData written with
+    ``store_model=True``.
+
+    Survives a ``write_h5ad`` / ``read_h5ad`` round trip, which is the point of
+    storing plain arrays and scalars rather than the dataclass itself.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying ``uns[uns_key]["model"]`` and the referenced ``varm``
+        entry.
+    uns_key
+        Which ``uns`` entry to read — ``"lsi"`` or ``"iterative_lsi"``.
+
+    Returns
+    -------
+    LSIModel
+        Without ``embedding`` populated (it is in ``obsm``), ready for
+        :func:`project_lsi`.
+    """
+    if uns_key not in adata.uns or "model" not in adata.uns[uns_key]:
+        raise KeyError(
+            f"adata.uns['{uns_key}']['model'] not found. Re-run with "
+            "`store_model=True` to make projection possible."
+        )
+    stored = adata.uns[uns_key]["model"]
+    mask = np.asarray(stored["feature_mask"], dtype=bool)
+    loadings_full = np.asarray(adata.varm[str(stored["loadings_key"])])
+    return LSIModel(
+        embedding=np.empty((0, loadings_full.shape[1]), dtype=np.float32),
+        singular_values=np.asarray(stored["singular_values"]),
+        feature_loadings=loadings_full[mask].astype(np.float32),
+        idx=np.arange(int(mask.sum()), dtype=np.int64),
+        row_sums=np.asarray(stored["row_sums"], dtype=np.float32),
+        n_train=int(stored["n_train"]),
+        method=int(stored["method"]),
+        scale_to=float(stored["scale_to"]),
+        binarize=bool(stored["binarize"]),
+        random_state=int(stored["random_state"]),
+    )

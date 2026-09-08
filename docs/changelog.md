@@ -12,6 +12,9 @@
 - Fragment filtering with Polars query engine (`filter_fragments`).
 - CLI: `convert`, `metrics`, `filter`, `tile`, `gene`, `features`, `combine`.
 - Spectral embedding (`tl.spectral`).
+- Latent semantic indexing — GPU TF-IDF plus truncated SVD (`tl.lsi`),
+  reproducing ArchR's `.computeLSI` for all three `LSIMethod` variants,
+  with projection of new cells onto a fitted embedding (`tl.project_lsi`).
 - Peak calling, peak merging, and peak matrix construction.
 - Marker peak detection with GPU-accelerated binomial test and BH correction.
 - Motif scanning from MEME format files.

@@ -20,6 +20,7 @@ from .chromvar import (
     compute_peak_bias,
 )
 from .spectral import spectral
+from .lsi import lsi, project_lsi, model_from_adata, LSIModel
 from .lda import lda, MiniBatchLDA
 
 __all__ = [
@@ -40,6 +41,10 @@ __all__ = [
     "sample_bg_peaks",
     "compute_peak_bias",
     "spectral",
+    "lsi",
+    "project_lsi",
+    "model_from_adata",
+    "LSIModel",
     "lda",
     "MiniBatchLDA",
 ]

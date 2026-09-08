@@ -56,6 +56,8 @@ __all__ = [
     "model_from_adata",
     "initial_features",
     "cluster_var_features",
+    "scale_dims",
+    "feature_accessibility",
 ]
 
 #: ArchR's ``LSIMethod`` string aliases.
@@ -287,6 +289,32 @@ def tfidf_gpu(
     return idf, inv_depth
 
 
+def _flip_signs(u: cp.ndarray, vt: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
+    """
+    Pin the arbitrary sign of each singular triplet.
+
+    An SVD determines each component only up to a simultaneous sign flip of
+    its left and right vectors, and ``cupyx``'s ``svds`` does not fix the
+    choice: repeated runs on identical input with an identical
+    ``random_state`` return components whose magnitudes agree to ~1e-4 but
+    whose signs differ.
+
+    Per-column sign is irrelevant to most downstream use (a correlation, a
+    distance, UMAP), but it is *not* irrelevant here: ArchR's ``scaleDims``
+    z-scores each cell **across** dimensions, mixing the columns, so a flipped
+    sign changes the scaled embedding, the depth correlations computed from it,
+    and the clustering built on it.
+
+    The convention is sklearn's ``svd_flip``: make the entry of largest
+    absolute value in each left singular vector positive, flipping the matching
+    right vector to compensate. The product ``u @ diag(s) @ vt`` is unchanged.
+    """
+    idx = cp.argmax(cp.abs(u), axis=0)
+    signs = cp.sign(u[idx, cp.arange(u.shape[1])])
+    signs = cp.where(signs == 0, cp.float32(1.0), signs).astype(u.dtype)
+    return u * signs, vt * signs[:, None]
+
+
 def _svd(
     X,
     n_comps: int,
@@ -306,6 +334,9 @@ def _svd(
 
     Randomized SVD is not offered: against a float64 ARPACK reference it lost
     the trailing components on both CPU and GPU.
+
+    Component signs are pinned by :func:`_flip_signs`, without which the
+    output is not reproducible run to run.
     """
     n_rows, n_cols = X.shape
     max_k = min(n_rows, n_cols) - 1
@@ -319,7 +350,52 @@ def _svd(
 
     u, s, vt = cusla.svds(X, k=n_comps, tol=tol, ncv=ncv)
     order = cp.argsort(s)[::-1]
-    return u[:, order], s[order], vt[order]
+    u, s, vt = u[:, order], s[order], vt[order]
+    # svds leaves each component's sign arbitrary and does not reproduce it
+    # across runs; pin it so the embedding is a deterministic function of the
+    # data (see _flip_signs).
+    u, vt = _flip_signs(u, vt)
+    return u, s, vt
+
+
+def scale_dims(
+    embedding: np.ndarray, scale_max: float | None = None
+) -> np.ndarray:
+    """
+    ArchR's ``scaleDims`` — z-score each **cell** across its dimensions.
+
+    This is ``ArchR:::.scaleDims`` → ``.rowZscores``, and the axis is easy to
+    get wrong: it standardises every *row* (one cell's embedding vector to mean
+    0, sd 1), not every column. Per-dimension standardisation is a different
+    operation and gives different results downstream — notably it leaves the
+    depth correlation of a component unchanged, whereas ArchR's per-cell
+    scaling does not (see :func:`drop_depth_correlated`).
+
+    ArchR applies this before clustering and before its ``corCutOff`` filter,
+    but the stored ``matSVD`` itself is unscaled — scaling happens on the way
+    out, in ``getReducedDims(scaleDims = TRUE)``.
+
+    Parameters
+    ----------
+    embedding
+        ``n_cells x n_dims``.
+    scale_max
+        Clip to ``[-scale_max, scale_max]`` afterwards, as
+        ``.rowZscores(limit = TRUE)`` does. ``None`` (ArchR's default) does not
+        clip.
+
+    Returns
+    -------
+    np.ndarray
+        The scaled embedding, float32.
+    """
+    e = np.asarray(embedding, dtype=np.float64)
+    sd = e.std(axis=1, ddof=1, keepdims=True)      # matrixStats::rowSds
+    sd = np.where(sd == 0, 1.0, sd)
+    z = (e - e.mean(axis=1, keepdims=True)) / sd
+    if scale_max is not None:
+        z = np.clip(z, -scale_max, scale_max)
+    return z.astype(np.float32)
 
 
 def drop_depth_correlated(
@@ -333,6 +409,11 @@ def drop_depth_correlated(
     *depth* should be **total fragments per cell** — ``obs["n_unique"]``, the
     analogue of ArchR's ``nFrags`` — not the nonzero count of whichever feature
     submatrix was used; using the latter drops components ArchR keeps.
+
+    *embedding* should already be scaled with :func:`scale_dims`, since that is
+    what ArchR correlates. Its per-cell z-scoring is not a per-column
+    transform, so unlike a per-dimension standardisation it genuinely changes
+    the correlations.
 
     Returns
     -------
@@ -580,8 +661,12 @@ def compute_lsi(
     else:
         depth_for_cor = np.asarray(depth)
 
+    # ArchR filters on the *scaled* dims (.LSICluster and getReducedDims both
+    # z-score per cell first), and because that scaling is per row rather than
+    # per column it changes the correlations — on a real tile matrix it was the
+    # difference between dropping component 1 and keeping it.
     keep, r = drop_depth_correlated(
-        model.embedding, depth_for_cor, cutoff=depth_cor_cutoff
+        scale_dims(model.embedding), depth_for_cor, cutoff=depth_cor_cutoff
     )
     model.depth_cor = r
     model.dims_dropped = np.where(~keep)[0]
@@ -760,6 +845,33 @@ _cluster_sums_kernel = cp.RawKernel(
     """,
     "cluster_sums",
 )
+
+
+def feature_accessibility(X, binarize: bool = True) -> np.ndarray:
+    """
+    Per-feature accessibility (ArchR's ``totalAcc$rowSums``), on GPU.
+
+    The obvious host-side route — ``np.diff(X.tocsc().indptr)`` — converts the
+    whole matrix to CSC, which on a 665 M-nonzero tile matrix measured 27 s and
+    dominated everything else in the pipeline put together. A ``bincount`` over
+    the column indices is the same quantity: in a valid CSR each ``(row, col)``
+    pair appears at most once, so counting column indices *is* the per-feature
+    cell count.
+
+    Parameters
+    ----------
+    X
+        Cells × features sparse matrix.
+    binarize
+        Count cells per feature (``True``) rather than summing counts.
+
+    Returns
+    -------
+    np.ndarray
+        Length ``n_features``.
+    """
+    Xg = _to_gpu_csr(X)
+    return cp.asnumpy(_feature_sums(Xg, binarize))
 
 
 def initial_features(

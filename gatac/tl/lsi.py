@@ -43,6 +43,7 @@ import cupy as cp
 import cupyx.scipy.sparse as cusp
 import cupyx.scipy.sparse.linalg as cusla
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 
 from ._gpu import ChunkedMatrix, _to_gpu_csr
@@ -58,6 +59,8 @@ __all__ = [
     "cluster_var_features",
     "scale_dims",
     "feature_accessibility",
+    "accessibility_pool",
+    "iterative_lsi",
 ]
 
 #: ArchR's ``LSIMethod`` string aliases.
@@ -150,6 +153,7 @@ class LSIModel:
     dims_dropped: np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
     n_held_out: int = 0
     n_zero_depth_projected: int = 0
+    n_empty_cells: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -305,13 +309,25 @@ def _flip_signs(u: cp.ndarray, vt: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
     sign changes the scaled embedding, the depth correlations computed from it,
     and the clustering built on it.
 
-    The convention is sklearn's ``svd_flip``: make the entry of largest
-    absolute value in each left singular vector positive, flipping the matching
-    right vector to compensate. The product ``u @ diag(s) @ vt`` is unchanged.
+    The rule must be a *smooth* function of the vector. sklearn's ``svd_flip``
+    takes the sign of the largest-magnitude entry, which is discontinuous: when
+    the top two magnitudes are nearly tied, the ~1e-6 noise this solver leaves
+    is enough to move the argmax and flip the entire component. That was
+    measured here — it made iterative LSI irreproducible, with a cluster ARI of
+    0.77 between two identical runs, because per-cell scaling mixes the columns
+    and so propagates a sign flip into the clustering.
+
+    Instead the sign comes from ``sum(u³)``, an aggregate over every entry and
+    therefore stable under small perturbations (the cube keeps the large
+    entries dominant so it does not vanish for a roughly symmetric vector, as
+    ``sum(u)`` can). ``sum(u)`` and finally ``+1`` are the fallbacks if it is
+    exactly zero. The product ``u @ diag(s) @ vt`` is unchanged either way.
     """
-    idx = cp.argmax(cp.abs(u), axis=0)
-    signs = cp.sign(u[idx, cp.arange(u.shape[1])])
-    signs = cp.where(signs == 0, cp.float32(1.0), signs).astype(u.dtype)
+    crit = (u.astype(cp.float64) ** 3).sum(axis=0)
+    fallback = u.astype(cp.float64).sum(axis=0)
+    crit = cp.where(crit == 0, fallback, crit)
+    signs = cp.sign(crit)
+    signs = cp.where(signs == 0, 1.0, signs).astype(u.dtype)
     return u * signs, vt * signs[:, None]
 
 
@@ -455,6 +471,7 @@ def compute_lsi(
     depth: np.ndarray | None = None,
     depth_cor_cutoff: float | None = None,
     scale_by_sv: bool = True,
+    allow_empty_cells: bool = False,
     tol: float = 1e-5,
     ncv: int | None = None,
     random_state: int = 0,
@@ -489,6 +506,16 @@ def compute_lsi(
         ``None`` keeps every component but still reports the correlations.
     scale_by_sv
         Return ``V @ diag(d)`` (ArchR's ``matSVD``) rather than ``V``.
+    allow_empty_cells
+        What to do about cells with no signal in the given features. ``False``
+        (default) raises, which is right when the *caller* chose the features:
+        an empty cell is then a data problem worth surfacing rather than
+        silently embedding at the origin. ``True`` excludes them from the fit
+        and gives them an all-zero row, which is what
+        :func:`iterative_lsi` needs — it selects the features itself, so
+        whether a cell is empty is not something the user can act on
+        beforehand. ArchR drops such cells from its output entirely; keeping
+        them as zero rows preserves one row per cell.
     tol, ncv
         Solver controls; see :func:`_svd`.
     random_state
@@ -520,20 +547,28 @@ def compute_lsi(
     depth_np = cp.asnumpy(depth_all)
 
     # ---- cell bookkeeping -------------------------------------------------
-    n_empty = int((depth_np == 0).sum())
-    if n_empty:
+    empty = depth_np == 0
+    n_empty = int(empty.sum())
+    if n_empty and not allow_empty_cells:
         raise ValueError(
             f"{n_empty} cell(s) have no features in the selected set. "
             "Filter empty cells before running LSI, e.g.:\n"
             "    sc.pp.filter_cells(adata, min_counts=1)\n"
-            "or widen the feature selection."
+            "or widen the feature selection.\n"
+            "Pass allow_empty_cells=True to embed them at the origin instead."
+        )
+    if n_empty:
+        logger.warning(
+            f"{n_empty} cell(s) have no signal in the selected features; "
+            "excluded from the fit and given an all-zero embedding row. "
+            "ArchR drops such cells from its output entirely."
         )
 
-    train_mask = np.ones(n_cells, dtype=bool)
+    train_mask = ~empty
     if outlier_quantiles is not None:
-        lo, hi = np.quantile(depth_np, sorted(outlier_quantiles))
-        held = (depth_np <= lo) | (depth_np >= hi)
-        if held.all() or (n_cells - int(held.sum())) < n_comps + 1:
+        lo, hi = np.quantile(depth_np[~empty], sorted(outlier_quantiles))
+        held = ((depth_np <= lo) | (depth_np >= hi)) & ~empty
+        if held.all() or (int((~empty).sum()) - int(held.sum())) < n_comps + 1:
             # Near-constant depth makes lo == hi, so the condition catches
             # every cell. Fitting nothing is worse than fitting everything.
             logger.warning(
@@ -543,7 +578,7 @@ def compute_lsi(
                 "when per-cell depth is near-constant."
             )
         else:
-            train_mask = ~held
+            train_mask = ~held & ~empty
     n_train = int(train_mask.sum())
     n_held_out = n_cells - n_train
     if n_held_out:
@@ -630,6 +665,7 @@ def compute_lsi(
         binarize=bool(binarize),
         random_state=random_state,
         n_held_out=n_held_out,
+        n_empty_cells=n_empty,
     )
     model.embedding[train_mask] = cp.asnumpy(emb_train).astype(np.float32)
     del u, s, vt, emb_train
@@ -941,6 +977,40 @@ def initial_features(
         )
         top = order[:n_features]
     return np.sort(top)
+
+
+def accessibility_pool(
+    accessibility: np.ndarray, total_features: int = 500_000
+) -> np.ndarray:
+    """
+    The feature *pool* variable-feature scoring runs over.
+
+    Distinct from :func:`initial_features`, and easy to conflate with it.
+    ``.identifyVarFeatures`` takes a plain top-N::
+
+        groupFeatures <- totalAcc[sort(head(order(totalAcc$rowSums,
+                                                  decreasing = TRUE),
+                                            totalFeatures)), ]
+
+    — no ``rmTop`` window and no ``filterQuantile``. Those apply only to the
+    *initial* feature set in ``addIterativeLSI``, which is a different
+    selection made once before the loop starts.
+
+    Parameters
+    ----------
+    accessibility
+        Per-feature accessibility over **all** features (ArchR's ``totalAcc``).
+    total_features
+        ArchR's ``totalFeatures``.
+
+    Returns
+    -------
+    np.ndarray
+        Pool feature indices, ascending.
+    """
+    acc = np.asarray(accessibility)
+    n = min(total_features, acc.shape[0])
+    return np.sort(np.argsort(-acc, kind="stable")[:n])
 
 
 def cluster_var_features(
@@ -1414,3 +1484,305 @@ def model_from_adata(adata, uns_key: str = "lsi") -> LSIModel:
         binarize=bool(stored["binarize"]),
         random_state=int(stored["random_state"]),
     )
+
+
+def iterative_lsi(
+    adata,
+    n_comps: int = 30,
+    *,
+    iterations: int = 2,
+    n_features: int = 25_000,
+    total_features: int = 500_000,
+    filter_quantile: float = 0.995,
+    method: int | str = 2,
+    scale_to: float = 1e4,
+    binarize: bool = True,
+    outlier_quantiles: tuple[float, float] | None = (0.02, 0.98),
+    depth_cor_cutoff: float | None = 0.75,
+    depth_key: str = "n_unique",
+    cluster_params: dict | None = None,
+    cluster_fn=None,
+    store_model: bool = False,
+    tol: float = 1e-5,
+    ncv: int | None = None,
+    random_state: int = 0,
+    inplace: bool = True,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Iterative feature selection followed by LSI — ``ArchR::addIterativeLSI``.
+
+    One LSI on the most accessible features is dominated by whichever
+    populations happen to be abundant. ArchR's answer is to iterate: cluster on
+    a first embedding, score every feature by how much its per-cluster
+    accessibility varies, keep the most variable, and redo the LSI on those.
+    Each round therefore selects features that separate the structure the
+    previous round found.
+
+    The loop, per round after the first: :func:`scale_dims` →
+    :func:`drop_depth_correlated` → cluster →
+    :func:`cluster_var_features` → LSI.
+
+    Parameters
+    ----------
+    adata
+        AnnData with a sparse cell × feature matrix. Unlike :func:`lsi` this
+        selects its own features and ignores ``var["selected"]``.
+    n_comps
+        Components per LSI round (ArchR's ``dimsToUse``).
+    iterations
+        Total LSI rounds, matching ArchR's semantics — ``2`` means an initial
+        LSI plus one re-selected round, with one clustering between them.
+    n_features
+        Features kept per round (ArchR's ``varFeatures``).
+    total_features
+        Size of the pool that variable-feature scoring runs over
+        (``totalFeatures``). Note this is a plain top-N, while the *initial*
+        selection is a rank window — see :func:`accessibility_pool` and
+        :func:`initial_features`.
+    filter_quantile
+        Sizes the head skipped by the initial rank window
+        (``filterQuantile``).
+    method, scale_to, binarize, outlier_quantiles, tol, ncv
+        Passed to each LSI round; see :func:`lsi`.
+    depth_cor_cutoff, depth_key
+        Depth-correlation filter applied before clustering and to the final
+        embedding.
+    cluster_params
+        Overrides for the built-in clusterer, e.g.
+        ``{"resolution": 2.0, "max_clusters": 6, "k": 20, "flavor": "leiden"}``.
+        Defaults are ArchR's iterative-LSI ``clusterParams``.
+    cluster_fn
+        Replace the built-in clusterer entirely. Receives the scaled,
+        depth-filtered embedding and must return one integer label per cell.
+        This is the escape hatch for users who prefer ``rsc.tl.leiden``, and
+        the hook the reproducibility test uses to inject ArchR's own labels so
+        that feature selection can be gated in isolation.
+    store_model
+        Store the final round's loadings and metadata for projection; see
+        :func:`lsi`.
+    random_state
+        Seed for the solver and the clusterer.
+    inplace
+        Store on *adata* and return ``None``, else return
+        ``(embedding, singular_values)``.
+    chunk_size
+        Stream the matrix from host memory in row chunks of this size.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray] | None
+        ``None`` when ``inplace=True``, having written
+        ``obsm["X_iterative_lsi"]``, ``uns["iterative_lsi"]``,
+        ``var["selected_iterative_lsi"]``,
+        ``obs["iterative_lsi_clusters_iter{j}"]`` and — with
+        ``store_model=True`` — ``varm["iterative_LSI"]``. Every key is prefixed
+        with the function's own name, so :func:`lsi` and this function can both
+        be run on one object without either overwriting the other.
+
+    Notes
+    -----
+    ``addIterativeLSI`` is not stable run to run — ArchR's own seed-to-seed
+    feature Jaccard on one dataset was 0.54 — so treat the selected feature set
+    as one sample from a distribution rather than a fixed answer.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.tl.iterative_lsi(adata, n_comps=30, n_features=25_000)
+    >>> adata.obsm["X_iterative_lsi"].shape
+    (n_cells, 30)
+    """
+    from ._clustering import snn_cluster  # local: keeps cuGraph off import gatac
+
+    method_id = _resolve_method(method)
+    if iterations < 1:
+        raise ValueError(f"iterations must be >= 1 (got {iterations}).")
+
+    X = adata.X
+    n_cells, n_vars = X.shape
+    depth = _resolve_depth(adata, depth_key)
+
+    params = {
+        "k": 20,
+        "resolution": 2.0,
+        "prune": 1.0 / 15.0,
+        "max_clusters": 6,
+        "n_outlier": 5,
+        "knn_assign": 10,
+        "flavor": "leiden",
+    }
+    if cluster_params:
+        unknown = set(cluster_params) - set(params)
+        if unknown:
+            raise ValueError(
+                f"Unknown cluster_params: {sorted(unknown)}. "
+                f"Known keys: {sorted(params)}."
+            )
+        params.update(cluster_params)
+
+    # ---- accessibility, computed once over every feature ------------------
+    acc = feature_accessibility(X, binarize=binarize)
+    features = initial_features(
+        acc, n_features, total_features=total_features,
+        filter_quantile=filter_quantile,
+    )
+    pool = accessibility_pool(acc, total_features)
+    logger.info(
+        f"Iterative LSI: {n_cells:,} cells, {n_vars:,} features; "
+        f"initial selection {len(features):,}, scoring pool {len(pool):,}, "
+        f"{iterations} round(s)."
+    )
+
+    n_per_iter: list[int] = []
+    cluster_labels: dict[int, np.ndarray] = {}
+    model: LSIModel | None = None
+    X_pool = None
+
+    for it in range(1, iterations + 1):
+        n_per_iter.append(len(features))
+        logger.info(f"  round {it}/{iterations}: LSI on {len(features):,} features")
+        model = compute_lsi(
+            X[:, features],
+            n_comps,
+            method=method_id,
+            scale_to=scale_to,
+            binarize=binarize,
+            outlier_quantiles=outlier_quantiles,
+            depth=depth,
+            depth_cor_cutoff=None,      # filtered per round below, and at the end
+            allow_empty_cells=True,     # the algorithm picks the features, so
+                                        # emptiness is not the user's to fix
+            scale_by_sv=True,
+            tol=tol,
+            ncv=ncv,
+            random_state=random_state,
+            chunk_size=chunk_size,
+        )
+        if it == iterations:
+            break
+
+        # ---- ArchR .LSICluster: scale, drop depth-correlated, cluster -----
+        z = scale_dims(model.embedding)
+        depth_for_cor = depth if depth is not None else np.asarray(
+            _cell_depth(_to_gpu_csr(X[:, features]), binarize).get()
+        )
+        keep, _r = drop_depth_correlated(z, depth_for_cor, cutoff=depth_cor_cutoff)
+        if keep.sum() < 2:
+            raise ValueError(
+                "Every component correlates with sequencing depth above "
+                f"{depth_cor_cutoff}; nothing left to cluster on."
+            )
+        z = z[:, keep]
+
+        if cluster_fn is not None:
+            labels = np.asarray(cluster_fn(z))
+            if labels.shape[0] != n_cells:
+                raise ValueError(
+                    f"cluster_fn returned {labels.shape[0]} labels for "
+                    f"{n_cells} cells."
+                )
+        else:
+            labels = snn_cluster(z, random_state=random_state, **params)
+        cluster_labels[it] = labels
+        logger.info(
+            f"  round {it}: {len(np.unique(labels))} cluster(s) on "
+            f"{keep.sum()} dim(s)"
+        )
+
+        # ArchR: `if (nClust == 1) return(prevFeatures)` — a single cluster
+        # carries no between-cluster variance, so the feature set is kept.
+        if len(np.unique(labels)) < 2:
+            logger.warning(
+                f"  round {it}: clustering returned a single cluster; keeping "
+                "the current feature set for the next round, as ArchR does."
+            )
+            continue
+
+        # ---- variable features over the accessibility pool ----------------
+        if X_pool is None:
+            X_pool = X[:, pool].tocsr() if sp.issparse(X) else X[:, pool]
+        sel_in_pool, _var = cluster_var_features(
+            X_pool, labels, n_features, scale_to=scale_to,
+            binarize=binarize, chunk_size=chunk_size,
+        )
+        features = np.sort(pool[sel_in_pool])
+
+    del X_pool
+    cp.get_default_memory_pool().free_all_blocks()
+
+    # ---- final depth-correlation filter, on the scaled embedding ----------
+    depth_final = depth if depth is not None else np.asarray(
+        _cell_depth(_to_gpu_csr(X[:, features]), binarize).get()
+    )
+    keep, r = drop_depth_correlated(
+        scale_dims(model.embedding), depth_final, cutoff=depth_cor_cutoff
+    )
+    embedding = model.embedding[:, keep]
+    dims_dropped = np.where(~keep)[0]
+    if dims_dropped.size:
+        logger.info(
+            f"Dropping {dims_dropped.size} depth-correlated component(s): "
+            f"{dims_dropped.tolist()}"
+        )
+    logger.info(
+        f"Iterative LSI complete: {embedding.shape[1]} component(s), "
+        f"{len(features):,} features."
+    )
+
+    if not inplace:
+        return embedding, model.singular_values
+
+    adata.obsm["X_iterative_lsi"] = embedding
+    mask = np.zeros(n_vars, dtype=bool)
+    mask[features] = True
+    adata.var["selected_iterative_lsi"] = mask
+    for it, labels in cluster_labels.items():
+        adata.obs[f"iterative_lsi_clusters_iter{it}"] = pd.Categorical(
+            labels.astype(str)
+        )
+
+    uns: dict = {
+        "singular_values": model.singular_values,
+        "depth_cor": r,
+        "dims_dropped": dims_dropped,
+        "iterations": iterations,
+        "n_features_per_iter": np.asarray(n_per_iter),
+        "n_held_out": model.n_held_out,
+        "n_zero_depth_projected": model.n_zero_depth_projected,
+        "n_empty_cells": model.n_empty_cells,
+        "params": _pack_params(
+            n_comps=n_comps,
+            iterations=iterations,
+            n_features=n_features,
+            total_features=total_features,
+            filter_quantile=filter_quantile,
+            method=method_id,
+            scale_to=scale_to,
+            binarize=binarize,
+            outlier_quantiles=outlier_quantiles,
+            depth_cor_cutoff=depth_cor_cutoff,
+            depth_key=depth_key,
+            tol=tol,
+            ncv=ncv,
+            random_state=random_state,
+            cluster_fn=cluster_fn,
+            **{f"cluster_{k}": v for k, v in params.items()},
+        ),
+    }
+    if store_model:
+        adata.varm["iterative_LSI"] = _align_loadings(model, mask, n_vars)
+        uns["model"] = {
+            "loadings_key": "iterative_LSI",
+            "feature_mask": _fitted_mask(model, mask, n_vars),
+            "row_sums": model.row_sums,
+            "n_train": model.n_train,
+            "singular_values": model.singular_values,
+            "method": model.method,
+            "scale_to": model.scale_to,
+            "binarize": model.binarize,
+            "scale_by_sv": True,
+            "random_state": model.random_state,
+        }
+    adata.uns["iterative_lsi"] = uns
+    return None

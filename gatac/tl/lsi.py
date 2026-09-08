@@ -753,15 +753,15 @@ def _tfidf_host_chunked(
         d_indices = cp.asarray(X.indices[d0:d1].astype(np.int32))
         d_indptr = cp.asarray((X.indptr[start : end + 1] - d0).astype(np.int32))
 
-        depth = (
-            cp.diff(d_indptr).astype(cp.float32)
-            if binarize
-            else cp.asarray(
-                np.add.reduceat(
-                    X.data[d0:d1], (X.indptr[start:end] - d0), dtype=np.float32
-                )
-            )
+        # Reuse _cell_depth on a device view of the chunk rather than summing
+        # rows host-side: np.add.reduceat returns the element itself, not 0,
+        # when two consecutive offsets are equal, so it silently mis-sums an
+        # empty row. compute_lsi excludes empty rows before reaching here, but
+        # this helper should not depend on that.
+        chunk_view = cusp.csr_matrix(
+            (d_data, d_indices, d_indptr), shape=(n_rows, X.shape[1])
         )
+        depth = _cell_depth(chunk_view, binarize)
         inv_depth = (cp.float32(1.0) / cp.maximum(depth, 1.0)).astype(cp.float32)
 
         _launch_warp_per_row(

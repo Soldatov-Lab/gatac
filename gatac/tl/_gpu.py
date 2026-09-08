@@ -185,6 +185,17 @@ class ChunkedMatrix:
 
     Notes
     -----
+    What this buys, and what it does not: the *matrix* lives in host memory, so
+    a matrix larger than VRAM becomes workable at all. But peak device memory
+    does **not** fall off monotonically with *chunk_size*. Measured on a
+    60,000 x 200,000 matrix (48 M nonzeros, k=20): 1.45 GB resident,
+    0.45 GB at ``chunk_size=20_000``, and 1.63 GB at ``chunk_size=5_000`` --
+    *worse* than resident. The dominant term is per-spmv cuSPARSE workspace,
+    which is allocated outside CuPy's pool (the pool itself reported no growth)
+    and is paid once per chunk per matvec, so halving the chunk size doubles
+    the number of those allocations. There is a sweet spot, not a knob that
+    trades memory for speed linearly; a few large chunks beat many small ones.
+
     ``matvec`` and ``rmatvec`` **preserve the dimensionality of their input**:
     a ``(n, 1)`` column vector returns ``(n, 1)``, a flat ``(n,)`` returns
     ``(n,)``. This is required by CuPy's iterative solvers — returning a flat

@@ -1621,8 +1621,27 @@ def iterative_lsi(
             )
         params.update(cluster_params)
 
+    # Upload once and slice on the device. scipy's fancy column indexing on a
+    # 65 M-nonzero CSR measured 0.45-0.50 s per call against 0.03 s for the
+    # same slice in cupyx, and this loop takes three of them. Skipped when
+    # streaming, since the point of chunk_size is that the matrix does not fit.
+    X_dev = None
+    if chunk_size is None and sp.issparse(X):
+        X_dev = _to_gpu_csr(X)
+
+    def _select(cols):
+        """Columns *cols* of the input matrix, sliced wherever it lives."""
+        if len(cols) == n_vars:
+            # The pool can cover every feature, in which case scipy still
+            # builds a full copy for nothing.
+            return X_dev if X_dev is not None else X
+        if X_dev is not None:
+            return X_dev[:, cp.asarray(cols)]
+        return X[:, cols]
+
     # ---- accessibility, computed once over every feature ------------------
-    acc = feature_accessibility(X, binarize=binarize)
+    acc = feature_accessibility(X_dev if X_dev is not None else X,
+                                binarize=binarize)
     features = initial_features(
         acc, n_features, total_features=total_features,
         filter_quantile=filter_quantile,
@@ -1643,7 +1662,7 @@ def iterative_lsi(
         n_per_iter.append(len(features))
         logger.info(f"  round {it}/{iterations}: LSI on {len(features):,} features")
         model = compute_lsi(
-            X[:, features],
+            _select(features),
             n_comps,
             method=method_id,
             scale_to=scale_to,
@@ -1664,8 +1683,8 @@ def iterative_lsi(
 
         # ---- ArchR .LSICluster: scale, drop depth-correlated, cluster -----
         z = scale_dims(model.embedding)
-        depth_for_cor = depth if depth is not None else np.asarray(
-            _cell_depth(_to_gpu_csr(X[:, features]), binarize).get()
+        depth_for_cor = depth if depth is not None else cp.asnumpy(
+            _cell_depth(_to_gpu_csr(_select(features)), binarize)
         )
         keep, _r = drop_depth_correlated(z, depth_for_cor, cutoff=depth_cor_cutoff)
         if keep.sum() < 2:
@@ -1701,7 +1720,7 @@ def iterative_lsi(
 
         # ---- variable features over the accessibility pool ----------------
         if X_pool is None:
-            X_pool = X[:, pool].tocsr() if sp.issparse(X) else X[:, pool]
+            X_pool = _select(pool)
         sel_in_pool, _var = cluster_var_features(
             X_pool, labels, n_features, scale_to=scale_to,
             binarize=binarize, chunk_size=chunk_size,
@@ -1712,9 +1731,10 @@ def iterative_lsi(
     cp.get_default_memory_pool().free_all_blocks()
 
     # ---- final depth-correlation filter, on the scaled embedding ----------
-    depth_final = depth if depth is not None else np.asarray(
-        _cell_depth(_to_gpu_csr(X[:, features]), binarize).get()
+    depth_final = depth if depth is not None else cp.asnumpy(
+        _cell_depth(_to_gpu_csr(_select(features)), binarize)
     )
+    del X_dev
     keep, r = drop_depth_correlated(
         scale_dims(model.embedding), depth_final, cutoff=depth_cor_cutoff
     )

@@ -39,6 +39,23 @@ requires cuGraph for the clustering step; `lsi` does not.
    MiniBatchLDA
 ```
 
+The individual stages of the LSI pipeline are exported too, for building a
+custom iterative scheme or inspecting one step in isolation. `scale_dims` is
+ArchR's `scaleDims` — note it standardises each *cell* across its dimensions,
+not each dimension across cells.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   feature_accessibility
+   initial_features
+   accessibility_pool
+   cluster_var_features
+   scale_dims
+```
+
 ---
 
 ## Peak calling & marker peaks

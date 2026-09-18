@@ -1871,6 +1871,172 @@ def _fit_logistic_batch(
     )
 
 
+def motif_presence_matrix(
+    motifs: list[DNAMotif],
+    regions: list[str],
+    genome_fasta: Union[str, Path],
+    *,
+    pvalue: float = 1e-5,
+    check_rc: bool = True,
+    bg_probs: Union[
+        Literal["auto", "subject", "even"],
+        tuple[float, float, float, float],
+    ] = (0.25, 0.25, 0.25, 0.25),
+    motif_batch_size: int = 16,
+    region_chunk_size: int = 64_000,
+    dinucleotide: bool = True,
+) -> dict:
+    """Which regions each motif hits, plus their dinucleotide composition.
+
+    This is the expensive half of :func:`motif_enrichment_regression` and it
+    does not depend on the score vector: the same regions, motifs, threshold
+    and strand setting give the same answer whatever is being regressed. Call
+    it once, keep the result, and hand it back through that function's
+    ``precomputed_hits`` argument to test any number of scores over one scan.
+
+    The dinucleotide frequencies come back with the presence matrix because
+    they are read off the same encoded sequences. Leaving them out would mean
+    re-fetching every sequence to build the composition covariates, which is
+    most of the cost this exists to avoid -- so ``dinucleotide=False`` is only
+    for a caller that will fit with ``covariates="none"`` or its own array.
+
+    Returns
+    -------
+    dict
+        ``presence`` ``(n_motifs, n_regions)`` bool, ``dinucleotide``
+        ``(n_regions, 16)`` float32 or None, and the identity of the scan:
+        ``motif_ids``, ``regions``, ``pvalue``, ``check_rc``,
+        ``bg_probs_request`` and the resolved ``bg_probs``. The identity
+        fields are what lets the consumer refuse a cache built for a different
+        question, so keep them with the arrays.
+
+    See Also
+    --------
+    motif_enrichment_regression : consumes this through ``precomputed_hits``.
+    """
+    from tqdm.auto import tqdm
+
+    if len(motifs) == 0:
+        raise ValueError("no motifs supplied")
+    regions = list(regions)
+    if not regions:
+        raise ValueError("no regions supplied")
+    n_motifs, n_regions = len(motifs), len(regions)
+
+    resolved_bg_probs = bg_probs
+    if isinstance(bg_probs, str):
+        logger.info("Resolving background base frequencies from all sequences...")
+        resolved_bg_probs = _resolve_bg_probs(
+            bg_probs, _fetch_region_sequences(regions, genome_fasta)
+        )
+
+    logger.info(f"Computing thresholds for {n_motifs} motifs...")
+    pwm_list = [m.to_log_odds(resolved_bg_probs) for m in motifs]
+    bg_array = np.array(resolved_bg_probs, dtype=np.float64)
+    thresholds = np.array(
+        [_compute_score_threshold_jit(pwm, bg_array, pvalue, 1e-4) for pwm in pwm_list],
+        dtype=np.float64,
+    )
+
+    presence = np.zeros((n_motifs, n_regions), dtype=bool)
+    dinuc = np.zeros((n_regions, 16), dtype=np.float32) if dinucleotide else None
+    logger.info(
+        f"Scanning {n_motifs} motifs across {n_regions} regions "
+        f"in chunks of {region_chunk_size}..."
+    )
+    n_chunks = (n_regions + region_chunk_size - 1) // region_chunk_size
+    for start in tqdm(
+        range(0, n_regions, region_chunk_size), total=n_chunks, desc="Scanning"
+    ):
+        stop = min(start + region_chunk_size, n_regions)
+        sequences = _fetch_region_sequences(regions[start:stop], genome_fasta)
+        encoded, lengths = _encode_sequences_batch(sequences)
+        rc = _reverse_complement_encoded(encoded) if check_rc else None
+        presence[:, start:stop] = _scan_motifs_batch_gpu(
+            encoded, lengths, pwm_list, thresholds, rc,
+            motif_batch_size=motif_batch_size, show_progress=False,
+        )
+        if dinuc is not None:
+            dinuc[start:stop] = _dinucleotide_frequencies(encoded)
+        del encoded, lengths, rc, sequences
+        mempool.free_all_blocks()
+
+    return {
+        "presence": presence,
+        "dinucleotide": dinuc,
+        "motif_ids": [m.id for m in motifs],
+        "regions": regions,
+        "pvalue": float(pvalue),
+        "check_rc": bool(check_rc),
+        "bg_probs_request": bg_probs if isinstance(bg_probs, str) else tuple(
+            float(v) for v in bg_probs),
+        "bg_probs": tuple(float(v) for v in resolved_bg_probs),
+    }
+
+
+def _validated_hits(hits, motifs, regions, pvalue, check_rc, bg_probs,
+                    need_dinucleotide):
+    """The cached scan, or a refusal naming what does not match.
+
+    Every field is checked. A presence matrix built for a different threshold,
+    strand setting, motif order or region order would still have the right
+    shape and would silently produce confident, wrong coefficients, which is
+    far worse than rescanning.
+    """
+    try:
+        presence = np.asarray(hits["presence"])
+        cached_regions = list(hits["regions"])
+        cached_ids = list(hits["motif_ids"])
+    except (KeyError, TypeError) as error:
+        raise ValueError(
+            "precomputed_hits must be a mapping with 'presence', 'regions' and "
+            "'motif_ids', as returned by motif_presence_matrix"
+        ) from error
+
+    problems = []
+    if presence.shape != (len(motifs), len(regions)):
+        problems.append(
+            f"presence is {presence.shape}, expected "
+            f"{(len(motifs), len(regions))} (motifs x regions)")
+    if cached_ids != [m.id for m in motifs]:
+        shared = len(set(cached_ids) & {m.id for m in motifs})
+        problems.append(
+            f"motif ids differ ({shared} of {len(motifs)} ids in common; order "
+            "matters because presence rows are positional)")
+    if cached_regions != list(regions):
+        problems.append(
+            f"regions differ ({len(cached_regions)} cached vs {len(regions)} "
+            "passed; order matters because presence columns are positional)")
+    if float(hits.get("pvalue", pvalue)) != float(pvalue):
+        problems.append(f"pvalue {hits.get('pvalue')} vs {pvalue}")
+    if bool(hits.get("check_rc", check_rc)) != bool(check_rc):
+        problems.append(f"check_rc {hits.get('check_rc')} vs {check_rc}")
+    if not isinstance(bg_probs, str):
+        cached_bg = tuple(float(v) for v in hits.get("bg_probs", bg_probs))
+        if not np.allclose(cached_bg, [float(v) for v in bg_probs]):
+            problems.append(f"bg_probs {cached_bg} vs {tuple(bg_probs)}")
+    elif "bg_probs" not in hits:
+        problems.append(
+            f"bg_probs={bg_probs!r} has to be resolved from the sequences and "
+            "the cache does not carry the resolved value")
+    dinuc = hits.get("dinucleotide")
+    dinuc = None if dinuc is None else np.asarray(dinuc)
+    if need_dinucleotide:
+        if dinuc is None:
+            problems.append(
+                "dinucleotide frequencies are missing and the requested "
+                "covariates need them; rebuild with dinucleotide=True or pass "
+                "covariates='none' or your own array")
+        elif dinuc.shape != (len(regions), 16):
+            problems.append(
+                f"dinucleotide is {dinuc.shape}, expected {(len(regions), 16)}")
+    if problems:
+        raise ValueError(
+            "precomputed_hits does not match this call: " + "; ".join(problems))
+    resolved = tuple(float(v) for v in hits.get("bg_probs", bg_probs))
+    return presence, dinuc, resolved
+
+
 def motif_enrichment_regression(
     motifs: list[DNAMotif],
     regions: list[str],
@@ -1890,6 +2056,7 @@ def motif_enrichment_regression(
     fit_batch_size: int = 24,
     max_iter: int = 50,
     tol: float = 1e-8,
+    precomputed_hits: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Motif enrichment as logistic regression on a continuous score (MEIRLOP-style).
@@ -1966,6 +2133,16 @@ def motif_enrichment_regression(
         Maximum IRLS iterations.
     tol : float, default 1e-8
         Convergence tolerance on the maximum coefficient step.
+    precomputed_hits : dict, optional
+        A scan from :func:`motif_presence_matrix` over these same regions and
+        motifs, which skips the sequence fetch and the PWM scan entirely.
+        Scanning is most of the cost and does not depend on ``scores``, so a
+        sweep over many score vectors -- components of a decomposition, several
+        contrasts, several ranks -- should scan once and pass the result here.
+        Every field is checked against this call and a mismatch raises rather
+        than rescanning, because a presence matrix built for a different
+        threshold, strand setting or region order has the right shape and would
+        silently give confident, wrong coefficients.
 
     Returns
     -------
@@ -2035,50 +2212,36 @@ def motif_enrichment_regression(
     n_regions = len(kept_regions)
     n_motifs = len(motifs)
 
-    resolved_bg_probs = bg_probs
-    if isinstance(bg_probs, str):
-        # "auto"/"subject" need global base frequencies, so sequences are fetched
-        # once here; the chunked pass below re-fetches per chunk.
-        logger.info("Resolving background base frequencies from all sequences...")
-        resolved_bg_probs = _resolve_bg_probs(
-            bg_probs, _fetch_region_sequences(kept_regions, genome_fasta)
+    need_dinucleotide = covariate_mode in ("dinucleotide", "gc")
+    if precomputed_hits is not None:
+        # Validated against the FULL region list the caller passed, then cut to
+        # the regions that survived the finite-score filter -- the cache is
+        # indexed by the question asked, not by whichever scores happen to be
+        # finite in this particular call.
+        presence, dinuc, resolved_bg_probs = _validated_hits(
+            precomputed_hits, motifs, regions, pvalue, check_rc, bg_probs,
+            need_dinucleotide)
+        logger.info(
+            f"Reusing a cached scan of {len(regions)} regions "
+            f"({n_regions} with finite scores) at background "
+            f"{tuple(round(v, 4) for v in resolved_bg_probs)}; "
+            "no sequence is fetched")
+        if len(kept_idx) != len(regions):
+            presence = presence[:, kept_idx]
+            dinuc = None if dinuc is None else dinuc[kept_idx]
+        presence = np.ascontiguousarray(presence, dtype=bool)
+    else:
+        scan = motif_presence_matrix(
+            motifs, kept_regions, genome_fasta, pvalue=pvalue,
+            check_rc=check_rc, bg_probs=bg_probs,
+            motif_batch_size=motif_batch_size,
+            region_chunk_size=region_chunk_size,
+            dinucleotide=need_dinucleotide,
         )
-
-    logger.info(f"Computing thresholds for {n_motifs} motifs...")
-    pwm_list = [m.to_log_odds(resolved_bg_probs) for m in motifs]
-    bg_array = np.array(resolved_bg_probs, dtype=np.float64)
-    thresholds = np.array(
-        [_compute_score_threshold_jit(pwm, bg_array, pvalue, 1e-4) for pwm in pwm_list],
-        dtype=np.float64,
-    )
-
-    presence = np.zeros((n_motifs, n_regions), dtype=bool)
-    dinuc = (
-        np.zeros((n_regions, 16), dtype=np.float32)
-        if covariate_mode in ("dinucleotide", "gc")
-        else None
-    )
-
-    logger.info(
-        f"Scanning {n_motifs} motifs across {n_regions} regions "
-        f"in chunks of {region_chunk_size}..."
-    )
-    n_chunks = (n_regions + region_chunk_size - 1) // region_chunk_size
-    for start in tqdm(
-        range(0, n_regions, region_chunk_size), total=n_chunks, desc="Scanning"
-    ):
-        stop = min(start + region_chunk_size, n_regions)
-        sequences = _fetch_region_sequences(kept_regions[start:stop], genome_fasta)
-        encoded, lengths = _encode_sequences_batch(sequences)
-        rc = _reverse_complement_encoded(encoded) if check_rc else None
-        presence[:, start:stop] = _scan_motifs_batch_gpu(
-            encoded, lengths, pwm_list, thresholds, rc,
-            motif_batch_size=motif_batch_size, show_progress=False,
-        )
-        if dinuc is not None:
-            dinuc[start:stop] = _dinucleotide_frequencies(encoded)
-        del encoded, lengths, rc, sequences
-        mempool.free_all_blocks()
+        presence, dinuc = scan["presence"], scan["dinucleotide"]
+        logger.info(
+            "Scanned at background "
+            f"{tuple(round(v, 4) for v in scan['bg_probs'])}")
 
     def _standardise(a: np.ndarray) -> np.ndarray:
         sd = a.std(axis=0)

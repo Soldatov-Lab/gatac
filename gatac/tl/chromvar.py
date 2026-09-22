@@ -232,6 +232,7 @@ def _chromvar_binning(
     bs: int = 50,
     w: float = 0.1,
     niterations: int = 50,
+    random_state: Optional[int] = None,
 ) -> np.ndarray:
     """
     Original chromVAR binning-based background sampling.
@@ -297,7 +298,7 @@ def _chromvar_binning(
 
     # Sample background peaks
     background_peaks = _bg_sample_helper(
-        bin_membership, bin_p, bin_density, niterations
+        bin_membership, bin_p, bin_density, niterations, random_state=random_state
     )
 
     return background_peaks
@@ -308,6 +309,7 @@ def _bg_sample_helper(
     bin_p: np.ndarray,
     bin_density: np.ndarray,
     niterations: int,
+    random_state: Optional[int] = None,
 ) -> np.ndarray:
     """
     Helper function for chromVAR-style background sampling.
@@ -324,6 +326,9 @@ def _bg_sample_helper(
         Number of peaks in each bin
     niterations : int
         Number of background peaks to sample
+    random_state : int, optional
+        Seed for the sampling. ``None`` draws from the global ``np.random``
+        state, as before.
         
     Returns
     -------
@@ -332,6 +337,7 @@ def _bg_sample_helper(
     """
     n = len(bin_membership)
     out = np.zeros((n, niterations), dtype=np.int32)
+    rng = np.random if random_state is None else np.random.default_rng(random_state)
 
     for i in trange(len(bin_density), desc="Sampling background peaks"):
         ix = np.where(bin_membership == i)[0]
@@ -341,7 +347,7 @@ def _bg_sample_helper(
         p = (p_tmp / bin_density)[bin_membership]
         p /= p.sum()
         # Sampling with replacement according to probabilities
-        sampled_indices = np.random.choice(
+        sampled_indices = rng.choice(
             np.arange(len(p)), size=niterations * len(ix), replace=True, p=p
         )
         out[ix, :] = sampled_indices.reshape((len(ix), niterations))
@@ -359,6 +365,7 @@ def sample_bg_peaks(
     n_neighbors: int = 50,
     bs: int = 50,
     w: float = 0.1,
+    random_state: Optional[int] = None,
 ) -> None:
     """
     Sample background peaks for chromVAR analysis.
@@ -393,6 +400,10 @@ def sample_bg_peaks(
         Bin size for chromVAR method (only used if method="chromvar")
     w : float, default 0.1
         Gaussian kernel width for chromVAR method (only used if method="chromvar")
+    random_state : int, optional
+        Seed for the chromVAR method's sampling, so a background can be
+        reproduced. ``None`` (default) draws from the global ``np.random``
+        state, as before. The k-NN method is deterministic and ignores it.
 
     Returns
     -------
@@ -464,7 +475,8 @@ def sample_bg_peaks(
                 f"Got {trans_norm_mat.shape[1]}. Use method='knn' for other cases."
             )
         knn_idx = _chromvar_binning(
-            trans_norm_mat, bs=bs, w=w, niterations=n_iterations
+            trans_norm_mat, bs=bs, w=w, niterations=n_iterations,
+            random_state=random_state,
         )
     else:
         raise ValueError(f"Unknown method: {method}")

@@ -18,17 +18,48 @@ size N_H:
 
 Permutation null: shuffle feature labels (feature-set permutation), recompute ES.
 NES, p-value, FDR follow the GSEA paper / GSEApy implementation.
+
+Hits-only evaluation
+--------------------
+RES only ever *increases* at a hit and decreases linearly between hits, so
+its extrema are pinned to hit positions. Writing the sorted hit positions as
+p_0 < ... < p_{H-1}, and C_j for the normalised cumulative hit weight
+Σ_{m<=j} w[p_m] / N_R, the running score at hit j and at the position
+immediately preceding it are
+
+    top_j = C_j - (p_j - j) / (N - H)          RES(p_j)
+    bot_j = top_j - w[p_j] / N_R               RES(p_j - 1)
+
+(the miss count at or before p_j is p_j + 1 - (j + 1) = p_j - j, and position
+p_j itself contributes no miss, so both share the same miss term). Then
+
+    max(RES) = max(max_j top_j, RES(N-1))    min(RES) = min(min_j bot_j, RES(N-1))
+
+exactly. The endpoint RES(N-1) = C_{H-1} - 1 is carried as an explicit
+candidate: normally C_{H-1} = 1 so it is 0 and never binds, but when N_R = 0
+(an all-zero metric, or a set whose members all have metric exactly 0) the
+normalisation is clamped, C_{H-1} = 0, and the true extremum is the endpoint
+rather than any hit.
+
+This makes scoring O(H) per (set, permutation) rather than O(N), which for
+typical N=20k and H~100 is a ~200x reduction in both work and memory.
+``_enrichment_scores_gpu`` below retains the naive O(N) cumsum as a reference
+oracle for the tests.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import cupy as cp
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+#: Target number of int32 elements in a (permutation × set × H_max) scoring
+#: block. Caps feature-set batch width so that very large sets do not blow up
+#: device memory; 64M elements is ~256 MB per intermediate.
+_SCORING_ELEM_BUDGET = 64_000_000
 
 
 # =============================================================================
@@ -36,12 +67,103 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
+def _es_from_hits_gpu(
+    weighted_metric: cp.ndarray,
+    hit_pos: cp.ndarray,
+    n_hits: cp.ndarray,
+    with_peaks: bool = False,
+):
+    """
+    Compute enrichment scores from sorted hit positions alone.
+
+    Evaluates the running enrichment score only at hit positions, which is
+    exact (see module docstring) and costs O(H) instead of O(N) per row.
+
+    Parameters
+    ----------
+    weighted_metric : cp.ndarray, shape (N,)
+        |r[i]|^weight for each feature, in the original ranked order.
+    hit_pos : cp.ndarray, shape (B, Hmax), int
+        Hit positions per row, sorted ascending, with any padding at the end
+        of the row. Padding values are ignored (they may be arbitrary, as
+        long as they sort last).
+    n_hits : cp.ndarray, shape (B, 1), float32
+        True number of hits per row.
+    with_peaks : bool, default False
+        Also return the hit index at which the ES peak occurs, for
+        leading-edge extraction.
+
+    Returns
+    -------
+    es : cp.ndarray, shape (B,)
+    peak_j : cp.ndarray, shape (B,), int32
+        Only when ``with_peaks``. For ES >= 0 the index j of the maximising
+        ``top_j``; for ES < 0 the index j of the minimising ``bot_j``.
+    """
+    N = weighted_metric.shape[0]
+    Hmax = hit_pos.shape[1]
+
+    ar = cp.arange(Hmax, dtype=cp.float32)[None, :]
+    mask = ar < n_hits
+
+    # Padding-safe gather: index at 0 where masked out, then zero the weight.
+    pos_safe = cp.where(mask, hit_pos, 0)
+    w_h = weighted_metric[pos_safe] * mask
+
+    n_r = cp.maximum(w_h.sum(axis=1, keepdims=True), 1e-10)
+    cum = cp.cumsum(w_h, axis=1) / n_r
+
+    # Padded entries inherit the last real hit position, so their top_j
+    # duplicates top_{H-1} and cannot shift either extremum.
+    last_j = (n_hits.astype(cp.int32) - 1).ravel()
+    last_pos = hit_pos[cp.arange(hit_pos.shape[0]), last_j][:, None]
+    pos_eff = cp.where(mask, hit_pos, last_pos).astype(cp.float32)
+
+    eff_j = cp.minimum(ar, n_hits - 1.0)
+    miss = pos_eff - eff_j
+    denom = cp.maximum(N - n_hits, 1.0)
+
+    top = cum - miss / denom
+    bot = top - w_h / n_r
+
+    # RES at the final position, N-1. This is 0 whenever the hit weights sum
+    # to something positive (C_{H-1} = 1 and all N-H misses have accrued), but
+    # if N_R is 0 -- an all-zero metric, or a set whose members all have metric
+    # exactly 0 -- the normalisation is clamped, C_{H-1} = 0, and the tail
+    # falls to -1. It is a real position, so it must be an explicit candidate.
+    tail = cum[:, -1] - 1.0
+
+    max_body = top.max(axis=1)
+    min_body = bot.min(axis=1)
+    max_es = cp.maximum(max_body, tail)
+    min_es = cp.minimum(min_body, tail)
+    take_max = cp.abs(max_es) > cp.abs(min_es)
+    es = cp.where(take_max, max_es, min_es)
+
+    if not with_peaks:
+        return es
+
+    # Sentinel n_hits means "the extremum is the tail at position N-1". Ties
+    # resolve to the earlier (body) candidate, matching np.argmax/argmin's
+    # first-occurrence semantics in the reference.
+    tail_j = n_hits.ravel().astype(cp.int32)
+    peak_j = cp.where(
+        take_max,
+        cp.where(tail > max_body, tail_j, top.argmax(axis=1)),
+        cp.where(tail < min_body, tail_j, bot.argmin(axis=1)),
+    ).astype(cp.int32)
+    return es, peak_j
+
+
 def _enrichment_scores_gpu(
     weighted_metric: cp.ndarray,
     tag_indicators: cp.ndarray,
 ) -> cp.ndarray:
     """
-    Compute enrichment scores for multiple tag indicators (permutations).
+    Reference O(N) implementation: enrichment scores from full tag indicators.
+
+    Superseded by :func:`_es_from_hits_gpu` in the hot path; retained as the
+    oracle that the hits-only kernel is validated against.
 
     Parameters
     ----------
@@ -90,48 +212,6 @@ def _enrichment_scores_gpu(
     return es
 
 
-def _enrichment_scores_and_running_gpu(
-    weighted_metric: cp.ndarray,
-    tag_indicator: cp.ndarray,
-) -> tuple[float, cp.ndarray]:
-    """
-    Compute enrichment score and full running ES for a single feature set.
-
-    Parameters
-    ----------
-    weighted_metric : cp.ndarray, shape (N,)
-    tag_indicator : cp.ndarray, shape (N,)
-
-    Returns
-    -------
-    es : float
-    run_es : cp.ndarray, shape (N,)
-    """
-    N = weighted_metric.shape[0]
-    n_hits = float(tag_indicator.sum())
-    n_miss = N - n_hits
-
-    sum_correl_tag = float((tag_indicator * weighted_metric).sum())
-
-    norm_tag = 1.0 / max(sum_correl_tag, 1e-10)
-    norm_no_tag = 1.0 / max(n_miss, 1.0)
-
-    no_tag = 1.0 - tag_indicator
-
-    increments = (
-        tag_indicator * weighted_metric * norm_tag
-        - no_tag * norm_no_tag
-    )
-
-    run_es = cp.cumsum(increments)
-    max_es = float(run_es.max())
-    min_es = float(run_es.min())
-
-    es = max_es if abs(max_es) > abs(min_es) else min_es
-
-    return es, run_es
-
-
 def _enrichment_scores_and_running_gpu_batch(
     weighted_metric: cp.ndarray,
     tag_indicators: cp.ndarray,
@@ -139,7 +219,7 @@ def _enrichment_scores_and_running_gpu_batch(
     """
     Compute enrichment scores and full running ES for multiple feature sets.
 
-    Vectorised version of :func:`_enrichment_scores_and_running_gpu`.
+    Reference implementation, retained as the oracle for leading-edge tests.
 
     Parameters
     ----------
@@ -186,35 +266,41 @@ def _enrichment_scores_and_running_gpu_batch(
 # =============================================================================
 
 
-def _generate_permutation_indices(
+def _permutation_pool_gpu(
     n_features: int,
     n_perm: int,
-    seed: int,
-) -> np.ndarray:
+    rs: cp.random.RandomState,
+    row_chunk: int = 256,
+) -> cp.ndarray:
     """
-    Generate permutation index arrays (feature-set permutation).
+    Generate a pool of uniform random permutations on the device.
 
-    Row 0 = identity (original order), rows 1..n_perm = shuffled.
+    Feature-set permutation is a relabelling of positions: under permutation
+    ``pi``, a feature set sitting at original positions ``P`` moves to
+    ``pi[P]``. Building the pool once means each (set, permutation) costs a
+    gather of H entries rather than a length-N shuffle, and the pool is
+    shared across all feature sets exactly as the previous implementation
+    shared one permutation matrix.
 
     Parameters
     ----------
     n_features : int
     n_perm : int
-    seed : int
+    rs : cp.random.RandomState
+    row_chunk : int, default 256
+        Permutations generated per argsort call, bounding transient memory.
 
     Returns
     -------
-    np.ndarray, shape (n_perm + 1, n_features), dtype int32
+    cp.ndarray, shape (n_perm, n_features), dtype int32
     """
-    perm_indices = np.empty((n_perm + 1, n_features), dtype=np.int32)
-    perm_indices[0] = np.arange(n_features, dtype=np.int32)
-
-    rs = np.random.RandomState(seed)
-    for i in range(1, n_perm + 1):
-        perm_indices[i] = perm_indices[0].copy()
-        rs.shuffle(perm_indices[i])
-
-    return perm_indices
+    pool = cp.empty((n_perm, n_features), dtype=cp.int32)
+    for start in range(0, n_perm, row_chunk):
+        end = min(start + row_chunk, n_perm)
+        keys = rs.random_sample(size=(end - start, n_features), dtype=cp.float32)
+        pool[start:end] = cp.argsort(keys, axis=1).astype(cp.int32)
+        del keys
+    return pool
 
 
 # =============================================================================
@@ -278,36 +364,41 @@ def _compute_fdr(
     FDR(NES) = (fraction of nesnull >= NES among same-sign nulls) /
                (fraction of nes_observed >= NES among same-sign observed)
     """
-    nvals = np.sort(nesnull_concat)
+    nes_observed = np.asarray(nes_observed, dtype=np.float64)
+    # Upcast the null once. A float64 probe against a float32 null makes
+    # searchsorted upcast the whole (n_sets * n_perm)-element array on every
+    # call; done per set that dominates the entire run once the sets number in
+    # the thousands. Probing in float32 instead would avoid the copy but round
+    # the search boundary, so pay the one-off cast and stay exact.
+    nvals = np.sort(np.asarray(nesnull_concat, dtype=np.float64))
     nnes = np.sort(nes_observed)
 
     all_neg_idx = np.searchsorted(nvals, 0, side="left")
     nes_neg_idx = np.searchsorted(nnes, 0, side="left")
 
+    pos = nes_observed >= 0
+
+    all_higher = np.where(
+        pos,
+        len(nvals) - np.searchsorted(nvals, nes_observed, side="left"),
+        np.searchsorted(nvals, nes_observed, side="right"),
+    )
+    nes_higher = np.where(
+        pos,
+        len(nnes) - np.searchsorted(nnes, nes_observed, side="left"),
+        np.searchsorted(nnes, nes_observed, side="right"),
+    )
+    all_pos = np.where(pos, len(nvals) - all_neg_idx, all_neg_idx)
+    nes_pos = np.where(pos, len(nnes) - nes_neg_idx, nes_neg_idx)
+
     fdrs = np.ones(len(nes_observed))
+    ok = (all_pos > 0) & (nes_pos > 0)
+    zeros = np.zeros(len(nes_observed))
+    phi_norm = np.divide(all_higher, all_pos, out=zeros.copy(), where=ok)
+    phi_obs = np.divide(nes_higher, nes_pos, out=zeros.copy(), where=ok)
 
-    for i, nes in enumerate(nes_observed):
-        if nes >= 0:
-            all_pos = len(nvals) - all_neg_idx
-            all_higher = len(nvals) - np.searchsorted(nvals, nes, side="left")
-            nes_pos = len(nnes) - nes_neg_idx
-            nes_higher = len(nnes) - np.searchsorted(nnes, nes, side="left")
-        else:
-            all_pos = all_neg_idx
-            all_higher = np.searchsorted(nvals, nes, side="right")
-            nes_pos = nes_neg_idx
-            nes_higher = np.searchsorted(nnes, nes, side="right")
-
-        if all_pos > 0 and nes_pos > 0:
-            phi_norm = all_higher / all_pos
-            phi_obs = nes_higher / nes_pos
-            if phi_obs > 0:
-                fdr = phi_norm / phi_obs
-                fdrs[i] = min(fdr, 1.0)
-            else:
-                fdrs[i] = 1.0
-        else:
-            fdrs[i] = 1.0
+    good = ok & (phi_obs > 0)
+    fdrs[good] = np.minimum(phi_norm[good] / phi_obs[good], 1.0)
 
     return fdrs
 
@@ -317,9 +408,50 @@ def _compute_fdr(
 # =============================================================================
 
 
+def _leading_edge_from_peak(
+    hit_indices: np.ndarray,
+    es: float,
+    peak_j: int,
+    n_features: int,
+) -> np.ndarray:
+    """
+    Leading-edge hits, derived from the index of the peak hit.
+
+    ``peak_j`` is the position within ``hit_indices`` at which the ES extremum
+    is attained (see :func:`_es_from_hits_gpu`). For a positive ES the peak
+    sits *at* hit ``peak_j``, so the leading edge is hits ``0..peak_j``. For a
+    negative ES the extremum sits at the position immediately *before* hit
+    ``peak_j``; that position is itself a hit whenever the preceding hit is
+    adjacent, in which case it joins the leading edge. ``peak_j == len(hits)``
+    is the sentinel for an extremum at the final position, N-1.
+
+    Returns
+    -------
+    np.ndarray
+        Indices (into the ranked list) of the leading-edge features.
+    """
+    if len(hit_indices) == 0:
+        return hit_indices[:0]
+
+    if peak_j >= len(hit_indices):  # extremum at position N-1
+        if es >= 0:
+            return hit_indices
+        return hit_indices[hit_indices >= n_features - 1]
+
+    if es >= 0:
+        return hit_indices[: peak_j + 1]
+
+    start = peak_j
+    if peak_j > 0 and hit_indices[peak_j - 1] == hit_indices[peak_j] - 1:
+        start = peak_j - 1
+    return hit_indices[start:]
+
+
 def _leading_edge_size(run_es_np: np.ndarray, es: float, hit_indices: np.ndarray) -> int:
     """
-    Count leading-edge genes (hits before the ES peak).
+    Reference implementation: count leading-edge genes from the full running ES.
+
+    Superseded by :func:`_leading_edge_from_peak`; retained as a test oracle.
     """
     if len(hit_indices) == 0:
         return 0
@@ -346,8 +478,8 @@ def prerank_gpu(
     max_size: int = 2000,
     permutation_num: int = 1000,
     seed: int = 42,
-    perm_batch_size: int = 256,
-    gs_batch_size: int = 16,
+    perm_batch_size: int = 512,
+    gs_batch_size: int = 128,
 ) -> list[dict]:
     """
     GPU-accelerated preranked GSEA.
@@ -355,14 +487,18 @@ def prerank_gpu(
     Implements the same algorithm as GSEApy's ``prerank`` but runs the
     enrichment-score computation entirely on the GPU using CuPy.
 
-    Feature sets are processed in batches of ``gs_batch_size`` and, within
-    each batch, permutations are chunked into groups of ``perm_batch_size``.
-    All feature-set × permutation combinations in a chunk are evaluated in
-    a **single GPU kernel call**, which dramatically increases GPU
-    utilisation compared to processing one feature set at a time.
+    A pool of ``perm_batch_size`` random permutations is generated on the
+    device at a time, and each chunk is scored against every feature set
+    before the next chunk is drawn. Feature sets are grouped into batches of
+    ``gs_batch_size``, sorted by size so that padding within a batch stays
+    small, and all (set × permutation) pairs in a batch are evaluated in a
+    single kernel call.
 
-    Peak GPU memory for the ES computation is approximately
-    ``gs_batch_size * perm_batch_size * N * 4`` bytes (float32).
+    Scoring evaluates the running enrichment score only at hit positions
+    (see module docstring), so the cost is set-size- rather than
+    N-proportional. Peak GPU memory is roughly
+    ``perm_batch_size * gs_batch_size * H_max * 4`` bytes for the scoring
+    plus ``perm_batch_size * N * 4`` bytes for the permutation pool.
 
     Parameters
     ----------
@@ -383,11 +519,11 @@ def prerank_gpu(
         Number of permutations for the null distribution.
     seed : int, default 42
         Random seed for permutation reproducibility.
-    perm_batch_size : int, default 256
-        Number of permutations to process together on GPU per feature-set
-        batch. Controls GPU memory usage. Reduce if OOM.
-    gs_batch_size : int, default 16
-        Number of feature sets to process simultaneously on the GPU.
+    perm_batch_size : int, default 512
+        Number of permutations held on the device at once. Controls GPU
+        memory usage. Reduce if OOM.
+    gs_batch_size : int, default 128
+        Number of feature sets scored simultaneously on the GPU.
         Larger values improve throughput but increase memory usage.
         Reduce if OOM.
 
@@ -401,6 +537,7 @@ def prerank_gpu(
         - pval: nominal p-value
         - fdr: FDR q-value
         - lead_edge_n: number of leading-edge features
+        - lead_edge_idx: indices of the leading-edge features in the ranked list
         - hits: indices of feature-set members in the ranked list
     """
     from tqdm.auto import tqdm
@@ -408,6 +545,11 @@ def prerank_gpu(
     N = len(feature_names)
     if N == 0:
         return []
+    if permutation_num < 1:
+        raise ValueError(
+            f"permutation_num must be >= 1, got {permutation_num}; "
+            "NES, p-values and FDR are all defined against the null."
+        )
 
     # Build feature-name → index lookup
     feature_to_idx = {g: i for i, g in enumerate(feature_names)}
@@ -417,21 +559,20 @@ def prerank_gpu(
     weighted_metric_np = (np.abs(ranking_values) ** weight).astype(np.float32)
     weighted_metric_gpu = cp.asarray(weighted_metric_np)
 
-    # Filter and build tag indicators for each feature set
-    valid_sets = []  # (name, hit_indices_np, tag_np)
+    # Filter feature sets and record their hit positions in the ranked list.
+    # ``set`` dedupes members repeated within a feature set, which would
+    # otherwise be double-counted in both the size filter and N_R.
+    valid_sets = []  # (name, hit_indices_np)
     for term, members in feature_sets.items():
-        hit_idx = sorted([feature_to_idx[g] for g in members if g in feature_to_idx])
+        hit_idx = sorted({feature_to_idx[g] for g in members if g in feature_to_idx})
         if min_size <= len(hit_idx) <= max_size:
-            tag = np.zeros(N, dtype=np.float32)
-            tag[hit_idx] = 1.0
-            valid_sets.append((term, np.array(hit_idx, dtype=np.int32), tag))
+            valid_sets.append((term, np.array(hit_idx, dtype=np.int32)))
 
     if not valid_sets:
         logger.warning("No feature sets passed size filter.")
         return []
 
     n_sets = len(valid_sets)
-    n_total_perms = permutation_num + 1  # including the unpermuted original
 
     logger.info(
         f"GPU GSEA: {n_sets} feature sets, {N} features, "
@@ -439,99 +580,121 @@ def prerank_gpu(
         f"(gs_batch={gs_batch_size}, perm_batch={perm_batch_size})"
     )
 
-    # Generate permutation indices ONCE on CPU (shared across all feature sets)
-    logger.info("Generating permutation indices...")
-    perm_indices = _generate_permutation_indices(N, permutation_num, seed)
-    # Keep on CPU; we'll transfer batches to GPU as needed
+    # -----------------------------------------------------------------
+    # Group feature sets into rectangular batches, sorted by size so that
+    # the padding needed to make a batch rectangular stays small. Batch
+    # width is capped so that the (permutation × set × H_max) scoring block
+    # stays within a fixed element budget regardless of set size.
+    # -----------------------------------------------------------------
+    sizes = np.array([len(h) for _, h in valid_sets], dtype=np.int64)
+    size_order = np.argsort(sizes, kind="stable")
 
-    # Pre-allocate result arrays
+    effective_perm_batch = min(perm_batch_size, permutation_num)
+    effective_gs_batch = min(gs_batch_size, n_sets)
+    budget_cols = max(1, _SCORING_ELEM_BUDGET // effective_perm_batch)
+
+    batches = []  # (orig_indices, pos_gpu, pos_clamped_gpu, n_hits_gpu)
+    cursor = 0
+    while cursor < n_sets:
+        h_max = 0
+        take = 0
+        while cursor + take < n_sets and take < effective_gs_batch:
+            cand_h = max(h_max, int(sizes[size_order[cursor + take]]))
+            if take > 0 and (take + 1) * cand_h > budget_cols:
+                break
+            h_max = cand_h
+            take += 1
+        idxs = size_order[cursor : cursor + take]
+        cursor += take
+
+        # Sentinel N sorts after every real position and is masked out.
+        pos_np = np.full((take, h_max), N, dtype=np.int32)
+        nh_np = np.empty((take, 1), dtype=np.float32)
+        for k, i in enumerate(idxs):
+            hits = valid_sets[i][1]
+            pos_np[k, : len(hits)] = hits
+            nh_np[k, 0] = len(hits)
+
+        pos_gpu = cp.asarray(pos_np)
+        batches.append((
+            idxs,
+            pos_gpu,
+            cp.minimum(pos_gpu, N - 1),  # in-bounds gather index for the pool
+            cp.asarray(nh_np),
+        ))
+
+    # -----------------------------------------------------------------
+    # Observed ES and leading-edge peak (unpermuted)
+    # -----------------------------------------------------------------
     all_es = np.empty(n_sets, dtype=np.float64)
+    all_peak = np.empty(n_sets, dtype=np.int64)
+    for idxs, pos_gpu, _pos_clamped, nh_gpu in batches:
+        es_b, peak_b = _es_from_hits_gpu(
+            weighted_metric_gpu, pos_gpu, nh_gpu, with_peaks=True
+        )
+        all_es[idxs] = cp.asnumpy(es_b)
+        all_peak[idxs] = cp.asnumpy(peak_b)
+
+    # -----------------------------------------------------------------
+    # Permutation null: one device-resident permutation pool at a time,
+    # scored against every feature set before the next pool is drawn.
+    # -----------------------------------------------------------------
+    esnull = np.empty((n_sets, permutation_num), dtype=np.float32)
+    rs = cp.random.RandomState(seed)
+
+    n_perm_chunks = -(-permutation_num // effective_perm_batch)
+    progress = tqdm(
+        total=n_perm_chunks * len(batches), desc="GSEA scoring blocks"
+    )
+    for p_start in range(0, permutation_num, effective_perm_batch):
+        n_perm = min(effective_perm_batch, permutation_num - p_start)
+        pool = _permutation_pool_gpu(N, n_perm, rs)
+
+        for idxs, _pos_gpu, pos_clamped, nh_gpu in batches:
+            n_gs, h_max = pos_clamped.shape
+
+            # Where each set's members land under each permutation
+            # → (n_perm, n_gs, h_max)
+            perm_pos = pool[:, pos_clamped]
+            keep = (
+                cp.arange(h_max, dtype=cp.float32)[None, None, :]
+                < nh_gpu[None, :, :]
+            )
+            perm_pos = cp.where(keep, perm_pos, N)
+            perm_pos = cp.sort(perm_pos, axis=2).reshape(n_perm * n_gs, h_max)
+            nh_flat = cp.tile(nh_gpu.reshape(1, n_gs), (n_perm, 1)).reshape(-1, 1)
+
+            es_p = _es_from_hits_gpu(weighted_metric_gpu, perm_pos, nh_flat)
+            esnull[idxs, p_start : p_start + n_perm] = cp.asnumpy(
+                es_p.reshape(n_perm, n_gs)
+            ).T
+
+            del perm_pos, keep, nh_flat, es_p
+            progress.update(1)
+
+        del pool
+        cp.get_default_memory_pool().free_all_blocks()
+    progress.close()
+
+    # -----------------------------------------------------------------
+    # Per-feature-set statistics (CPU – negligible cost)
+    # -----------------------------------------------------------------
     all_nes = np.empty(n_sets, dtype=np.float64)
     all_pvals = np.empty(n_sets, dtype=np.float64)
-    all_lead_edge_n = np.empty(n_sets, dtype=np.int32)
-    all_hits = []
+    all_lead_edge: list[np.ndarray] = [None] * n_sets
     nesnull_parts = []
 
-    # Determine effective batch sizes
-    effective_perm_batch = min(perm_batch_size, n_total_perms)
-    effective_gs_batch = min(gs_batch_size, n_sets)
+    for i, (_term, hit_idx) in enumerate(valid_sets):
+        es_obs = float(all_es[i])
+        null_i = esnull[i]
 
-    n_gs_batches = (n_sets + effective_gs_batch - 1) // effective_gs_batch
-
-    # Process feature sets in batches
-    for gs_start in tqdm(
-        range(0, n_sets, effective_gs_batch),
-        desc="GSEA feature-set batches",
-        total=n_gs_batches,
-    ):
-        gs_end = min(gs_start + effective_gs_batch, n_sets)
-        gs_batch = valid_sets[gs_start:gs_end]
-        n_gs = len(gs_batch)
-
-        # Stack tag indicators for all feature sets in this batch → (n_gs, N)
-        tags_np = np.stack([t for _, _, t in gs_batch])
-        tags_gpu = cp.asarray(tags_np)
-
-        # -----------------------------------------------------------
-        # Compute ES for every (feature-set, permutation) pair in chunks
-        # -----------------------------------------------------------
-        es_all = np.empty((n_gs, n_total_perms), dtype=np.float32)
-
-        for perm_start in range(0, n_total_perms, effective_perm_batch):
-            perm_end = min(perm_start + effective_perm_batch, n_total_perms)
-            n_perm = perm_end - perm_start
-
-            # Transfer permutation indices once for all feature sets
-            perm_batch_gpu = cp.asarray(perm_indices[perm_start:perm_end])
-
-            # Apply permutations to all feature sets at once:
-            #   tags_gpu[:, perm_batch_gpu] → (n_gs, n_perm, N)
-            # Flatten to (n_gs * n_perm, N) for a single kernel call
-            perm_tags = tags_gpu[:, perm_batch_gpu].reshape(
-                n_gs * n_perm, N
-            )
-
-            # One GPU kernel for the entire (gene-set × permutation) block
-            es_batch_flat = _enrichment_scores_gpu(
-                weighted_metric_gpu, perm_tags
-            )
-            es_all[:, perm_start:perm_end] = cp.asnumpy(
-                es_batch_flat.reshape(n_gs, n_perm)
-            )
-
-            del perm_batch_gpu, perm_tags, es_batch_flat
-
-        # -----------------------------------------------------------
-        # Running ES for leading edge (all feature sets in batch at once)
-        # -----------------------------------------------------------
-        _, run_es_batch_gpu = _enrichment_scores_and_running_gpu_batch(
-            weighted_metric_gpu, tags_gpu
+        all_pvals[i] = _compute_pval(es_obs, null_i)
+        nes, nesnull = _normalize_es(es_obs, null_i)
+        all_nes[i] = nes
+        nesnull_parts.append(nesnull)
+        all_lead_edge[i] = _leading_edge_from_peak(
+            hit_idx, es_obs, int(all_peak[i]), N
         )
-        run_es_batch_np = cp.asnumpy(run_es_batch_gpu)
-        del tags_gpu, run_es_batch_gpu
-
-        # -----------------------------------------------------------
-        # Per-feature-set statistics (CPU – negligible cost)
-        # -----------------------------------------------------------
-        for j in range(n_gs):
-            idx = gs_start + j
-            _term, hit_idx, _ = gs_batch[j]
-
-            es_obs = float(es_all[j, 0])
-            esnull = es_all[j, 1:]
-
-            pval = _compute_pval(es_obs, esnull)
-            nes, nesnull = _normalize_es(es_obs, esnull)
-            le_n = _leading_edge_size(
-                run_es_batch_np[j], es_obs, hit_idx
-            )
-
-            all_es[idx] = es_obs
-            all_nes[idx] = nes
-            all_pvals[idx] = pval
-            all_lead_edge_n[idx] = le_n
-            all_hits.append(hit_idx)
-            nesnull_parts.append(nesnull)
 
     # FDR across all feature sets
     nesnull_concat = np.concatenate(nesnull_parts)
@@ -539,19 +702,20 @@ def prerank_gpu(
 
     # Build results
     results = []
-    for i, (term, hit_idx, _) in enumerate(valid_sets):
+    for i, (term, hit_idx) in enumerate(valid_sets):
         results.append({
             "term": term,
             "es": float(all_es[i]),
             "nes": float(all_nes[i]),
             "pval": float(all_pvals[i]),
             "fdr": float(fdrs[i]),
-            "lead_edge_n": int(all_lead_edge_n[i]),
-            "hits": all_hits[i].tolist(),
+            "lead_edge_n": len(all_lead_edge[i]),
+            "lead_edge_idx": all_lead_edge[i].tolist(),
+            "hits": hit_idx.tolist(),
         })
 
     # Free GPU memory
-    del weighted_metric_gpu
+    del weighted_metric_gpu, batches
     cp.get_default_memory_pool().free_all_blocks()
 
     return results

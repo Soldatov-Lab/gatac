@@ -1525,7 +1525,7 @@ def gsea_motif_enrichment(
     seed: int = 42,
     threads: int = 1,
     backend: Literal["gpu", "gseapy"] = "gpu",
-    gs_batch_size: int = 4,
+    gs_batch_size: int = 128,
 ) -> "Union[pd.DataFrame, dict[str, pd.DataFrame]]":
     """
     Run preranked GSEA to identify enriched TF motifs from a LogFC-ranked peak list.
@@ -1578,7 +1578,7 @@ def gsea_motif_enrichment(
           numbers of motifs (10-50× speedup). Requires a CUDA-capable GPU.
         * ``"gseapy"`` – Delegates to ``gseapy.prerank`` (Rust backend).
           No GPU required.
-    gs_batch_size : int, default 4
+    gs_batch_size : int, default 128
         Number of gene sets processed simultaneously on the GPU per kernel
         call (GPU backend only). Larger values increase throughput at the
         cost of more VRAM. Reduce if you encounter out-of-memory errors.

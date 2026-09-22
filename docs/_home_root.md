@@ -109,11 +109,11 @@ or many h5ad files using streaming aggregation.
 <a href="cli/features.html">→ CLI: features</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
-:::{grid-item-card} {fas}`project-diagram` Spectral Embedding
+:::{grid-item-card} {fas}`project-diagram` Dimensionality Reduction
 :shadow: none
 
-Spectral decomposition of the cell × feature matrix for dimensionality
-reduction, UMAP, and clustering.
+Embed cells for UMAP and clustering via spectral decomposition, ArchR-style
+(iterative) **LSI** with projection of new cells, or **LDA** topic modelling.
 
 <a href="api/tools.html#dimensionality-reduction">→ API: tl</a>
 :::
@@ -133,7 +133,7 @@ build a cell × peak count matrix.
 Scan peaks for TF binding motifs (MEME format), run motif enrichment tests,
 and compute chromVAR deviation scores.
 
-<a href="api/tools.html#chromvar">→ API: tl</a>
+<a href="api/tools.html#motif-analysis">→ API: tl</a>
 :::
 
 ::::

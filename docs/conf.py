@@ -135,6 +135,10 @@ html_theme_options = {
     "repository_branch": "main",
     "use_repository_button": True,
     "navigation_with_keys": False,
+    # pydata-sphinx-theme>=0.20 injects a header search field unless this is
+    # set explicitly, duplicating the sidebar one; sphinx-book-theme's own
+    # empty default is ignored.
+    "navbar_persistent": [],
 }
 
 html_static_path = ["_static"]

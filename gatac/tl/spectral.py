@@ -42,6 +42,14 @@ import numpy as np
 import scipy.sparse as sp
 from anndata import AnnData
 
+from ._gpu import (
+    ChunkedMatrix,
+    _launch_1d,
+    _row_norms_sq_kernel,
+    _scale_rows_kernel,
+    _to_gpu_csr,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["spectral"]
@@ -49,42 +57,10 @@ __all__ = ["spectral"]
 
 # ---------------------------------------------------------------------------
 # CUDA kernels – avoid materialising O(nnz) index arrays
+#
+# _scale_rows_kernel, _row_norms_sq_kernel, _launch_1d, _to_gpu_csr and
+# _PinnedChunk now live in gatac.tl._gpu, shared with gatac.tl.lsi.
 # ---------------------------------------------------------------------------
-
-_scale_rows_kernel = cp.RawKernel(
-    r"""
-    extern "C" __global__
-    void scale_rows(float* data, const int* indptr,
-                    const float* scale, int n_rows) {
-        int row = blockIdx.x * blockDim.x + threadIdx.x;
-        if (row < n_rows) {
-            float s = scale[row];
-            for (int j = indptr[row]; j < indptr[row + 1]; j++) {
-                data[j] *= s;
-            }
-        }
-    }
-    """,
-    "scale_rows",
-)
-
-_row_norms_sq_kernel = cp.RawKernel(
-    r"""
-    extern "C" __global__
-    void row_norms_sq(const float* data, const int* indptr,
-                      float* norms, int n_rows) {
-        int row = blockIdx.x * blockDim.x + threadIdx.x;
-        if (row < n_rows) {
-            float s = 0.0f;
-            for (int j = indptr[row]; j < indptr[row + 1]; j++) {
-                s += data[j] * data[j];
-            }
-            norms[row] = s;
-        }
-    }
-    """,
-    "row_norms_sq",
-)
 
 _idf_l2_normalize_kernel = cp.RawKernel(
     r"""
@@ -119,46 +95,6 @@ _idf_l2_normalize_kernel = cp.RawKernel(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _launch_1d(kernel, n: int, *args):
-    """Launch a 1-D grid CUDA kernel with *n* threads."""
-    block = 256
-    grid = (int(n) + block - 1) // block
-    kernel((grid,), (block,), args)
-
-
-def _to_gpu_csr(X) -> cusp.csr_matrix:
-    """
-    Upload a sparse matrix to the GPU as a CuPy CSR float32 matrix.
-
-    The ``data`` array is cast to float32 if needed; ``indices`` and
-    ``indptr`` (which dominate memory for ATAC-seq matrices) are shared
-    without copying when the source is already in CSR format.
-    No full CPU-side float copy is made.
-    """
-    if isinstance(X, cusp.csr_matrix):
-        if X.dtype == cp.float32:
-            return X
-        # Convert only the data array; share indices/indptr
-        return cusp.csr_matrix(
-            (X.data.astype(cp.float32), X.indices, X.indptr), shape=X.shape
-        )
-    if isinstance(X, cusp.spmatrix):
-        return _to_gpu_csr(X.tocsr())
-    if sp.issparse(X):
-        X_csr = X.tocsr()
-        if X_csr.dtype == np.float32:
-            return cusp.csr_matrix(X_csr)
-        # Build a scipy CSR with float32 data sharing index arrays — avoids a
-        # full-matrix float conversion on the CPU before the GPU upload.
-        data_f32 = X_csr.data.astype(np.float32)
-        return cusp.csr_matrix(
-            sp.csr_matrix(
-                (data_f32, X_csr.indices, X_csr.indptr), shape=X_csr.shape
-            )
-        )
-    raise TypeError(f"Unsupported matrix type: {type(X)}")
 
 
 def _idf_gpu(X_csr: cusp.csr_matrix) -> cp.ndarray:
@@ -309,45 +245,6 @@ def _spectral_mf(
 # ---------------------------------------------------------------------------
 
 
-class _PinnedChunk:
-    """
-    CSR chunk with arrays stored in page-locked (pinned) memory.
-
-    Pinned memory allows the GPU copy engine to transfer data via direct
-    PCIe DMA (bypassing the OS staging buffer), roughly doubling H2D
-    bandwidth compared to pageable host memory.
-
-    Parameters
-    ----------
-    csr : sp.csr_matrix
-        The CSR chunk to pin (data must already be float32).
-    row_start, row_end : int
-        Row range of this chunk in the full matrix.
-    """
-
-    __slots__ = ("data", "indices", "indptr", "shape", "row_start", "row_end", "_pins")
-
-    def __init__(self, csr: sp.csr_matrix, row_start: int, row_end: int) -> None:
-        self.shape     = csr.shape
-        self.row_start = row_start
-        self.row_end   = row_end
-        self._pins: list = []
-
-        for name, src in (
-            ("data",    csr.data.astype(np.float32, copy=False)),
-            ("indices", csr.indices.astype(np.int32,   copy=False)),
-            ("indptr",  csr.indptr.astype(np.int32,    copy=False)),
-        ):
-            # PinnedMemory → cudaMallocHost (no pool cap).
-            # PinnedMemoryPointer exposes the buffer protocol for np.frombuffer.
-            mem = cp.cuda.PinnedMemory(src.nbytes, 0)
-            ptr = cp.cuda.PinnedMemoryPointer(mem, 0)
-            arr = np.frombuffer(ptr, dtype=src.dtype).reshape(src.shape)
-            arr[:] = src
-            setattr(self, name, arr)
-            self._pins.append(mem)
-
-
 def _idf_gpu_chunked(
     X_cpu: sp.csr_matrix,
     chunk_size: int,
@@ -490,83 +387,19 @@ def _spectral_chunked(
     del sqrt_dinv
     logger.info("Degree scaling done (GPU-accelerated).")
 
-    # ---- Phase 4: eigsh with pinned memory + double-buffered uploads ----
-    # Pinned chunks enable DMA transfers; a non-blocking upload stream
-    # pre-fetches chunk i+1 while the GPU computes with chunk i.
-    pinned_chunks: list[_PinnedChunk] = []
-    for start in range(0, n_cells, chunk_size):
-        end = min(start + chunk_size, n_cells)
-        pinned_chunks.append(_PinnedChunk(X_cpu[start:end], start, end))
+    # ---- Phase 4: eigsh over a streamed operator ----
+    # ChunkedMatrix pins the row chunks and pre-fetches chunk i+1 on a
+    # non-blocking stream while the GPU computes with chunk i, so only one
+    # chunk (plus the prefetch) occupies VRAM per matvec.
+    store = ChunkedMatrix(X_cpu, chunk_size)
     del X_cpu
-    logger.info(
-        f"Chunk arrays moved to pinned memory ({len(pinned_chunks)} chunks)."
-    )
 
     degree_inv_gpu = cp.asarray(np.float32(1.0) / degree, dtype=cp.float32)
     del degree
 
-    upload_stream = cp.cuda.Stream(non_blocking=True)
+    # A v = X (Xᵀ v) − D⁻¹ v
+    A = store.gram_operator(diag_shift=degree_inv_gpu)
 
-    def _upload(pc: "_PinnedChunk") -> cusp.csr_matrix:
-        with upload_stream:
-            d_data    = cp.asarray(pc.data)
-            d_indices = cp.asarray(pc.indices)
-            d_indptr  = cp.asarray(pc.indptr)
-        return cusp.csr_matrix(
-            (d_data, d_indices, d_indptr), shape=pc.shape
-        )
-
-    def _chunked_XTv(v: cp.ndarray) -> cp.ndarray:
-        w = cp.zeros(n_features, dtype=cp.float32)
-        cur_gpu = _upload(pinned_chunks[0])
-        cur_ev  = cp.cuda.Event()
-        cur_ev.record(upload_stream)
-
-        for i, pc in enumerate(pinned_chunks):
-            if i + 1 < len(pinned_chunks):
-                nxt_gpu = _upload(pinned_chunks[i + 1])
-                nxt_ev  = cp.cuda.Event()
-                nxt_ev.record(upload_stream)
-
-            cur_ev.synchronize()
-            w += cur_gpu.T.dot(v[pc.row_start : pc.row_end])
-            del cur_gpu
-
-            if i + 1 < len(pinned_chunks):
-                cur_gpu, cur_ev = nxt_gpu, nxt_ev
-
-        return w
-
-    def _chunked_Xw(w: cp.ndarray) -> cp.ndarray:
-        y = cp.empty(n_cells, dtype=cp.float32)
-        cur_gpu = _upload(pinned_chunks[0])
-        cur_ev  = cp.cuda.Event()
-        cur_ev.record(upload_stream)
-
-        for i, pc in enumerate(pinned_chunks):
-            if i + 1 < len(pinned_chunks):
-                nxt_gpu = _upload(pinned_chunks[i + 1])
-                nxt_ev  = cp.cuda.Event()
-                nxt_ev.record(upload_stream)
-
-            cur_ev.synchronize()
-            y[pc.row_start : pc.row_end] = cur_gpu.dot(w)
-            del cur_gpu
-
-            if i + 1 < len(pinned_chunks):
-                cur_gpu, cur_ev = nxt_gpu, nxt_ev
-
-        return y
-
-    def matvec(v):
-        w = _chunked_XTv(v)
-        y = _chunked_Xw(w)
-        y -= degree_inv_gpu * v
-        return y
-
-    A = cusla.LinearOperator(
-        shape=(n_cells, n_cells), matvec=matvec, dtype=cp.float32,
-    )
     rng = cp.random.RandomState(seed=random_state)
     v0 = rng.rand(n_cells).astype(cp.float32)
 

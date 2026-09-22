@@ -9,9 +9,19 @@ scoring, and topic modelling.
 ## Dimensionality reduction
 
 Compute a spectral decomposition of the cell × feature matrix — the standard
-entry point for UMAP and clustering in ATAC-seq workflows (`spectral`) — or
-model topics over the peak-accessibility matrix with GPU-accelerated
-mini-batch Online Variational Bayes (`lda`, `MiniBatchLDA`).
+entry point for UMAP and clustering in ATAC-seq workflows (`spectral`) — run
+TF-IDF followed by a truncated SVD, the Signac/ArchR latent semantic indexing
+(`lsi`, with `project_lsi` to place new cells on a fitted embedding) — or model
+topics over the peak-accessibility matrix with GPU-accelerated mini-batch
+Online Variational Bayes (`lda`, `MiniBatchLDA`).
+
+`lsi` reproduces `ArchR:::.computeLSI` component for component, including its
+three `LSIMethod` variants, its depth-outlier hold-out, and the
+depth-correlation dimension filter. `iterative_lsi` is the port of
+`ArchR::addIterativeLSI`: it clusters on a first embedding, keeps the features
+whose per-cluster accessibility varies most, and redoes the decomposition on
+those — so each round selects for the structure the previous round found. It
+requires cuGraph for the clustering step; `lsi` does not.
 
 ```{eval-rst}
 .. currentmodule:: gatac.tl
@@ -21,8 +31,29 @@ mini-batch Online Variational Bayes (`lda`, `MiniBatchLDA`).
    :nosignatures:
 
    spectral
+   lsi
+   iterative_lsi
+   project_lsi
+   model_from_adata
    lda
    MiniBatchLDA
+```
+
+The individual stages of the LSI pipeline are exported too, for building a
+custom iterative scheme or inspecting one step in isolation. `scale_dims` is
+ArchR's `scaleDims` — note it standardises each *cell* across its dimensions,
+not each dimension across cells.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   feature_accessibility
+   initial_features
+   accessibility_pool
+   cluster_var_features
+   scale_dims
 ```
 
 ---

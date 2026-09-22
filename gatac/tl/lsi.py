@@ -1,0 +1,2189 @@
+"""
+GPU-accelerated Latent Semantic Indexing (TF-IDF + truncated SVD) for
+ATAC-seq matrices.
+
+A port of ``ArchR:::.computeLSI`` / ``ArchR:::.projectLSI`` (ArchR 1.0.3),
+accelerated with CuPy. The three TF-IDF variants are ArchR's ``LSIMethod``
+1/2/3, with ``tf = x / depth``, ``df`` = per-feature sum over *training* cells
+and ``n`` = number of training cells:
+
+===========  ===================  =================================
+``method``   ArchR name           value on each nonzero
+===========  ===================  =================================
+1            ``tf-logidf``        ``tf * log(1 + n/df)``
+2 (default)  ``log(tf-idf)``      ``log(tf * (n/df) * scale_to + 1)``
+3            ``logtf-logidf``     ``log(tf + 1) * log(1 + n/df)``
+===========  ===================  =================================
+
+``method=2`` is the default because it is what ``addIterativeLSI`` uses (only
+the internal ``.computeLSI`` defaults to 1), and it is also Signac's
+``RunTFIDF(method = 1)``.
+
+Notes on fidelity
+-----------------
+* **Depth follows ``binarize``.** ArchR binarizes *before* ``colSums``, so the
+  per-cell depth is the number of nonzero features when ``binarize=True`` and
+  the row sum of counts when ``binarize=False``. GATAC tile matrices are
+  ``uint16`` unless built with ``count_strategy="binarize"``, so conflating the
+  two silently mis-normalises a default matrix.
+* **The embedding is ``V @ diag(d)``** — singular vectors scaled by singular
+  values — matching ArchR's ``matSVD``.
+* **Projection re-computes depth for the cells being projected** and reuses
+  only the training ``row_sums``/``n_train`` for the IDF, plus the *fitted*
+  ``binarize`` and feature subset. See :func:`project_lsi`.
+* **The result is bitwise reproducible** for a given ``random_state``, in one
+  process and across fresh ones. That needed more than seeding: cuSPARSE's
+  SpMV is not run-to-run deterministic, so the solver runs on a fixed-order
+  product of its own (see ``_csr_spmv_kernel``). ``deterministic=False``
+  restores ``cupyx``'s ``svds``, which is reproducible at no seed.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+from dataclasses import dataclass, field
+from typing import Literal
+
+import cupy as cp
+import cupyx.scipy.sparse as cusp
+import cupyx.scipy.sparse.linalg as cusla
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+
+from ._gpu import ChunkedMatrix, _to_gpu_csr
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "lsi",
+    "LSIModel",
+    "project_lsi",
+    "model_from_adata",
+    "initial_features",
+    "cluster_var_features",
+    "scale_dims",
+    "feature_accessibility",
+    "accessibility_pool",
+    "iterative_lsi",
+]
+
+#: ArchR's ``LSIMethod`` string aliases.
+_METHOD_ALIASES = {
+    "tf-logidf": 1,
+    "log(tf-idf)": 2,
+    "logtf-logidf": 3,
+}
+
+
+# ---------------------------------------------------------------------------
+# TF-IDF kernel — one warp per cell
+# ---------------------------------------------------------------------------
+#
+# A warp per row rather than a thread per row: within-row reads are then
+# coalesced and the per-cell depth reduction is a __shfl_down_sync tree.
+# Measured 1 ms vs 9 ms for the thread-per-row shape on a 20 M-nonzero matrix.
+#
+# ``idf`` arrives pre-transformed — log(1 + n/df) for methods 1 and 3, bare
+# n/df for method 2 — so the log over the feature axis is paid n_features
+# times instead of nnz times.
+#
+# ``inv_depth`` is supplied by the caller, never derived here, because
+# projection must use the *new* cells' depth while taking the IDF from
+# training.
+_tfidf_kernel = cp.RawKernel(
+    r"""
+    extern "C" __global__
+    void tfidf(float* data, const int* indices, const int* indptr,
+               const float* idf, const float* inv_depth,
+               const float scale_to, const int method,
+               const int binarize, const int n_rows) {
+        int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int lane = threadIdx.x & 31;
+        if (warp >= n_rows) return;
+
+        int s = indptr[warp], e = indptr[warp + 1];
+        float inv = inv_depth[warp];
+
+        for (int j = s + lane; j < e; j += 32) {
+            float x  = binarize ? 1.0f : data[j];
+            float tf = x * inv;
+            float w  = idf[indices[j]];
+            float v;
+            if      (method == 1) v = tf * w;                        // tf-logidf
+            else if (method == 2) v = log1pf(tf * w * scale_to);     // log(tf-idf)
+            else                  v = log1pf(tf) * w;               // logtf-logidf
+            data[j] = v;
+        }
+    }
+    """,
+    "tfidf",
+)
+
+
+def _launch_warp_per_row(kernel, n_rows: int, *args) -> None:
+    """Launch *kernel* with one warp per row."""
+    block = 256
+    grid = (int(n_rows) * 32 + block - 1) // block
+    kernel((grid,), (block,), args)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic sparse matrix-vector product
+# ---------------------------------------------------------------------------
+#
+# cuSPARSE's SpMV is not run-to-run deterministic. Measured on the 27 M-nonzero
+# TF-IDF matrix of the 4,437-cell PBMC fixture, eight repeats of ``X @ v`` with
+# a byte-identical input vector gave eight different results (max |d| 2.9e-3 on
+# values of order 1e3); the same held for ``Xᵀ @ v`` and for the SpMM path with
+# a single column. That — not the eigensolver's random start — is where LSI's
+# irreproducibility comes from: seeding the start vector only halved the
+# run-to-run spread of the embedding (max |Δu| 1.7e-5 → 6.6e-6), because every
+# Lanczos step re-randomises the low bits again. Every dense primitive the
+# solver otherwise uses (gemv, gemm, nrm2, dot, eigh) *was* bitwise
+# reproducible over 5 repeats of the same test.
+#
+# One warp per row with a strided partial sum and a fixed ``__shfl_down_sync``
+# reduction tree fixes the summation order, so the result is bitwise
+# reproducible. Accumulating in double costs nothing on a memory-bound kernel
+# and buys accuracy rather than spending it: against ArchR's float64 irlba on
+# the 643-cell G0 fixture, LSIMethod 2 held its 1.8e-7 worst-case relative
+# singular-value error, where a float32 accumulator drifted to 1.5e-6.
+_csr_spmv_kernel = cp.RawKernel(
+    r"""
+    extern "C" __global__
+    void csr_spmv(const float* __restrict__ data,
+                  const int* __restrict__ indices,
+                  const int* __restrict__ indptr,
+                  const float* __restrict__ x,
+                  float* __restrict__ y, const int n_rows) {
+        int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int lane = threadIdx.x & 31;
+        if (warp >= n_rows) return;
+
+        int s = indptr[warp], e = indptr[warp + 1];
+        double acc = 0.0;
+        for (int j = s + lane; j < e; j += 32)
+            acc += (double)data[j] * (double)x[indices[j]];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffff, acc, off);
+        if (lane == 0) y[warp] = (float)acc;
+    }
+    """,
+    "csr_spmv",
+)
+
+
+def _spmv(A: cusp.csr_matrix, x: cp.ndarray, out: cp.ndarray) -> cp.ndarray:
+    """``out = A @ x`` for a float32 CSR *A*, with a fixed summation order."""
+    _launch_warp_per_row(
+        _csr_spmv_kernel, A.shape[0],
+        A.data, A.indices, A.indptr, x, out, np.int32(A.shape[0]),
+    )
+    return out
+
+
+# The dense-right-hand-side counterpart. One warp per row still, but eight
+# accumulators deep so a k=30 product reads each row four times rather than
+# thirty; that is what keeps it competitive with cuSPARSE's SpMM while summing
+# in a fixed order.
+_CSR_SPMM_TILE = 8
+_csr_spmm_kernel = cp.RawKernel(
+    r"""
+    extern "C" __global__
+    void csr_spmm(const float* __restrict__ data,
+                  const int* __restrict__ indices,
+                  const int* __restrict__ indptr,
+                  const float* __restrict__ B,
+                  float* __restrict__ C,
+                  const int n_rows, const int n_cols) {
+        const int TILE = 8;
+        int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int lane = threadIdx.x & 31;
+        if (warp >= n_rows) return;
+
+        int s = indptr[warp], e = indptr[warp + 1];
+        for (int c0 = 0; c0 < n_cols; c0 += TILE) {
+            int cn = min(TILE, n_cols - c0);
+            double acc[TILE];
+            #pragma unroll
+            for (int t = 0; t < TILE; ++t) acc[t] = 0.0;
+            for (int j = s + lane; j < e; j += 32) {
+                double v = (double)data[j];
+                const float* brow = B + (size_t)indices[j] * n_cols + c0;
+                #pragma unroll
+                for (int t = 0; t < TILE; ++t)
+                    if (t < cn) acc[t] += v * (double)brow[t];
+            }
+            #pragma unroll
+            for (int t = 0; t < TILE; ++t) {
+                double a = acc[t];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    a += __shfl_down_sync(0xffffffff, a, off);
+                if (lane == 0 && t < cn)
+                    C[(size_t)warp * n_cols + c0 + t] = (float)a;
+            }
+        }
+    }
+    """,
+    "csr_spmm",
+)
+
+
+def _spmm(A: cusp.csr_matrix, B: cp.ndarray) -> cp.ndarray:
+    """``A @ B`` for float32 CSR *A* and dense ``(A.shape[1], c)`` *B*."""
+    B = cp.ascontiguousarray(B, dtype=cp.float32)
+    out = cp.empty((A.shape[0], B.shape[1]), dtype=cp.float32)
+    _launch_warp_per_row(
+        _csr_spmm_kernel, A.shape[0],
+        A.data, A.indices, A.indptr, B, out,
+        np.int32(A.shape[0]), np.int32(B.shape[1]),
+    )
+    return out
+
+
+def _gram_operator(
+    X: cusp.csr_matrix,
+) -> tuple[cusla.LinearOperator, cusp.csr_matrix]:
+    """
+    The smaller of ``X Xᵀ`` / ``Xᵀ X`` as a deterministic LinearOperator.
+
+    This is the operator ``cupyx``'s ``svds`` builds internally, rebuilt here
+    so the two products go through :func:`_spmv` instead of cuSPARSE. Applying
+    ``Xᵀ`` deterministically needs its rows contiguous, so the transpose is
+    materialised — the cost is a second copy of the matrix (15 ms and 217 MB on
+    the PBMC fixture) and it is why ``deterministic=False`` exists.
+
+    Returns the operator and that transpose, which the caller needs again to
+    recover the singular vectors on the other side.
+    """
+    if X.dtype != cp.float32:
+        raise TypeError(
+            f"the deterministic solver needs a float32 matrix, got {X.dtype}."
+        )
+    XT = X.T.tocsr()
+    m, n = X.shape
+    # m <= n: y = X (Xᵀ v), an (m, m) operator; otherwise y = Xᵀ (X v).
+    first, second = (XT, X) if m <= n else (X, XT)
+    p = min(m, n)
+    tmp = cp.empty(first.shape[0], dtype=cp.float32)
+
+    def matvec(v):
+        shp = v.shape
+        vf = cp.ascontiguousarray(v.ravel(), dtype=cp.float32)
+        _spmv(first, vf, tmp)
+        y = _spmv(second, tmp, cp.empty(p, dtype=cp.float32))
+        return y.reshape(-1, 1) if len(shp) == 2 else y
+
+    return (
+        cusla.LinearOperator(shape=(p, p), matvec=matvec, dtype=cp.float32),
+        XT,
+    )
+
+
+@contextlib.contextmanager
+def _cupy_seed(seed: int):
+    """
+    Scope CuPy's global RNG to *seed*, restoring the caller's state on exit.
+
+    ``cupyx``'s ``svds`` gives no way to pass a starting vector: it calls
+    ``eigsh`` without ``v0``, and ``eigsh`` then draws one from
+    ``cupy.random.random`` — so ``random_state`` reached the LSI metadata but
+    never the solver. Seeding the global stream is the only handle on that, and
+    restoring the previous state afterwards keeps the call from perturbing the
+    caller's own draws.
+    """
+    prev = cp.random.get_random_state()
+    try:
+        cp.random.set_random_state(cp.random.RandomState(seed))
+        yield
+    finally:
+        cp.random.set_random_state(prev)
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LSIModel:
+    """
+    A fitted LSI, carrying exactly what is needed to project new cells.
+
+    ``idf`` is deliberately *not* stored: it is a pure function of
+    ``row_sums``, ``n_train`` and ``method`` (and ArchR likewise recomputes it
+    in ``.projectLSI``), so deriving it in one place removes a field that could
+    contradict the settings beside it.
+    """
+
+    embedding: np.ndarray            #: (n_cells, n_comps) V @ diag(d)
+    singular_values: np.ndarray      #: (n_comps,)
+    feature_loadings: np.ndarray     #: (n_kept, n_comps) — retained features, `idx` order
+    idx: np.ndarray                  #: retained feature indices, into the fitted feature set
+    row_sums: np.ndarray             #: training per-feature sums over `idx` (ArchR rowSm)
+    n_train: int                     #: training cell count (ArchR nCol)
+    method: int
+    scale_to: float
+    binarize: bool
+    deterministic: bool = True       #: whether the *reproducible* solver ran
+    random_state: int = 0
+    depth_cor: np.ndarray | None = None      #: |r| with log10 depth, per component
+    dims_dropped: np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
+    n_held_out: int = 0
+    n_zero_depth_projected: int = 0
+    n_empty_cells: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Pieces
+# ---------------------------------------------------------------------------
+
+
+def _resolve_method(method: int | str) -> int:
+    """Map ArchR's ``LSIMethod`` value or string alias onto 1/2/3."""
+    if isinstance(method, str):
+        key = method.strip().lower()
+        if key not in _METHOD_ALIASES:
+            raise ValueError(
+                f"Unknown LSI method {method!r}. Use 1, 2, 3 or one of "
+                f"{sorted(_METHOD_ALIASES)}."
+            )
+        return _METHOD_ALIASES[key]
+    if method not in (1, 2, 3):
+        raise ValueError(f"method must be 1, 2 or 3 (got {method!r}).")
+    return int(method)
+
+
+def _cell_depth(X: cusp.csr_matrix, binarize: bool) -> cp.ndarray:
+    """
+    Per-cell depth, honouring *binarize*, as ArchR's ``colSm``.
+
+    ArchR binarizes before ``Matrix::colSums``, so with ``binarize=True`` the
+    depth is the number of nonzero features and with ``binarize=False`` it is
+    the sum of the counts. Using nnz for a count-valued matrix would divide a
+    count numerator by an nnz denominator, and the resulting ``tf`` would not
+    sum to 1 per cell.
+    """
+    if binarize:
+        return cp.diff(X.indptr).astype(cp.float32)
+    return cp.asarray(X.sum(axis=1), dtype=cp.float32).ravel()
+
+
+def _feature_sums(X: cusp.csr_matrix, binarize: bool) -> cp.ndarray:
+    """Per-feature sums over the rows of *X*, honouring *binarize* (ArchR ``rowSm``)."""
+    n_features = X.shape[1]
+    if binarize:
+        # In a valid CSR each (row, col) pair appears once, so a bincount over
+        # the column indices is the document frequency — no binary copy needed.
+        return cp.bincount(
+            X.indices.astype(cp.intp), minlength=n_features
+        ).astype(cp.float32)
+    return cp.asarray(X.sum(axis=0), dtype=cp.float32).ravel()
+
+
+def _idf_from_row_sums(
+    row_sums: cp.ndarray, n_train: int, method: int
+) -> cp.ndarray:
+    """
+    IDF vector, pre-transformed for the kernel.
+
+    Methods 1 and 3 fold ``log(1 + n/df)`` in here so the log is paid once per
+    feature rather than once per nonzero; method 2 needs the bare ratio because
+    its log wraps the whole product.
+    """
+    df = cp.maximum(row_sums, cp.float32(1.0))
+    ratio = cp.float32(n_train) / df
+    if method == 2:
+        return ratio.astype(cp.float32)
+    return cp.log1p(ratio).astype(cp.float32)
+
+
+def tfidf_gpu(
+    X: cusp.csr_matrix,
+    *,
+    method: int = 2,
+    scale_to: float = 1e4,
+    binarize: bool = True,
+    idf: cp.ndarray | None = None,
+    inv_depth: cp.ndarray | None = None,
+    row_sums: cp.ndarray | None = None,
+    n_train: int | None = None,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """
+    Apply TF-IDF **in place** to a cells × features GPU CSR matrix.
+
+    Parameters
+    ----------
+    X
+        Cells × features CSR on device. ``X.data`` is converted to float32 in
+        place; the index arrays are untouched.
+    method
+        ArchR ``LSIMethod`` 1/2/3.
+    scale_to
+        ArchR's ``scaleTo``.
+    binarize
+        Treat every nonzero as 1, in both the depth and the numerator.
+    idf
+        Pre-computed IDF (already log-transformed for methods 1 and 3). When
+        ``None`` it is derived from *row_sums* and *n_train*, which then default
+        to this matrix's own values.
+    inv_depth
+        Reciprocal per-cell depth. When ``None`` it is computed from *X*
+        honouring *binarize*. Projection passes the new cells' own depth.
+    row_sums, n_train
+        Training-side IDF inputs; only used when *idf* is ``None``.
+
+    Returns
+    -------
+    tuple[cp.ndarray, cp.ndarray]
+        ``(idf, inv_depth)`` actually used, for reuse by a projection.
+    """
+    method = _resolve_method(method)
+    n_cells = X.shape[0]
+
+    X.data = X.data.astype(cp.float32, copy=False)
+    indices32 = X.indices.astype(cp.int32, copy=False)
+    indptr32 = X.indptr.astype(cp.int32, copy=False)
+
+    if inv_depth is None:
+        depth = _cell_depth(X, binarize)
+        # ArchR: colSm[colSm == 0] <- 1, so an empty row stays all-zero
+        depth = cp.where(depth == 0, cp.float32(1.0), depth)
+        inv_depth = (cp.float32(1.0) / depth).astype(cp.float32)
+    else:
+        inv_depth = inv_depth.astype(cp.float32, copy=False)
+
+    if idf is None:
+        if row_sums is None:
+            row_sums = _feature_sums(X, binarize)
+        if n_train is None:
+            n_train = n_cells
+        idf = _idf_from_row_sums(row_sums, n_train, method)
+    else:
+        idf = idf.astype(cp.float32, copy=False)
+
+    _launch_warp_per_row(
+        _tfidf_kernel, n_cells,
+        X.data, indices32, indptr32, idf, inv_depth,
+        np.float32(scale_to), np.int32(method),
+        np.int32(bool(binarize)), np.int32(n_cells),
+    )
+    return idf, inv_depth
+
+
+def _flip_signs(u: cp.ndarray, vt: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
+    """
+    Pin the arbitrary sign of each singular triplet.
+
+    An SVD determines each component only up to a simultaneous sign flip of
+    its left and right vectors, and ``cupyx``'s ``svds`` does not fix the
+    choice: repeated runs on identical input with an identical
+    ``random_state`` return components whose magnitudes agree to ~1e-4 but
+    whose signs differ.
+
+    Per-column sign is irrelevant to most downstream use (a correlation, a
+    distance, UMAP), but it is *not* irrelevant here: ArchR's ``scaleDims``
+    z-scores each cell **across** dimensions, mixing the columns, so a flipped
+    sign changes the scaled embedding, the depth correlations computed from it,
+    and the clustering built on it.
+
+    The rule must be a *smooth* function of the vector. sklearn's ``svd_flip``
+    takes the sign of the largest-magnitude entry, which is discontinuous: when
+    the top two magnitudes are nearly tied, the ~1e-6 noise this solver leaves
+    is enough to move the argmax and flip the entire component. That was
+    measured here — it made iterative LSI irreproducible, with a cluster ARI of
+    0.77 between two identical runs, because per-cell scaling mixes the columns
+    and so propagates a sign flip into the clustering.
+
+    Instead the sign comes from ``sum(u³)``, an aggregate over every entry and
+    therefore stable under small perturbations (the cube keeps the large
+    entries dominant so it does not vanish for a roughly symmetric vector, as
+    ``sum(u)`` can). ``sum(u)`` and finally ``+1`` are the fallbacks if it is
+    exactly zero. The product ``u @ diag(s) @ vt`` is unchanged either way.
+    """
+    crit = (u.astype(cp.float64) ** 3).sum(axis=0)
+    fallback = u.astype(cp.float64).sum(axis=0)
+    crit = cp.where(crit == 0, fallback, crit)
+    signs = cp.sign(crit)
+    signs = cp.where(signs == 0, 1.0, signs).astype(u.dtype)
+    return u * signs, vt * signs[:, None]
+
+
+def _augment_orthonormal(x: cp.ndarray, n_aug: int, rng) -> cp.ndarray:
+    """
+    Pad *x* with *n_aug* columns orthonormal to it (``svds``' own fallback).
+
+    Only reached when the Gram spectrum is rank-deficient at the requested
+    ``n_comps``. ``svds`` draws these from CuPy's global RNG; drawing them from
+    a seeded host generator instead keeps the padded columns reproducible too.
+    """
+    if n_aug <= 0:
+        return x
+    m, n = x.shape
+    y = cp.empty((m, n + n_aug), dtype=x.dtype)
+    y[:, :n] = x
+    for i in range(n, n + n_aug):
+        v = cp.asarray(rng.random(m), dtype=x.dtype)
+        v -= v @ y[:, :i].conj() @ y[:, :i].T
+        y[:, i] = v / cp.linalg.norm(v)
+    return y
+
+
+def _svd_deterministic(
+    X: cusp.csr_matrix, n_comps: int, *, tol: float, ncv: int, random_state: int
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """
+    ``svds``' algorithm with every source of run-to-run variation removed.
+
+    Identical in structure to ``cupyx.scipy.sparse.linalg.svds`` — thick-restart
+    Lanczos on the smaller Gram operator, then one product to recover the other
+    side — but the Gram apply goes through :func:`_gram_operator` rather than
+    cuSPARSE, and the Lanczos start vector is drawn from a seeded host
+    generator and handed to ``eigsh`` as ``v0`` rather than left to CuPy's
+    global RNG. Both are needed: see the comment above ``_csr_spmv_kernel``.
+    """
+    gram, XT = _gram_operator(X)
+    m, n = X.shape
+    rng = np.random.default_rng(random_state)
+    v0 = cp.asarray(rng.random(gram.shape[0]), dtype=cp.float32)
+
+    w, x = cusla.eigsh(
+        gram, k=n_comps, which="LM", ncv=ncv, tol=tol, v0=v0,
+        return_eigenvectors=True,
+    )
+    del gram
+
+    # Below svds' own rank cutoff the singular value is reported as zero and
+    # the vector replaced by an arbitrary orthonormal one; mirror that.
+    w = cp.maximum(w, 0)
+    cutoff = 1e3 * float(np.finfo(np.float32).eps) * float(w.max())
+    above = w > cutoff
+    n_large = int(above.sum())
+    s = cp.zeros_like(w)
+    s[:n_large] = cp.sqrt(w[above])
+    x = cp.ascontiguousarray(x[:, above])
+
+    if m <= n:                      # gram was X Xᵀ, so x holds the left vectors
+        u, v = x, _spmm(XT, x) / s[:n_large]
+    else:                           # gram was Xᵀ X, so x holds the right ones
+        v, u = x, _spmm(X, x) / s[:n_large]
+    del XT
+    u = _augment_orthonormal(u, n_comps - n_large, rng)
+    v = _augment_orthonormal(v, n_comps - n_large, rng)
+    return u, s, v.conj().T
+
+
+def _deterministic_available(X, deterministic: bool) -> bool:
+    """Whether :func:`_svd` can take the reproducible path for this operand."""
+    return bool(deterministic) and cusp.isspmatrix_csr(X) and X.dtype == cp.float32
+
+
+def _svd(
+    X,
+    n_comps: int,
+    *,
+    tol: float = 1e-5,
+    ncv: int | None = None,
+    random_state: int = 0,
+    deterministic: bool = True,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """
+    Truncated SVD of a sparse matrix or LinearOperator, descending.
+
+    ``cupyx``'s ``svds`` runs Lanczos on the implicit Gram operator (the
+    smaller of ``X Xᵀ`` / ``Xᵀ X``), which for an ATAC matrix is cells × cells.
+    Defaults differ deliberately from CuPy's: ``tol=1e-5`` is irlba's default —
+    hence ArchR's and Signac's behaviour — where CuPy uses machine precision,
+    and the wider Krylov basis measured 29–47 % faster at 200k–500k cells with
+    no loss of accuracy.
+
+    Randomized SVD is not offered: against a float64 ARPACK reference it lost
+    the trailing components on both CPU and GPU.
+
+    With *deterministic* (the default) and a resident float32 CSR matrix the
+    same algorithm is run through :func:`_svd_deterministic`, which is bitwise
+    reproducible for a given ``random_state``. ``svds`` itself is not, at any
+    seed. A streamed :class:`~gatac.tl._gpu.ChunkedMatrix` operator cannot take
+    that path — the transpose it needs is exactly what does not fit — so it
+    falls back to ``svds`` with the global RNG scoped to ``random_state``,
+    which controls the start vector but not cuSPARSE.
+
+    Component signs are pinned by :func:`_flip_signs`, without which the
+    output is not reproducible run to run even when everything else is.
+    """
+    n_rows, n_cols = X.shape
+    max_k = min(n_rows, n_cols) - 1
+    if n_comps > max_k:
+        raise ValueError(
+            f"n_comps={n_comps} must be < min(n_cells, n_features) = "
+            f"{min(n_rows, n_cols)}; the solver requires k < min(m, n)."
+        )
+    if ncv is None:
+        ncv = min(max_k, max(4 * n_comps + 1, n_comps + 60))
+
+    if _deterministic_available(X, deterministic):
+        u, s, vt = _svd_deterministic(
+            X, n_comps, tol=tol, ncv=ncv, random_state=random_state
+        )
+    else:
+        if deterministic:
+            logger.info(
+                "Deterministic SVD unavailable for this operand "
+                f"({type(X).__name__}); seeding the solver's start vector "
+                "only. cuSPARSE's SpMV remains nondeterministic, so repeated "
+                "runs will differ at ~1e-5 in the embedding."
+            )
+        with _cupy_seed(random_state):
+            u, s, vt = cusla.svds(X, k=n_comps, tol=tol, ncv=ncv)
+
+    order = cp.argsort(s)[::-1]
+    u, s, vt = u[:, order], s[order], vt[order]
+    # svds leaves each component's sign arbitrary and does not reproduce it
+    # across runs; pin it so the embedding is a deterministic function of the
+    # data (see _flip_signs).
+    u, vt = _flip_signs(u, vt)
+    return u, s, vt
+
+
+def scale_dims(
+    embedding: np.ndarray, scale_max: float | None = None
+) -> np.ndarray:
+    """
+    ArchR's ``scaleDims`` — z-score each **cell** across its dimensions.
+
+    This is ``ArchR:::.scaleDims`` → ``.rowZscores``, and the axis is easy to
+    get wrong: it standardises every *row* (one cell's embedding vector to mean
+    0, sd 1), not every column. Per-dimension standardisation is a different
+    operation and gives different results downstream — notably it leaves the
+    depth correlation of a component unchanged, whereas ArchR's per-cell
+    scaling does not (see :func:`drop_depth_correlated`).
+
+    ArchR applies this before clustering and before its ``corCutOff`` filter,
+    but the stored ``matSVD`` itself is unscaled — scaling happens on the way
+    out, in ``getReducedDims(scaleDims = TRUE)``.
+
+    A consequence worth knowing about, because it is a property of ArchR's
+    algorithm rather than of this port: z-scoring across dimensions **mixes the
+    columns**, so the scaled embedding is not invariant to the arbitrary sign
+    of an SVD component. Measured on the 4,437-cell PBMC oracle at iteration 1,
+    where GATAC and ArchR agree on every determined component to |r| = 1.000000
+    (29 of 30; the 30th sits inside a flat trailing spectrum and is not
+    determined by either): 11 of those components come back with opposite
+    signs, and the mean per-cell distance between the two scaled embeddings is
+    10.20 — against 0.204, fifty times smaller, once the signs are aligned.
+
+    There is no canonical sign to align *to*. ArchR takes whatever irlba's
+    random start produces, and its own signs move between its own seeds: on the
+    same fixture, seed 1 vs seed 2 flipped 15 of 29 determined components, seed
+    1 vs seed 3 flipped 20, seed 2 vs seed 3 flipped 16 — a wider spread than
+    GATAC's rule shows against any of them (10, 13, 17). So ArchR's clustering,
+    and therefore the features its next iteration selects, depend in part on its
+    solver's RNG; that is one of the mechanisms behind its ~0.93 seed-to-seed
+    feature Jaccard. :func:`_flip_signs` pins GATAC's sign to the data instead,
+    which is the reproducible choice but does not, and cannot, reproduce any
+    particular ArchR run.
+
+    Parameters
+    ----------
+    embedding
+        ``n_cells x n_dims``.
+    scale_max
+        Clip to ``[-scale_max, scale_max]`` afterwards, as
+        ``.rowZscores(limit = TRUE)`` does. ``None`` (ArchR's default) does not
+        clip.
+
+    Returns
+    -------
+    np.ndarray
+        The scaled embedding, float32.
+    """
+    e = np.asarray(embedding, dtype=np.float64)
+    sd = e.std(axis=1, ddof=1, keepdims=True)      # matrixStats::rowSds
+    sd = np.where(sd == 0, 1.0, sd)
+    z = (e - e.mean(axis=1, keepdims=True)) / sd
+    if scale_max is not None:
+        z = np.clip(z, -scale_max, scale_max)
+    return z.astype(np.float32)
+
+
+def drop_depth_correlated(
+    embedding: np.ndarray,
+    depth: np.ndarray,
+    cutoff: float | None = 0.75,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Flag components correlated with sequencing depth (ArchR's ``corCutOff``).
+
+    *depth* should be **total fragments per cell** — ``obs["n_unique"]``, the
+    analogue of ArchR's ``nFrags`` — not the nonzero count of whichever feature
+    submatrix was used; using the latter drops components ArchR keeps.
+
+    *embedding* should already be scaled with :func:`scale_dims`, since that is
+    what ArchR correlates. Its per-cell z-scoring is not a per-column
+    transform, so unlike a per-dimension standardisation it genuinely changes
+    the correlations.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(keep_mask, abs_correlation)``, both length ``n_comps``.
+    """
+    d = np.log10(np.asarray(depth, dtype=np.float64) + 1.0)
+    d_sd = d.std()
+    e = np.asarray(embedding, dtype=np.float64)
+    e_sd = e.std(axis=0)
+
+    if d_sd == 0:
+        # constant depth — correlation is undefined, nothing to drop
+        r = np.zeros(e.shape[1])
+    else:
+        dz = (d - d.mean()) / d_sd
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ez = (e - e.mean(axis=0)) / np.where(e_sd == 0, 1.0, e_sd)
+        r = np.abs((ez * dz[:, None]).mean(axis=0))
+        r[e_sd == 0] = 0.0
+
+    keep = np.ones(e.shape[1], dtype=bool) if cutoff is None else (r <= cutoff)
+    return keep, r
+
+
+# ---------------------------------------------------------------------------
+# Fit / project
+# ---------------------------------------------------------------------------
+
+
+def compute_lsi(
+    X,
+    n_comps: int = 30,
+    *,
+    method: int | str = 2,
+    scale_to: float = 1e4,
+    binarize: bool = True,
+    outlier_quantiles: tuple[float, float] | None = None,
+    depth: np.ndarray | None = None,
+    depth_cor_cutoff: float | None = None,
+    scale_by_sv: bool = True,
+    allow_empty_cells: bool = False,
+    tol: float = 1e-5,
+    ncv: int | None = None,
+    random_state: int = 0,
+    deterministic: bool = True,
+    chunk_size: int | None = None,
+) -> LSIModel:
+    """
+    Fit LSI on a cells × features matrix, following ``ArchR:::.computeLSI``.
+
+    Parameters
+    ----------
+    X
+        Cells × features sparse matrix (scipy or cupyx). Not modified: the
+        device copy is what gets TF-IDF'd in place.
+    n_comps
+        Number of components.
+    method
+        ArchR ``LSIMethod`` 1/2/3, or a string alias.
+    scale_to
+        ArchR's ``scaleTo``.
+    binarize
+        Treat nonzeros as 1. Also determines what "depth" means (see module
+        docstring).
+    outlier_quantiles
+        Depth quantiles whose tails are **held out** of the fit and projected
+        back in afterwards, as ArchR does with ``c(0.02, 0.98)``. ``None``
+        fits every cell.
+    depth
+        Total fragments per cell, for the depth-correlation filter only. When
+        ``None`` the matrix's own per-cell depth is used, with a warning.
+    depth_cor_cutoff
+        Drop components whose \\|r\\| with ``log10(depth)`` exceeds this.
+        ``None`` keeps every component but still reports the correlations.
+    scale_by_sv
+        Return ``V @ diag(d)`` (ArchR's ``matSVD``) rather than ``V``.
+    allow_empty_cells
+        What to do about cells with no signal in the given features. ``False``
+        (default) raises, which is right when the *caller* chose the features:
+        an empty cell is then a data problem worth surfacing rather than
+        silently embedding at the origin. ``True`` excludes them from the fit
+        and gives them an all-zero row, which is what
+        :func:`iterative_lsi` needs — it selects the features itself, so
+        whether a cell is empty is not something the user can act on
+        beforehand. ArchR drops such cells from its output entirely; keeping
+        them as zero rows preserves one row per cell.
+    tol, ncv
+        Solver controls; see :func:`_svd`.
+    random_state
+        Seed for the Lanczos starting vector.
+    deterministic
+        Use the reproducible solver path: a seeded Lanczos start vector and a
+        fixed-order sparse matrix-vector product, so two runs at the same
+        ``random_state`` give bitwise-identical output. ``False`` restores
+        ``cupyx``'s ``svds``, which is not reproducible at any seed.
+
+        Two caveats, part of the contract rather than footnotes. It costs a
+        **second copy of the fitted matrix on device** — the transpose the
+        fixed-order product needs. And a **streamed (``chunk_size``) run cannot
+        take this path at all**: that transpose is exactly what does not fit,
+        so the request is downgraded to seeding the start vector, with cuSPARSE
+        still nondeterministic underneath. The downgrade is logged, and it is
+        the *effective* mode, not the requested one, that lands in
+        ``LSIModel.deterministic`` and in the ``uns`` params — so a run can be
+        asked afterwards whether it was actually reproducible.
+    chunk_size
+        Stream the matrix from host memory in row chunks of this size instead
+        of holding it in VRAM.
+
+    Returns
+    -------
+    LSIModel
+        With ``embedding`` covering **all** input rows: fitted cells from the
+        SVD, held-out cells projected.
+    """
+    method = _resolve_method(method)
+    n_cells, n_features = X.shape
+
+    # ---- depth, honouring binarize ---------------------------------------
+    X_gpu_full = _to_gpu_csr(X) if chunk_size is None else None
+    if X_gpu_full is not None:
+        depth_all = _cell_depth(X_gpu_full, binarize)
+    else:
+        Xh = X.tocsr()
+        depth_all = cp.asarray(
+            np.diff(Xh.indptr).astype(np.float32)
+            if binarize
+            else np.asarray(Xh.sum(axis=1)).ravel().astype(np.float32)
+        )
+    depth_np = cp.asnumpy(depth_all)
+
+    # ---- cell bookkeeping -------------------------------------------------
+    empty = depth_np == 0
+    n_empty = int(empty.sum())
+    if n_empty and not allow_empty_cells:
+        raise ValueError(
+            f"{n_empty} cell(s) have no features in the selected set. "
+            "Filter empty cells before running LSI, e.g.:\n"
+            "    sc.pp.filter_cells(adata, min_counts=1)\n"
+            "or widen the feature selection.\n"
+            "Pass allow_empty_cells=True to embed them at the origin instead."
+        )
+    if n_empty:
+        logger.warning(
+            f"{n_empty} cell(s) have no signal in the selected features; "
+            "excluded from the fit and given an all-zero embedding row. "
+            "ArchR drops such cells from its output entirely."
+        )
+
+    train_mask = ~empty
+    if outlier_quantiles is not None:
+        lo, hi = np.quantile(depth_np[~empty], sorted(outlier_quantiles))
+        held = ((depth_np <= lo) | (depth_np >= hi)) & ~empty
+        if held.all() or (int((~empty).sum()) - int(held.sum())) < n_comps + 1:
+            # Near-constant depth makes lo == hi, so the condition catches
+            # every cell. Fitting nothing is worse than fitting everything.
+            logger.warning(
+                "Depth-outlier hold-out would leave "
+                f"{n_cells - int(held.sum())} training cell(s) for "
+                f"n_comps={n_comps}; fitting all cells instead. This happens "
+                "when per-cell depth is near-constant."
+            )
+        else:
+            train_mask = ~held & ~empty
+    n_train = int(train_mask.sum())
+    n_held_out = n_cells - n_train
+    if n_held_out:
+        logger.info(
+            f"Holding out {n_held_out} depth-outlier cell(s); "
+            f"fitting on {n_train}."
+        )
+
+    # ---- training submatrix ----------------------------------------------
+    if X_gpu_full is not None:
+        X_train = X_gpu_full if n_held_out == 0 else X_gpu_full[cp.asarray(train_mask)]
+    else:
+        X_train = X.tocsr() if n_held_out == 0 else X.tocsr()[train_mask]
+
+    # ---- retained features (ArchR: rowSm > 0 on training cells) ----------
+    if X_gpu_full is not None:
+        row_sums_all = _feature_sums(X_train, binarize)
+        keep_feat = row_sums_all > 0
+        idx = cp.asnumpy(cp.where(keep_feat)[0])
+        row_sums = row_sums_all[keep_feat]
+    else:
+        Xt = X_train
+        rs = (
+            np.diff(Xt.tocsc().indptr).astype(np.float32)
+            if binarize
+            else np.asarray(Xt.sum(axis=0)).ravel().astype(np.float32)
+        )
+        idx = np.where(rs > 0)[0]
+        row_sums = cp.asarray(rs[idx])
+    n_kept = len(idx)
+    if n_kept < n_features:
+        logger.info(
+            f"Dropping {n_features - n_kept} feature(s) with zero training "
+            f"signal; {n_kept} retained."
+        )
+
+    if n_comps >= min(n_train, n_kept):
+        raise ValueError(
+            f"n_comps={n_comps} must be < min(n_train, n_features_kept) = "
+            f"{min(n_train, n_kept)} (n_train={n_train}, kept={n_kept})."
+        )
+
+    # ---- TF-IDF + SVD -----------------------------------------------------
+    idf = _idf_from_row_sums(row_sums, n_train, method)
+
+    if X_gpu_full is not None:
+        X_fit = X_train[:, cp.asarray(idx)] if n_kept < n_features else X_train
+        X_fit = _to_gpu_csr(X_fit).copy()
+        inv_depth_train = (
+            cp.float32(1.0) / _cell_depth(X_fit, binarize).clip(1.0)
+        ).astype(cp.float32)
+        tfidf_gpu(
+            X_fit, method=method, scale_to=scale_to, binarize=binarize,
+            idf=idf, inv_depth=inv_depth_train,
+        )
+        used_deterministic = _deterministic_available(X_fit, deterministic)
+        u, s, vt = _svd(X_fit, n_comps, tol=tol, ncv=ncv,
+                        random_state=random_state,
+                        deterministic=deterministic)
+        del X_fit
+    else:
+        Xf = X_train[:, idx].tocsr() if n_kept < n_features else X_train.tocsr()
+        Xf = _tfidf_host_chunked(
+            Xf, idf=idf, method=method, scale_to=scale_to,
+            binarize=binarize, chunk_size=chunk_size,
+        )
+        store, op = ChunkedMatrix(Xf, chunk_size), None
+        op = store.as_operator()
+        used_deterministic = _deterministic_available(op, deterministic)
+        u, s, vt = _svd(op, n_comps, tol=tol, ncv=ncv,
+                        random_state=random_state,
+                        deterministic=deterministic)
+        del store, op, Xf
+
+    cp.get_default_memory_pool().free_all_blocks()
+
+    emb_train = (u * s) if scale_by_sv else u
+    loadings = cp.asnumpy(vt.T)          # (n_kept, n_comps)
+    s_np = cp.asnumpy(s)
+
+    model = LSIModel(
+        embedding=np.empty((n_cells, n_comps), dtype=np.float32),
+        singular_values=s_np,
+        feature_loadings=loadings.astype(np.float32),
+        idx=np.asarray(idx, dtype=np.int64),
+        row_sums=cp.asnumpy(row_sums).astype(np.float32),
+        n_train=n_train,
+        method=method,
+        scale_to=float(scale_to),
+        binarize=bool(binarize),
+        deterministic=used_deterministic,
+        random_state=random_state,
+        n_held_out=n_held_out,
+        n_empty_cells=n_empty,
+    )
+    model.embedding[train_mask] = cp.asnumpy(emb_train).astype(np.float32)
+    del u, s, vt, emb_train
+    cp.get_default_memory_pool().free_all_blocks()
+
+    # ---- reinsert held-out cells by projection ---------------------------
+    if n_held_out:
+        X_out = (
+            X_gpu_full[cp.asarray(~train_mask)]
+            if X_gpu_full is not None
+            else X.tocsr()[~train_mask]
+        )
+        proj, n_zero = _project(model, X_out, already_subset=False)
+        model.embedding[~train_mask] = proj
+        model.n_zero_depth_projected = n_zero
+        del X_out
+
+    del X_gpu_full
+    cp.get_default_memory_pool().free_all_blocks()
+
+    # ---- depth-correlation filter ----------------------------------------
+    if depth is None:
+        logger.warning(
+            "No `depth` supplied for the depth-correlation filter; falling "
+            "back to per-cell depth of the selected features. ArchR uses total "
+            "fragments per cell (obs['n_unique'])."
+        )
+        depth_for_cor = depth_np
+    else:
+        depth_for_cor = np.asarray(depth)
+
+    # ArchR filters on the *scaled* dims (.LSICluster and getReducedDims both
+    # z-score per cell first), and because that scaling is per row rather than
+    # per column it changes the correlations — on a real tile matrix it was the
+    # difference between dropping component 1 and keeping it.
+    keep, r = drop_depth_correlated(
+        scale_dims(model.embedding), depth_for_cor, cutoff=depth_cor_cutoff
+    )
+    model.depth_cor = r
+    model.dims_dropped = np.where(~keep)[0]
+    if model.dims_dropped.size:
+        logger.info(
+            f"Dropping {model.dims_dropped.size} component(s) correlated with "
+            f"depth (|r| > {depth_cor_cutoff}): "
+            f"{model.dims_dropped.tolist()}"
+        )
+        model.embedding = model.embedding[:, keep]
+
+    # A flat trailing spectrum means the surplus components are not supported
+    # by the data — and they are what makes the solver slow.
+    if len(s_np) > 5:
+        tail = s_np[-5:]
+        if float(tail[0] / tail[-1]) < 1.02:
+            logger.info(
+                "The trailing singular values are nearly identical "
+                f"({tail[0]:.3g} → {tail[-1]:.3g}); n_comps={n_comps} likely "
+                "exceeds the rank this data supports. A smaller n_comps is "
+                "both faster and no less informative."
+            )
+
+    return model
+
+
+def _tfidf_host_chunked(
+    X: sp.csr_matrix,
+    *,
+    idf: cp.ndarray,
+    method: int,
+    scale_to: float,
+    binarize: bool,
+    chunk_size: int,
+) -> sp.csr_matrix:
+    """TF-IDF a host CSR matrix in row chunks, writing back in place."""
+    X = X.tocsr()
+    if X.dtype != np.float32:
+        X = sp.csr_matrix(
+            (X.data.astype(np.float32), X.indices, X.indptr), shape=X.shape
+        )
+    n_cells = X.shape[0]
+    for start in range(0, n_cells, chunk_size):
+        end = min(start + chunk_size, n_cells)
+        d0, d1 = int(X.indptr[start]), int(X.indptr[end])
+        n_rows = end - start
+        d_data = cp.asarray(X.data[d0:d1])
+        d_indices = cp.asarray(X.indices[d0:d1].astype(np.int32))
+        d_indptr = cp.asarray((X.indptr[start : end + 1] - d0).astype(np.int32))
+
+        # Reuse _cell_depth on a device view of the chunk rather than summing
+        # rows host-side: np.add.reduceat returns the element itself, not 0,
+        # when two consecutive offsets are equal, so it silently mis-sums an
+        # empty row. compute_lsi excludes empty rows before reaching here, but
+        # this helper should not depend on that.
+        chunk_view = cusp.csr_matrix(
+            (d_data, d_indices, d_indptr), shape=(n_rows, X.shape[1])
+        )
+        depth = _cell_depth(chunk_view, binarize)
+        inv_depth = (cp.float32(1.0) / cp.maximum(depth, 1.0)).astype(cp.float32)
+
+        _launch_warp_per_row(
+            _tfidf_kernel, n_rows,
+            d_data, d_indices, d_indptr, idf, inv_depth,
+            np.float32(scale_to), np.int32(method),
+            np.int32(bool(binarize)), np.int32(n_rows),
+        )
+        X.data[d0:d1] = cp.asnumpy(d_data)
+        del d_data, d_indices, d_indptr, depth, inv_depth
+        cp.get_default_memory_pool().free_all_blocks()
+    return X
+
+
+def _project(
+    model: LSIModel, X_new, already_subset: bool = False
+) -> tuple[np.ndarray, int]:
+    """Core of :func:`project_lsi`; returns ``(embedding, n_zero_depth)``."""
+    Xg = _to_gpu_csr(X_new)
+
+    # 1. subset to the retained features
+    if not already_subset and Xg.shape[1] != len(model.idx):
+        Xg = _to_gpu_csr(Xg[:, cp.asarray(model.idx)])
+    Xg = Xg.copy()
+
+    # 2/3. the fitted binarize setting, then depth recomputed on THESE cells
+    depth = _cell_depth(Xg, model.binarize)
+    n_zero = int(cp.sum(depth == 0))
+    inv_depth = (
+        cp.float32(1.0) / cp.where(depth == 0, cp.float32(1.0), depth)
+    ).astype(cp.float32)
+
+    # 4/5. TF from the new cells' depth, IDF from the training row sums
+    idf = _idf_from_row_sums(
+        cp.asarray(model.row_sums), model.n_train, model.method
+    )
+    tfidf_gpu(
+        Xg, method=model.method, scale_to=model.scale_to,
+        binarize=model.binarize, idf=idf, inv_depth=inv_depth,
+    )
+
+    # Deterministic on purpose: this is the step that places the held-out
+    # depth-outlier cells back into the embedding, so cuSPARSE's
+    # nondeterministic SpMM here would make the *output* of an otherwise
+    # bitwise-reproducible fit differ run to run — measured at 1e-4 absolute on
+    # the 179 held-out cells of the PBMC fixture, with the 4,258 fitted cells
+    # already identical.
+    loadings = cp.asarray(model.feature_loadings, dtype=cp.float32)
+    emb = (
+        _spmm(Xg, loadings)
+        if Xg.dtype == cp.float32
+        else Xg.dot(loadings)
+    )
+    out = cp.asnumpy(emb).astype(np.float32)
+    del Xg, emb, idf, inv_depth, depth
+    cp.get_default_memory_pool().free_all_blocks()
+    return out, n_zero
+
+
+def project_lsi(model: LSIModel, X_new) -> np.ndarray:
+    """
+    Project new cells onto a fitted LSI, following ``ArchR:::.projectLSI``.
+
+    The order is not interchangeable:
+
+    1. subset to the retained features (``model.idx``),
+    2. apply the **fitted** ``binarize`` setting,
+    3. **recompute** per-cell depth on the new cells,
+    4. TF from that depth,
+    5. IDF from the training ``row_sums`` and ``n_train``,
+
+    then ``emb = X_new @ loadings``. A cell whose nonzeros all fell in features
+    dropped at fit time has zero depth after step 1 and projects to an all-zero
+    row, as in ArchR (``colSm[colSm == 0] <- 1``), rather than to NaN.
+
+    Parameters
+    ----------
+    model
+        A fitted :class:`LSIModel`.
+    X_new
+        Cells × features matrix, either over the model's original feature set
+        or already subset to ``model.idx``.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n_new_cells, n_comps)`` embedding, in the model's component order
+        *before* any depth-correlation filtering.
+    """
+    emb, n_zero = _project(model, X_new)
+    if n_zero:
+        logger.warning(
+            f"{n_zero} projected cell(s) have no signal in the model's "
+            "retained features; their embedding rows are zero."
+        )
+    return emb
+
+# ---------------------------------------------------------------------------
+# Iterative-LSI feature selection (ArchR addIterativeLSI / .identifyVarFeatures)
+# ---------------------------------------------------------------------------
+#
+# Per-cluster pseudo-bulk accumulation with one warp per cell and an atomicAdd
+# per nonzero. This avoids both temporaries the naive form needs: the
+# nnz-sized row-id array a searchsorted approach builds, and the
+# n_clusters x n_features int64 bincount.
+#
+# float32 accumulation is exact here: the values added are small integers
+# (1 when binarizing, otherwise raw counts), and integers below 2^24 are
+# represented exactly. The normalisation and variance that follow run in
+# float64, so a near-tie in the variance ranking is not decided by float32.
+_cluster_sums_kernel = cp.RawKernel(
+    r"""
+    extern "C" __global__
+    void cluster_sums(const float* data, const int* indices, const int* indptr,
+                      const int* cluster, float* group,
+                      const int n_features, const int binarize,
+                      const int n_rows) {
+        int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+        int lane = threadIdx.x & 31;
+        if (warp >= n_rows) return;
+
+        float* row = group + (long long)cluster[warp] * (long long)n_features;
+        int s = indptr[warp], e = indptr[warp + 1];
+        for (int j = s + lane; j < e; j += 32) {
+            atomicAdd(row + indices[j], binarize ? 1.0f : data[j]);
+        }
+    }
+    """,
+    "cluster_sums",
+)
+
+
+def feature_accessibility(X, binarize: bool = True) -> np.ndarray:
+    """
+    Per-feature accessibility (ArchR's ``totalAcc$rowSums``), on GPU.
+
+    The obvious host-side route — ``np.diff(X.tocsc().indptr)`` — converts the
+    whole matrix to CSC, which on a 665 M-nonzero tile matrix measured 27 s and
+    dominated everything else in the pipeline put together. A ``bincount`` over
+    the column indices is the same quantity: in a valid CSR each ``(row, col)``
+    pair appears at most once, so counting column indices *is* the per-feature
+    cell count.
+
+    Parameters
+    ----------
+    X
+        Cells × features sparse matrix.
+    binarize
+        Count cells per feature (``True``) rather than summing counts.
+
+    Returns
+    -------
+    np.ndarray
+        Length ``n_features``.
+    """
+    Xg = _to_gpu_csr(X)
+    return cp.asnumpy(_feature_sums(Xg, binarize))
+
+
+def initial_features(
+    accessibility: np.ndarray,
+    n_features: int = 25_000,
+    *,
+    total_features: int = 500_000,
+    filter_quantile: float = 0.995,
+) -> np.ndarray:
+    """
+    ArchR's ``firstSelection = "top"`` initial feature set.
+
+    A rank *window*, not a quantile trim of the whole distribution — which is
+    why :func:`gatac.pp.select_features` cannot be reused here. Transcribed
+    from ``addIterativeLSI`` (ArchR 1.0.3)::
+
+        nFeature <- varFeatures[1]
+        rmTop    <- floor((1 - filterQuantile) * totalFeatures)
+        if (sum(totalAcc$rowSums > 0) > 2.25 * varFeatures) {
+            topIdx <- head(order(rowSums, decreasing = TRUE),
+                           nFeature + rmTop)[-seq_len(rmTop)]
+        } else {
+            topIdx <- head(order(rowSums, decreasing = TRUE), nFeature)
+        }
+        topFeatures <- totalAcc[sort(topIdx), ]
+
+    Note the guard: the most accessible ``rmTop`` features are skipped **only**
+    when enough features are non-zero, otherwise ArchR falls back to a plain
+    top-N (printing "Not Enough Non-Zero Features to Filter!"). ``rmTop`` is
+    computed from the ``total_features`` *parameter*, not from how many
+    features the matrix actually has.
+
+    Zero-accessibility features are not removed here; ``.computeLSI`` drops
+    them later via its own ``rowSm > 0`` check, so removing them at this step
+    would diverge from ArchR.
+
+    Parameters
+    ----------
+    accessibility
+        Per-feature accessibility (ArchR's ``totalAcc$rowSums``). For a
+        binarized tile matrix this is the number of cells per feature.
+    n_features
+        ArchR's ``varFeatures`` — the window width.
+    total_features
+        ArchR's ``totalFeatures``, used only to size the skipped head.
+    filter_quantile
+        ArchR's ``filterQuantile``.
+
+    Returns
+    -------
+    np.ndarray
+        Selected feature indices, ascending.
+    """
+    acc = np.asarray(accessibility)
+    n_nonzero = int((acc > 0).sum())
+    rm_top = int(np.floor((1.0 - filter_quantile) * total_features))
+
+    # R's order() is stable, so ties keep ascending index order
+    order = np.argsort(-acc, kind="stable")
+    if n_nonzero > 2.25 * n_features:
+        top = order[rm_top : rm_top + n_features]
+    else:
+        logger.info(
+            f"Only {n_nonzero:,} non-zero feature(s) for n_features="
+            f"{n_features:,}; not enough to skip the top {rm_top:,} "
+            "(ArchR: Not Enough Non-Zero Features to Filter!)."
+        )
+        top = order[:n_features]
+    return np.sort(top)
+
+
+def accessibility_pool(
+    accessibility: np.ndarray, total_features: int = 500_000
+) -> np.ndarray:
+    """
+    The feature *pool* variable-feature scoring runs over.
+
+    Distinct from :func:`initial_features`, and easy to conflate with it.
+    ``.identifyVarFeatures`` takes a plain top-N::
+
+        groupFeatures <- totalAcc[sort(head(order(totalAcc$rowSums,
+                                                  decreasing = TRUE),
+                                            totalFeatures)), ]
+
+    — no ``rmTop`` window and no ``filterQuantile``. Those apply only to the
+    *initial* feature set in ``addIterativeLSI``, which is a different
+    selection made once before the loop starts.
+
+    Parameters
+    ----------
+    accessibility
+        Per-feature accessibility over **all** features (ArchR's ``totalAcc``).
+    total_features
+        ArchR's ``totalFeatures``.
+
+    Returns
+    -------
+    np.ndarray
+        Pool feature indices, ascending.
+    """
+    acc = np.asarray(accessibility)
+    n = min(total_features, acc.shape[0])
+    return np.sort(np.argsort(-acc, kind="stable")[:n])
+
+
+def cluster_var_features(
+    X_pool,
+    clusters: np.ndarray,
+    n_features: int = 25_000,
+    *,
+    scale_to: float = 1e4,
+    binarize: bool = True,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ArchR's per-cluster variable features (``selectionMethod = "var"``).
+
+    Transcribed from ``ArchR:::.identifyVarFeatures``, whose ``groupMat`` is
+    **features × clusters**::
+
+        groupMat <- log2(t(t(groupMat) / colSums(groupMat)) * scaleTo + 1)
+        var      <- matrixStats::rowVars(groupMat)
+        idx      <- sort(head(order(var, decreasing = TRUE), nFeature))
+
+    So the normalisation is per *cluster* — each cluster's pseudo-bulk sums to
+    ``scale_to`` — and the variance is per *feature* across clusters. This
+    implementation accumulates the transpose (clusters × features), so **both
+    reductions flip**: ``sum(axis=1, keepdims=True)`` and
+    ``var(axis=0, ddof=1)``. Writing ArchR's R idiom against this orientation
+    would score clusters instead of features.
+
+    ``ddof=1`` matches ``matrixStats::rowVars``.
+
+    Parameters
+    ----------
+    X_pool
+        Cells × features matrix restricted to the accessibility pool from
+        :func:`initial_features` — ArchR scores over that pool, not over every
+        feature in the matrix.
+    clusters
+        Integer cluster label per cell.
+    n_features
+        How many features to keep.
+    scale_to
+        ArchR's ``scaleTo``.
+    binarize
+        Accumulate presence rather than counts.
+    chunk_size
+        Stream the matrix from host memory in row chunks of this size.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(selected_indices_ascending, variance_per_pool_feature)``.
+    """
+    labels = np.asarray(clusters)
+    if labels.shape[0] != X_pool.shape[0]:
+        raise ValueError(
+            f"clusters has length {labels.shape[0]} but X_pool has "
+            f"{X_pool.shape[0]} rows."
+        )
+    uniq, codes = np.unique(labels, return_inverse=True)
+    k = len(uniq)
+    if k < 2:
+        raise ValueError(
+            "Variable-feature selection needs at least 2 clusters "
+            f"(got {k}). ArchR returns the previous feature set in this case."
+        )
+    n_pool = X_pool.shape[1]
+    group = cp.zeros((k, n_pool), dtype=cp.float32)
+    codes_gpu = cp.asarray(codes.astype(np.int32))
+
+    def _accumulate(Xg: cusp.csr_matrix, code_slice: cp.ndarray) -> None:
+        _launch_warp_per_row(
+            _cluster_sums_kernel, Xg.shape[0],
+            Xg.data.astype(cp.float32, copy=False),
+            Xg.indices.astype(cp.int32, copy=False),
+            Xg.indptr.astype(cp.int32, copy=False),
+            code_slice, group, np.int32(n_pool),
+            np.int32(bool(binarize)), np.int32(Xg.shape[0]),
+        )
+
+    if chunk_size is None:
+        _accumulate(_to_gpu_csr(X_pool), codes_gpu)
+    else:
+        Xh = X_pool.tocsr()
+        for start in range(0, Xh.shape[0], chunk_size):
+            end = min(start + chunk_size, Xh.shape[0])
+            _accumulate(_to_gpu_csr(Xh[start:end]), codes_gpu[start:end])
+            cp.get_default_memory_pool().free_all_blocks()
+
+    # float64 from here: a near-tie in the variance ranking should not be
+    # decided by float32 rounding, and the group matrix is only k x n_pool.
+    g = group.astype(cp.float64)
+    del group
+    totals = g.sum(axis=1, keepdims=True)
+    totals = cp.where(totals == 0, cp.float64(1.0), totals)
+    g = cp.log2(g / totals * cp.float64(scale_to) + cp.float64(1.0))
+    var = cp.asnumpy(g.var(axis=0, ddof=1))
+    del g
+    cp.get_default_memory_pool().free_all_blocks()
+
+    n_sel = min(n_features, n_pool)
+    idx = np.argsort(-var, kind="stable")[:n_sel]
+    return np.sort(idx), var
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def _resolve_features(adata, features) -> np.ndarray | None:
+    """Resolve the feature selector to a boolean mask, or None for all."""
+    if features is None:
+        return None
+    if isinstance(features, str):
+        if features not in adata.var.columns:
+            raise KeyError(
+                f"Column '{features}' not found in adata.var. Call "
+                "`pp.select_features` first, pass a boolean array, or set "
+                "`features=None` to use every feature."
+            )
+        return adata.var[features].to_numpy().astype(bool)
+    mask = np.asarray(features)
+    if mask.dtype == bool:
+        if mask.shape[0] != adata.n_vars:
+            raise ValueError(
+                f"Boolean feature mask has length {mask.shape[0]}, expected "
+                f"{adata.n_vars}."
+            )
+        return mask
+    out = np.zeros(adata.n_vars, dtype=bool)
+    out[mask] = True
+    return out
+
+
+def _resolve_depth(adata, depth_key: str) -> np.ndarray | None:
+    """
+    Total fragments per cell, for the depth-correlation filter.
+
+    ArchR correlates each component against ``nFrags``; the GATAC analogue is
+    the ``n_unique`` column written by :func:`gatac.pp.compute_metrics`. Using
+    the nonzero count of whichever feature submatrix was selected instead drops
+    components ArchR keeps.
+    """
+    if depth_key and depth_key in adata.obs.columns:
+        return adata.obs[depth_key].to_numpy(dtype=np.float64)
+    return None
+
+
+def _jsonable(value):
+    """Coerce a parameter value to something ``h5py`` can store, or drop it."""
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    if value is None:
+        return "None"
+    if isinstance(value, (tuple, list)) and all(
+        isinstance(v, (bool, int, float)) for v in value
+    ):
+        return np.asarray(value)
+    return None
+
+
+def _pack_params(**kwargs) -> dict:
+    """
+    Build the ``uns`` params dict, dropping anything unserialisable.
+
+    Callables (``cluster_fn``) and arbitrary objects would make ``write_h5ad``
+    fail, so they never reach ``uns``: a callable is recorded as a flag plus its
+    qualified name, and anything else non-scalar is dropped with a debug note.
+    """
+    out: dict = {}
+    for key, value in kwargs.items():
+        if callable(value):
+            out[f"{key}_supplied"] = True
+            out[f"{key}_name"] = getattr(value, "__qualname__", repr(value))
+            continue
+        coerced = _jsonable(value)
+        if coerced is None:
+            logger.debug(f"Dropping unserialisable param {key!r} from uns.")
+            continue
+        out[key] = coerced
+    return out
+
+
+def _align_loadings(
+    model: LSIModel, feat_mask: np.ndarray | None, n_vars: int
+) -> np.ndarray:
+    """
+    Scatter the fitted loadings onto the full var axis.
+
+    ``varm`` requires its first axis to be exactly ``n_vars``, but the model is
+    fitted over a subset (the feature mask composed with the model's own
+    retained-feature ``idx``). Unfitted features get zeros rather than NaN, so a
+    stray downstream matmul contributes nothing instead of poisoning the result;
+    which rows are real is recoverable from the stored mask.
+    """
+    n_comps = model.feature_loadings.shape[1]
+    full = np.zeros((n_vars, n_comps), dtype=np.float32)
+    base = np.where(feat_mask)[0] if feat_mask is not None else np.arange(n_vars)
+    full[base[model.idx]] = model.feature_loadings
+    return full
+
+
+def _fitted_mask(
+    model: LSIModel, feat_mask: np.ndarray | None, n_vars: int
+) -> np.ndarray:
+    """Boolean mask over the full var axis of the features actually fitted."""
+    out = np.zeros(n_vars, dtype=bool)
+    base = np.where(feat_mask)[0] if feat_mask is not None else np.arange(n_vars)
+    out[base[model.idx]] = True
+    return out
+
+
+def lsi(
+    adata,
+    n_comps: int = 30,
+    *,
+    method: int | str = 2,
+    features: str | np.ndarray | None = "selected",
+    binarize: bool = True,
+    scale_to: float = 1e4,
+    outlier_quantiles: tuple[float, float] | None = None,
+    depth_cor_cutoff: float | None = 0.75,
+    depth_key: str = "n_unique",
+    scale_by_sv: bool = True,
+    tol: float = 1e-5,
+    ncv: int | None = None,
+    store_model: bool = False,
+    random_state: int = 0,
+    deterministic: bool = True,
+    inplace: bool = True,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    GPU-accelerated LSI: TF-IDF followed by truncated SVD.
+
+    A port of ``ArchR:::.computeLSI``, and the same computation Signac performs
+    with ``RunTFIDF`` + ``RunSVD``. For the iterative feature-selection variant
+    (``ArchR::addIterativeLSI``) see :func:`gatac.tl.iterative_lsi`.
+
+    Parameters
+    ----------
+    adata
+        AnnData with a sparse cell × feature matrix in ``adata.X`` — a tile or
+        peak matrix, count-valued or binary.
+    n_comps
+        Number of components. Must be smaller than both the number of fitted
+        cells and the number of retained features. Note that the solver's cost
+        is driven far more by ``n_comps`` than by cell count: components beyond
+        the rank the data supports sit in a near-degenerate tail that the
+        eigensolver then has to separate. ``uns["lsi"]["singular_values"]``
+        shows where your own spectrum flattens.
+    method
+        ArchR's ``LSIMethod``: ``1`` (``"tf-logidf"``), ``2``
+        (``"log(tf-idf)"``, the default) or ``3`` (``"logtf-logidf"``). String
+        aliases are accepted. ``2`` is the default because it is what
+        ``addIterativeLSI`` uses — only the internal ``.computeLSI`` defaults to
+        1 — and it is also Signac's ``RunTFIDF(method = 1)``. Methods 1 and 3
+        span the same subspace on ATAC-scale data; 2 is genuinely different, and
+        is the only one that produces the familiar depth-correlated first
+        component.
+    features
+        Which features to use. ``"selected"`` (default) reads the boolean mask
+        in ``adata.var["selected"]`` and requires a prior
+        :func:`gatac.pp.select_features`; a boolean or integer array selects
+        directly; ``None`` uses every feature.
+    binarize
+        Treat every nonzero as 1, as ArchR does by default. This also
+        determines what per-cell depth means — the number of nonzero features
+        when binarizing, the sum of counts otherwise — because ArchR binarizes
+        before computing it. GATAC tile matrices are ``uint16`` unless built
+        with ``count_strategy="binarize"``, so leaving this ``True`` on a count
+        matrix is the faithful choice, not a no-op.
+    scale_to
+        ArchR's ``scaleTo``; only used by ``method=2``.
+    outlier_quantiles
+        Depth quantiles whose tails are held out of the fit and projected back
+        in afterwards. ``None`` (default) fits every cell: for a one-shot
+        embedding you asked for an embedding of your cells, not of 96 % of
+        them. Pass ``(0.02, 0.98)`` for exact ``.computeLSI`` parity.
+    depth_cor_cutoff
+        Drop components whose absolute correlation with ``log10`` sequencing
+        depth exceeds this (ArchR's ``corCutOff``, default 0.75). ``None``
+        keeps every component; the correlations are reported either way.
+    depth_key
+        ``adata.obs`` column holding total fragments per cell, used only for
+        the depth correlation. Defaults to ``"n_unique"``, written by
+        :func:`gatac.pp.compute_metrics`. Falls back to the selected
+        submatrix's per-cell depth, with a warning, when absent.
+    scale_by_sv
+        Return ``V @ diag(d)``, as ArchR's ``matSVD`` does, rather than the
+        orthonormal ``V``.
+    tol, ncv
+        Solver controls. ``tol=1e-5`` matches irlba, the solver ArchR and
+        Signac use, rather than CuPy's machine-precision default; ``ncv=None``
+        picks a Krylov basis of ``max(4 * n_comps + 1, n_comps + 60)``, which
+        measured 29–47 % faster than CuPy's default at 200k–500k cells with no
+        loss of accuracy.
+    store_model
+        Also store the feature loadings and the metadata needed to project new
+        cells. Off by default: aligned to the full var axis the loadings are
+        ``n_vars × n_comps`` (73 MB at 606k features, k=30).
+    random_state
+        Seed for the Lanczos starting vector.
+    deterministic
+        Use the reproducible solver path: a seeded Lanczos start vector and a
+        fixed-order sparse matrix-vector product, so two runs at the same
+        ``random_state`` give bitwise-identical output. ``False`` restores
+        ``cupyx``'s ``svds``, which is not reproducible at any seed.
+
+        Two caveats, part of the contract rather than footnotes. It costs a
+        **second copy of the fitted matrix on device** — the transpose the
+        fixed-order product needs. And a **streamed (``chunk_size``) run cannot
+        take this path at all**: that transpose is exactly what does not fit,
+        so the request is downgraded to seeding the start vector, with cuSPARSE
+        still nondeterministic underneath. The downgrade is logged, and it is
+        the *effective* mode, not the requested one, that lands in
+        ``LSIModel.deterministic`` and in the ``uns`` params — so a run can be
+        asked afterwards whether it was actually reproducible.
+    inplace
+        Store the result on *adata* and return ``None``; otherwise return
+        ``(embedding, singular_values)``.
+    chunk_size
+        Stream the matrix from host memory in row chunks of this many cells
+        instead of holding it in VRAM. A float32 CSR costs about 8 bytes per
+        nonzero on device, so this is rarely needed — a 46 GB card holds
+        roughly 5 billion nonzeros resident.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray] | None
+        ``None`` when ``inplace=True``, having written:
+
+        * ``adata.obsm["X_lsi"]`` — the embedding, one row per cell
+        * ``adata.uns["lsi"]`` — singular values, per-component depth
+          correlation, dropped components, the parameters used, and the model
+          when ``store_model=True``
+        * ``adata.varm["LSI"]`` — feature loadings, when ``store_model=True``
+
+        Otherwise ``(embedding, singular_values)``.
+
+    Notes
+    -----
+    Cells with no signal in the selected features raise rather than producing
+    a degenerate row, matching :func:`gatac.tl.spectral`. Held-out depth
+    outliers are projected back in, so the embedding always has one row per
+    cell in the original order.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.pp.select_features(adata, n_features=50_000)
+    >>> ga.tl.lsi(adata, n_comps=30)
+    >>> adata.obsm["X_lsi"].shape
+    (n_cells, 30)
+
+    For exact ArchR ``.computeLSI`` parity, including its depth-outlier
+    hold-out:
+
+    >>> ga.tl.lsi(adata, n_comps=30, method=1, outlier_quantiles=(0.02, 0.98))
+    """
+    method_id = _resolve_method(method)
+    feat_mask = _resolve_features(adata, features)
+
+    X = adata.X
+    if feat_mask is not None:
+        n_sel = int(feat_mask.sum())
+        if n_sel == 0:
+            raise ValueError(
+                "The feature selection is empty; nothing to decompose."
+            )
+        logger.info(
+            f"Running LSI on {adata.n_obs:,} cells x {n_sel:,} selected "
+            f"features (method {method_id})."
+        )
+        X = X[:, feat_mask]
+    else:
+        logger.info(
+            f"Running LSI on {adata.n_obs:,} cells x {adata.n_vars:,} features "
+            f"(method {method_id})."
+        )
+
+    depth = _resolve_depth(adata, depth_key)
+
+    model = compute_lsi(
+        X,
+        n_comps,
+        method=method_id,
+        scale_to=scale_to,
+        binarize=binarize,
+        outlier_quantiles=outlier_quantiles,
+        depth=depth,
+        depth_cor_cutoff=depth_cor_cutoff,
+        scale_by_sv=scale_by_sv,
+        tol=tol,
+        ncv=ncv,
+        random_state=random_state,
+        deterministic=deterministic,
+        chunk_size=chunk_size,
+    )
+
+    logger.info(
+        f"LSI complete: {model.embedding.shape[1]} component(s) kept "
+        f"(top singular value {model.singular_values[0]:.4g})."
+    )
+
+    if not inplace:
+        return model.embedding, model.singular_values
+
+    adata.obsm["X_lsi"] = model.embedding
+    uns: dict = {
+        "singular_values": model.singular_values,
+        "depth_cor": model.depth_cor,
+        "dims_dropped": model.dims_dropped,
+        "n_held_out": model.n_held_out,
+        "n_zero_depth_projected": model.n_zero_depth_projected,
+        "params": _pack_params(
+            n_comps=n_comps,
+            method=method_id,
+            binarize=binarize,
+            scale_to=scale_to,
+            outlier_quantiles=outlier_quantiles,
+            depth_cor_cutoff=depth_cor_cutoff,
+            depth_key=depth_key,
+            scale_by_sv=scale_by_sv,
+            tol=tol,
+            ncv=ncv,
+            random_state=random_state,
+            deterministic=model.deterministic,
+            features=features if isinstance(features, str) else "array",
+        ),
+    }
+    if store_model:
+        adata.varm["LSI"] = _align_loadings(model, feat_mask, adata.n_vars)
+        uns["model"] = {
+            "loadings_key": "LSI",
+            "feature_mask": _fitted_mask(model, feat_mask, adata.n_vars),
+            "row_sums": model.row_sums,
+            "n_train": model.n_train,
+            "singular_values": model.singular_values,
+            "method": model.method,
+            "scale_to": model.scale_to,
+            "binarize": model.binarize,
+            "scale_by_sv": bool(scale_by_sv),
+            "deterministic": model.deterministic,
+            "random_state": model.random_state,
+        }
+    adata.uns["lsi"] = uns
+    return None
+
+
+def model_from_adata(adata, uns_key: str = "lsi") -> LSIModel:
+    """
+    Rebuild an :class:`LSIModel` from an AnnData written with
+    ``store_model=True``.
+
+    Survives a ``write_h5ad`` / ``read_h5ad`` round trip, which is the point of
+    storing plain arrays and scalars rather than the dataclass itself.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying ``uns[uns_key]["model"]`` and the referenced ``varm``
+        entry.
+    uns_key
+        Which ``uns`` entry to read — ``"lsi"`` or ``"iterative_lsi"``.
+
+    Returns
+    -------
+    LSIModel
+        Without ``embedding`` populated (it is in ``obsm``), ready for
+        :func:`project_lsi`.
+    """
+    if uns_key not in adata.uns or "model" not in adata.uns[uns_key]:
+        raise KeyError(
+            f"adata.uns['{uns_key}']['model'] not found. Re-run with "
+            "`store_model=True` to make projection possible."
+        )
+    stored = adata.uns[uns_key]["model"]
+    mask = np.asarray(stored["feature_mask"], dtype=bool)
+    loadings_full = np.asarray(adata.varm[str(stored["loadings_key"])])
+    return LSIModel(
+        embedding=np.empty((0, loadings_full.shape[1]), dtype=np.float32),
+        singular_values=np.asarray(stored["singular_values"]),
+        feature_loadings=loadings_full[mask].astype(np.float32),
+        idx=np.arange(int(mask.sum()), dtype=np.int64),
+        row_sums=np.asarray(stored["row_sums"], dtype=np.float32),
+        n_train=int(stored["n_train"]),
+        method=int(stored["method"]),
+        scale_to=float(stored["scale_to"]),
+        binarize=bool(stored["binarize"]),
+        # absent in models written before the reproducible solver existed
+        deterministic=bool(stored.get("deterministic", False)),
+        random_state=int(stored["random_state"]),
+    )
+
+
+def iterative_lsi(
+    adata,
+    n_comps: int = 30,
+    *,
+    iterations: int = 2,
+    n_features: int = 25_000,
+    total_features: int = 500_000,
+    filter_quantile: float = 0.995,
+    method: int | str = 2,
+    scale_to: float = 1e4,
+    binarize: bool = True,
+    outlier_quantiles: tuple[float, float] | None = (0.02, 0.98),
+    depth_cor_cutoff: float | None = 0.75,
+    depth_key: str = "n_unique",
+    cluster_params: dict | None = None,
+    cluster_fn=None,
+    store_model: bool = False,
+    tol: float = 1e-5,
+    ncv: int | None = None,
+    random_state: int = 0,
+    deterministic: bool = True,
+    inplace: bool = True,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Iterative feature selection followed by LSI — ``ArchR::addIterativeLSI``.
+
+    One LSI on the most accessible features is dominated by whichever
+    populations happen to be abundant. ArchR's answer is to iterate: cluster on
+    a first embedding, score every feature by how much its per-cluster
+    accessibility varies, keep the most variable, and redo the LSI on those.
+    Each round therefore selects features that separate the structure the
+    previous round found.
+
+    The loop, per round after the first: :func:`scale_dims` →
+    :func:`drop_depth_correlated` → cluster →
+    :func:`cluster_var_features` → LSI.
+
+    Parameters
+    ----------
+    adata
+        AnnData with a sparse cell × feature matrix. Unlike :func:`lsi` this
+        selects its own features and ignores ``var["selected"]``.
+    n_comps
+        Components per LSI round (ArchR's ``dimsToUse``).
+    iterations
+        Total LSI rounds, matching ArchR's semantics — ``2`` means an initial
+        LSI plus one re-selected round, with one clustering between them.
+    n_features
+        Features kept per round (ArchR's ``varFeatures``).
+    total_features
+        Size of the pool that variable-feature scoring runs over
+        (``totalFeatures``). Note this is a plain top-N, while the *initial*
+        selection is a rank window — see :func:`accessibility_pool` and
+        :func:`initial_features`.
+    filter_quantile
+        Sizes the head skipped by the initial rank window
+        (``filterQuantile``).
+    method, scale_to, binarize, outlier_quantiles, tol, ncv
+        Passed to each LSI round; see :func:`lsi`.
+    depth_cor_cutoff, depth_key
+        Depth-correlation filter applied before clustering and to the final
+        embedding.
+    cluster_params
+        Overrides for the built-in clusterer, e.g.
+        ``{"resolution": 2.0, "max_clusters": 6, "k": 20, "flavor": "leiden"}``.
+        Defaults are ArchR's iterative-LSI ``clusterParams``. Every keyword of
+        :func:`~gatac.tl._clustering.snn_cluster` is accepted, ``quantize`` and
+        ``max_resolution_retries`` included; the values actually used are
+        recorded in ``uns["iterative_lsi"]["params"]`` under a ``cluster_``
+        prefix.
+    cluster_fn
+        Replace the built-in clusterer entirely. Receives the scaled,
+        depth-filtered embedding and must return one integer label per cell.
+        This is the escape hatch for users who prefer ``rsc.tl.leiden``, and
+        the hook the reproducibility test uses to inject ArchR's own labels so
+        that feature selection can be gated in isolation.
+    store_model
+        Store the final round's loadings and metadata for projection; see
+        :func:`lsi`.
+    random_state
+        Seed for the solver and the clusterer.
+    deterministic
+        Use the reproducible solver path: a seeded Lanczos start vector and a
+        fixed-order sparse matrix-vector product, so two runs at the same
+        ``random_state`` give bitwise-identical output. ``False`` restores
+        ``cupyx``'s ``svds``, which is not reproducible at any seed.
+
+        Two caveats, part of the contract rather than footnotes. It costs a
+        **second copy of the fitted matrix on device** — the transpose the
+        fixed-order product needs. And a **streamed (``chunk_size``) run cannot
+        take this path at all**: that transpose is exactly what does not fit,
+        so the request is downgraded to seeding the start vector, with cuSPARSE
+        still nondeterministic underneath. The downgrade is logged, and it is
+        the *effective* mode, not the requested one, that lands in
+        ``LSIModel.deterministic`` and in the ``uns`` params — so a run can be
+        asked afterwards whether it was actually reproducible.
+    inplace
+        Store on *adata* and return ``None``, else return
+        ``(embedding, singular_values)``.
+    chunk_size
+        Stream the matrix from host memory in row chunks of this size.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray] | None
+        ``None`` when ``inplace=True``, having written
+        ``obsm["X_iterative_lsi"]``, ``uns["iterative_lsi"]``,
+        ``var["selected_iterative_lsi"]``,
+        ``obs["iterative_lsi_clusters_iter{j}"]`` and — with
+        ``store_model=True`` — ``varm["iterative_LSI"]``. Every key is prefixed
+        with the function's own name, so :func:`lsi` and this function can both
+        be run on one object without either overwriting the other.
+
+    Notes
+    -----
+    ``addIterativeLSI`` is not stable run to run — ArchR's own seed-to-seed
+    feature Jaccard on one dataset was 0.54 — so treat the selected feature set
+    as one sample from a distribution rather than a fixed answer.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.tl.iterative_lsi(adata, n_comps=30, n_features=25_000)
+    >>> adata.obsm["X_iterative_lsi"].shape
+    (n_cells, 30)
+    """
+    from ._clustering import snn_cluster  # local: keeps cuGraph off import gatac
+
+    method_id = _resolve_method(method)
+    if iterations < 1:
+        raise ValueError(f"iterations must be >= 1 (got {iterations}).")
+
+    X = adata.X
+    n_cells, n_vars = X.shape
+    depth = _resolve_depth(adata, depth_key)
+
+    # Every keyword `snn_cluster` takes, so that `cluster_params` can reach
+    # all of them: `quantize` and `max_resolution_retries` were previously
+    # unreachable from here, which made them impossible to ablate through the
+    # public API even though both change the partition.
+    params = {
+        "k": 20,
+        "resolution": 2.0,
+        "prune": 1.0 / 15.0,
+        "max_clusters": 6,
+        "n_outlier": 5,
+        "knn_assign": 10,
+        "flavor": "leiden",
+        "knn": "exact",
+        "quantize": 2,
+        "max_resolution_retries": 3,
+    }
+    if cluster_params:
+        unknown = set(cluster_params) - set(params)
+        if unknown:
+            raise ValueError(
+                f"Unknown cluster_params: {sorted(unknown)}. "
+                f"Known keys: {sorted(params)}."
+            )
+        params.update(cluster_params)
+
+    # Upload once and slice on the device. scipy's fancy column indexing on a
+    # 65 M-nonzero CSR measured 0.45-0.50 s per call against 0.03 s for the
+    # same slice in cupyx, and this loop takes three of them. Skipped when
+    # streaming, since the point of chunk_size is that the matrix does not fit.
+    X_dev = None
+    if chunk_size is None and sp.issparse(X):
+        X_dev = _to_gpu_csr(X)
+
+    def _select(cols):
+        """Columns *cols* of the input matrix, sliced wherever it lives."""
+        if len(cols) == n_vars:
+            # The pool can cover every feature, in which case scipy still
+            # builds a full copy for nothing.
+            return X_dev if X_dev is not None else X
+        if X_dev is not None:
+            return X_dev[:, cp.asarray(cols)]
+        return X[:, cols]
+
+    # ---- accessibility, computed once over every feature ------------------
+    acc = feature_accessibility(X_dev if X_dev is not None else X,
+                                binarize=binarize)
+    features = initial_features(
+        acc, n_features, total_features=total_features,
+        filter_quantile=filter_quantile,
+    )
+    pool = accessibility_pool(acc, total_features)
+    logger.info(
+        f"Iterative LSI: {n_cells:,} cells, {n_vars:,} features; "
+        f"initial selection {len(features):,}, scoring pool {len(pool):,}, "
+        f"{iterations} round(s)."
+    )
+
+    n_per_iter: list[int] = []
+    cluster_labels: dict[int, np.ndarray] = {}
+    model: LSIModel | None = None
+    X_pool = None
+
+    for it in range(1, iterations + 1):
+        n_per_iter.append(len(features))
+        logger.info(f"  round {it}/{iterations}: LSI on {len(features):,} features")
+        model = compute_lsi(
+            _select(features),
+            n_comps,
+            method=method_id,
+            scale_to=scale_to,
+            binarize=binarize,
+            outlier_quantiles=outlier_quantiles,
+            depth=depth,
+            depth_cor_cutoff=None,      # filtered per round below, and at the end
+            allow_empty_cells=True,     # the algorithm picks the features, so
+                                        # emptiness is not the user's to fix
+            scale_by_sv=True,
+            tol=tol,
+            ncv=ncv,
+            random_state=random_state,
+            deterministic=deterministic,
+            chunk_size=chunk_size,
+        )
+        if it == iterations:
+            break
+
+        # ---- ArchR .LSICluster: scale, drop depth-correlated, cluster -----
+        z = scale_dims(model.embedding)
+        depth_for_cor = depth if depth is not None else cp.asnumpy(
+            _cell_depth(_to_gpu_csr(_select(features)), binarize)
+        )
+        keep, _r = drop_depth_correlated(z, depth_for_cor, cutoff=depth_cor_cutoff)
+        if keep.sum() < 2:
+            raise ValueError(
+                "Every component correlates with sequencing depth above "
+                f"{depth_cor_cutoff}; nothing left to cluster on."
+            )
+        z = z[:, keep]
+
+        if cluster_fn is not None:
+            labels = np.asarray(cluster_fn(z))
+            if labels.shape[0] != n_cells:
+                raise ValueError(
+                    f"cluster_fn returned {labels.shape[0]} labels for "
+                    f"{n_cells} cells."
+                )
+        else:
+            labels = snn_cluster(z, random_state=random_state, **params)
+        cluster_labels[it] = labels
+        logger.info(
+            f"  round {it}: {len(np.unique(labels))} cluster(s) on "
+            f"{keep.sum()} dim(s)"
+        )
+
+        # ArchR: `if (nClust == 1) return(prevFeatures)` — a single cluster
+        # carries no between-cluster variance, so the feature set is kept.
+        if len(np.unique(labels)) < 2:
+            logger.warning(
+                f"  round {it}: clustering returned a single cluster; keeping "
+                "the current feature set for the next round, as ArchR does."
+            )
+            continue
+
+        # ---- variable features over the accessibility pool ----------------
+        if X_pool is None:
+            X_pool = _select(pool)
+        sel_in_pool, _var = cluster_var_features(
+            X_pool, labels, n_features, scale_to=scale_to,
+            binarize=binarize, chunk_size=chunk_size,
+        )
+        features = np.sort(pool[sel_in_pool])
+
+    del X_pool
+    cp.get_default_memory_pool().free_all_blocks()
+
+    # ---- final depth-correlation filter, on the scaled embedding ----------
+    depth_final = depth if depth is not None else cp.asnumpy(
+        _cell_depth(_to_gpu_csr(_select(features)), binarize)
+    )
+    del X_dev
+    keep, r = drop_depth_correlated(
+        scale_dims(model.embedding), depth_final, cutoff=depth_cor_cutoff
+    )
+    embedding = model.embedding[:, keep]
+    dims_dropped = np.where(~keep)[0]
+    if dims_dropped.size:
+        logger.info(
+            f"Dropping {dims_dropped.size} depth-correlated component(s): "
+            f"{dims_dropped.tolist()}"
+        )
+    logger.info(
+        f"Iterative LSI complete: {embedding.shape[1]} component(s), "
+        f"{len(features):,} features."
+    )
+
+    if not inplace:
+        return embedding, model.singular_values
+
+    adata.obsm["X_iterative_lsi"] = embedding
+    mask = np.zeros(n_vars, dtype=bool)
+    mask[features] = True
+    adata.var["selected_iterative_lsi"] = mask
+    for it, labels in cluster_labels.items():
+        adata.obs[f"iterative_lsi_clusters_iter{it}"] = pd.Categorical(
+            labels.astype(str)
+        )
+
+    uns: dict = {
+        "singular_values": model.singular_values,
+        "depth_cor": r,
+        "dims_dropped": dims_dropped,
+        "iterations": iterations,
+        "n_features_per_iter": np.asarray(n_per_iter),
+        "n_held_out": model.n_held_out,
+        "n_zero_depth_projected": model.n_zero_depth_projected,
+        "n_empty_cells": model.n_empty_cells,
+        "params": _pack_params(
+            n_comps=n_comps,
+            iterations=iterations,
+            n_features=n_features,
+            total_features=total_features,
+            filter_quantile=filter_quantile,
+            method=method_id,
+            scale_to=scale_to,
+            binarize=binarize,
+            outlier_quantiles=outlier_quantiles,
+            depth_cor_cutoff=depth_cor_cutoff,
+            depth_key=depth_key,
+            tol=tol,
+            ncv=ncv,
+            random_state=random_state,
+            deterministic=model.deterministic,
+            cluster_fn=cluster_fn,
+            **{f"cluster_{k}": v for k, v in params.items()},
+        ),
+    }
+    if store_model:
+        adata.varm["iterative_LSI"] = _align_loadings(model, mask, n_vars)
+        uns["model"] = {
+            "loadings_key": "iterative_LSI",
+            "feature_mask": _fitted_mask(model, mask, n_vars),
+            "row_sums": model.row_sums,
+            "n_train": model.n_train,
+            "singular_values": model.singular_values,
+            "method": model.method,
+            "scale_to": model.scale_to,
+            "binarize": model.binarize,
+            "scale_by_sv": True,
+            "deterministic": model.deterministic,
+            "random_state": model.random_state,
+        }
+    adata.uns["iterative_lsi"] = uns
+    return None

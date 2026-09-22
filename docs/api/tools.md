@@ -82,7 +82,8 @@ accelerated binomial test with Benjamini–Hochberg correction.
 ## Motif analysis
 
 Read motifs from MEME-format files, test for over-representation in peak
-sets, and run GSEA on motif rankings.
+sets, run GSEA on motif rankings, and score per-cell TF activity with
+chromVAR.
 
 ```{eval-rst}
 .. autosummary::
@@ -98,9 +99,7 @@ sets, and run GSEA on motif rankings.
    gsea_motif_enrichment
 ```
 
----
-
-## chromVAR
+### chromVAR
 
 Compute transcription-factor activity deviation scores following the chromVAR
 algorithm.  All compute-intensive steps are executed on GPU.

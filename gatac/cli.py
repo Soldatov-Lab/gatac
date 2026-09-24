@@ -814,7 +814,7 @@ def main():
     # Doublets subcommand
     doublets_parser = subparsers.add_parser(
         'doublets',
-        help='Detect multiplet/doublet cells using the AMULET Poisson method',
+        help='Detect multiplet/doublet cells using the AMULET Poisson method (GPU)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     doublets_parser.add_argument(
@@ -874,7 +874,7 @@ def main():
         '-j', '--threads',
         type=int,
         default=1,
-        help='Number of parallel workers for overlap detection (default 1)'
+        help='Ignored; kept for backwards compatibility (overlap detection runs on the GPU)'
     )
     doublets_parser.set_defaults(func=doublets_command)
 

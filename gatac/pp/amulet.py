@@ -1,16 +1,17 @@
 """
 AMULET doublet/multiplet detection for single-cell ATAC-seq.
 
-Direct port of the AMULET (Atac-seq MULtiplet Estimation Tool) algorithm of
+GPU port of the AMULET (Atac-seq MULtiplet Estimation Tool) algorithm of
 Thibodeau et al. (2021) to the GATAC data model.
 
-The overlap-detection sweep-line, the per-cell Poisson scoring, the row-sum
-Poisson repeat-inference, and the BH-FDR correction are translated
-line-for-line from the upstream Python source (`FragmentFileOverlapCounter.py`
-and `AMULET.py`). The data flow has been rewritten to operate on GATAC's
-parquet fragment files via DuckDB and to parallelize per-chromosome with a
-worker pool; the optional repeat-filter pass is applied at the raw-read level
-rather than the overlap level.
+The per-cell Poisson scoring, the row-sum Poisson repeat-inference, and the
+BH-FDR correction follow the upstream Python source (`AMULET.py`). The
+overlap detection of `FragmentFileOverlapCounter.py` (a per-cell sweep-line)
+and the union/cell x region matrix of `AMULET.py` are rewritten as sort +
+cumsum passes over all cells of a chromosome at once on the GPU (cupy), and
+only the row and column sums of the matrix are ever materialized. The
+optional repeat-filter pass is applied at the raw-read level rather than the
+overlap level.
 
 The method detects cells whose fragments show an abnormally high number of
 overlapping insertions, which is characteristic of doublets or multiplets
@@ -27,486 +28,324 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Optional, Union, List, Set
+from typing import Optional, Union, List
 
+import cudf
+import cupy as cp
 import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import scipy.stats as stats
 import statsmodels.api as sm
 
+from ._utils import cleanup_gpu_memory
 from .genome import get_chrom_sizes
 
 logger = logging.getLogger(__name__)
 
+_ROW_GROUPS_PER_BATCH = 64
+
 
 # ---------------------------------------------------------------------------
-# Overlap detection (sweep-line algorithm, ported from AMULET)
+# Interval primitives (GPU, sort + cumsum)
 # ---------------------------------------------------------------------------
 
-def _get_overlaps(reads: np.ndarray, overlapthresh: int) -> List[List]:
+def _check_bits(n_bits: int, what: str):
+    if n_bits > 64:
+        raise ValueError(f"Cannot pack {what} into 64-bit sort keys ({n_bits} bits needed)")
+
+
+def _overlap_segments(
+    start: cp.ndarray,
+    end: cp.ndarray,
+    cell: cp.ndarray,
+    overlapthresh: int,
+) -> tuple:
     """
-    Sweep-line running-sum algorithm for overlap detection.
+    Per-cell sweep-line overlap detection for all cells of one chromosome.
+
+    Equivalent to running AMULET's running-sum sweep independently on the
+    fragments of every cell: each fragment ``[start, end)`` contributes +1 at
+    ``start`` and -1 at ``end``, events at the same position are collapsed,
+    and a segment is reported for every maximal run of positions where at
+    least ``overlapthresh`` fragments of the cell overlap.
+
+    All events are sorted once by (cell, position). Because the events of
+    each cell sum to zero, a global cumsum equals the per-cell running sum.
 
     Parameters
     ----------
-    reads : np.ndarray, shape (n, 3)
-        Reads as [start, end, ...] for a single (chrom, barcode) segment.
+    start, end : cp.ndarray of int64
+        Fragment coordinates.
+    cell : cp.ndarray of int64
+        Cell index of each fragment.
     overlapthresh : int
         Minimum overlap count to report (i.e. expected_overlap + 1).
 
     Returns
     -------
-    list of [chr, start, end, minoverlap, maxoverlap, starts_str, ends_str]
+    seg_cell, seg_start, seg_end : cp.ndarray of int64
     """
-    if len(reads) <= overlapthresh - 1:
-        return []
+    empty = cp.zeros(0, dtype=cp.int64)
+    if len(start) < overlapthresh:
+        return empty, empty, empty
 
-    starts = reads[:, 0]
-    ends = reads[:, 1]
+    pos_bits = max(1, int(end.max()).bit_length())
+    cell_bits = max(1, int(cell.max()).bit_length())
+    _check_bits(cell_bits + pos_bits + 1, "cell and position")
 
-    overlapindex = np.empty((len(starts) * 2, 2), dtype=np.int64)
-    overlapindex[0::2, 0] = starts
-    overlapindex[0::2, 1] = 1
-    overlapindex[1::2, 0] = ends
-    overlapindex[1::2, 1] = -1
-    sort_idx = np.argsort(overlapindex[:, 0], kind="mergesort")
-    overlapindex = overlapindex[sort_idx]
+    # Key: cell | position | is_start. Order within a position is irrelevant
+    # since events at the same position are collapsed.
+    cell_key = cell.astype(cp.uint64) << np.uint64(pos_bits + 1)
+    one = np.uint64(1)
+    events = cp.concatenate([
+        cell_key | (start.astype(cp.uint64) << one) | one,
+        cell_key | (end.astype(cp.uint64) << one),
+    ])
+    events.sort()
 
-    runningsum = np.empty(len(overlapindex), dtype=np.int64)
-    runningsumpos = np.empty(len(overlapindex), dtype=np.int64)
-    runningsum[0] = overlapindex[0, 1]
-    runningsumpos[0] = overlapindex[0, 0]
-    write_idx = 0
-    for i in range(1, len(overlapindex)):
-        cursum = runningsum[write_idx] + overlapindex[i, 1]
-        if overlapindex[i - 1, 0] == overlapindex[i, 0]:
-            runningsum[write_idx] = cursum
-        else:
-            write_idx += 1
-            runningsum[write_idx] = cursum
-            runningsumpos[write_idx] = overlapindex[i, 0]
-    runningsum = runningsum[:write_idx + 1]
-    runningsumpos = runningsumpos[:write_idx + 1]
+    delta = (events & one).astype(cp.int32) * 2 - 1
+    running = cp.cumsum(delta, dtype=cp.int32)
+    cell_pos = events >> one
+    del events, delta
 
-    rv: List[List] = []
-    withinsegment = False
-    segmentstart = -1
-    minoverlap = -1
-    maxoverlap = -1
-    for i in range(len(runningsum)):
-        if withinsegment:
-            if runningsum[i] < overlapthresh:
-                rv.append([segmentstart, runningsumpos[i], minoverlap, maxoverlap])
-                withinsegment = False
-                segmentstart = minoverlap = maxoverlap = -1
-            else:
-                if runningsum[i] > maxoverlap:
-                    maxoverlap = int(runningsum[i])
-        else:
-            if runningsum[i] >= overlapthresh:
-                segmentstart = int(runningsumpos[i])
-                minoverlap = maxoverlap = int(runningsum[i])
-                withinsegment = True
-    if withinsegment:
-        rv.append([segmentstart, int(runningsumpos[-1]), minoverlap, maxoverlap])
+    # Running sum after the last event of each distinct (cell, position)
+    last = cp.empty(len(cell_pos), dtype=bool)
+    last[:-1] = cell_pos[1:] != cell_pos[:-1]
+    last[-1] = True
+    running = running[last]
+    cell_pos = cell_pos[last]
 
-    return rv
+    # Every cell ends at 0, so segments never cross a cell boundary.
+    inside = running >= overlapthresh
+    prev = cp.zeros_like(inside)
+    prev[1:] = inside[:-1]
+    seg_open = cp.flatnonzero(inside & ~prev)
+    seg_close = cp.flatnonzero(~inside & prev)
+
+    pos_mask = np.uint64((1 << pos_bits) - 1)
+    seg_cell = (cell_pos[seg_open] >> np.uint64(pos_bits)).astype(cp.int64)
+    seg_start = (cell_pos[seg_open] & pos_mask).astype(cp.int64)
+    seg_end = (cell_pos[seg_close] & pos_mask).astype(cp.int64)
+    return seg_cell, seg_start, seg_end
 
 
-def _format_frag_overlaps(chrom: str, barcode: str, overlaps: List[List]) -> List[str]:
-    """Format overlap lines for fragment input (no mapping quality)."""
-    lines = []
-    for ov in overlaps:
-        lines.append(
-            f"{chrom}\t{ov[0]}\t{ov[1]}\t{barcode}\t{ov[2]}\t{ov[3]}\t.\t.\t.\n"
-        )
-    return lines
-
-
-def _get_union_peaks(overlaps_df: pd.DataFrame) -> np.ndarray:
+def _merge_intervals(start: cp.ndarray, end: cp.ndarray) -> tuple:
     """
-    Compute the union of overlapping regions across all cells.
+    Merge closed intervals ``[start, end]`` that overlap or touch.
 
     Parameters
     ----------
-    overlaps_df : pd.DataFrame
-        Must contain columns: chr, start, end.
+    start, end : cp.ndarray of int64
+        Intervals on a single chromosome.
 
     Returns
     -------
-    np.ndarray, shape (n_regions, 3)
-        Union of merged regions as [chr, start, end].
+    ids : cp.ndarray of int64
+        Merged-region index of each input interval.
+    region_start, region_end : cp.ndarray of int64
+        Merged regions, sorted by position.
     """
-    if len(overlaps_df) == 0:
-        return np.zeros((0, 3), dtype=object)
+    n = len(start)
+    if n == 0:
+        empty = cp.zeros(0, dtype=cp.int64)
+        return empty, empty, empty
 
-    data = overlaps_df[["chr", "start", "end"]].values
-    out = []
-    for chrom in np.unique(data[:, 0]):
-        chrom_data = data[data[:, 0] == chrom]
-        sorted_idx = np.argsort(chrom_data[:, 1], kind="mergesort")
-        sorted_data = chrom_data[sorted_idx]
-        cur_start, cur_end = sorted_data[0, 1], sorted_data[0, 2]
-        for i in range(1, len(sorted_data)):
-            nxt_start, nxt_end = sorted_data[i, 1], sorted_data[i, 2]
-            if nxt_start > cur_end:
-                out.append([chrom, cur_start, cur_end])
-                cur_start, cur_end = nxt_start, nxt_end
-            else:
-                cur_end = max(cur_end, nxt_end)
-        out.append([chrom, cur_start, cur_end])
-    return np.array(out, dtype=object)
+    idx_bits = max(1, (n - 1).bit_length())
+    pos_bits = max(1, int(end.max()).bit_length())
+    _check_bits(pos_bits + 1 + idx_bits, "position and interval index")
+
+    # Key: position | is_end | interval index. Starts sort before ends at the
+    # same position, so touching intervals merge.
+    one = np.uint64(1)
+    shift = np.uint64(idx_bits)
+    idx = cp.arange(n, dtype=cp.uint64)
+    events = cp.concatenate([
+        ((start.astype(cp.uint64) << one) << shift) | idx,
+        (((end.astype(cp.uint64) << one) | one) << shift) | idx,
+    ])
+    events.sort()
+
+    is_end = ((events >> shift) & one).astype(bool)
+    pos = (events >> (shift + one)).astype(cp.int64)
+    depth = cp.cumsum(cp.where(is_end, -1, 1), dtype=cp.int64)
+    opens = ~is_end & (depth == 1)
+    closes = is_end & (depth == 0)
+    region = cp.cumsum(opens) - 1
+
+    ids = cp.empty(n, dtype=cp.int64)
+    is_start = ~is_end
+    ids[(events[is_start] & np.uint64((1 << idx_bits) - 1)).astype(cp.int64)] = region[is_start]
+    return ids, pos[opens], pos[closes]
+
+
+def _hits_regions(
+    start: cp.ndarray,
+    end: cp.ndarray,
+    region_start: cp.ndarray,
+    region_end: cp.ndarray,
+) -> cp.ndarray:
+    """Mask of intervals intersecting any of the sorted, disjoint closed regions."""
+    if len(region_start) == 0:
+        return cp.zeros(len(start), dtype=bool)
+    # The candidate with the largest start <= end also has the largest end.
+    idx = cp.searchsorted(region_start, end, side="right") - 1
+    return (idx >= 0) & (region_end[cp.maximum(idx, 0)] >= start)
 
 
 # ---------------------------------------------------------------------------
-# Parquet-based overlap finding (DuckDB backend, like FragmentFileOverlapCounter)
+# Data loading
 # ---------------------------------------------------------------------------
 
-def _load_repeat_regions(repeat_filter: Union[str, Path]) -> Optional[np.ndarray]:
-    """Load BED file of known repetitive regions."""
-    if not repeat_filter:
-        return None
+def _load_repeat_regions(repeat_filter: Union[str, Path], chromosomes: List[str]) -> dict:
+    """Load a BED file of known repetitive regions, merged per chromosome on the GPU."""
     logger.info(f"Loading repeat regions from {repeat_filter}")
-    df = pd.read_csv(repeat_filter, sep="\t", header=None).values[:, 0:3]
-    return _get_union_peaks(pd.DataFrame(df, columns=["chr", "start", "end"]))
+    df = pd.read_csv(repeat_filter, sep="\t", header=None, usecols=[0, 1, 2],
+                     names=["chrom", "start", "end"])
+    regions = {}
+    for chrom, sub in df[df["chrom"].isin(chromosomes)].groupby("chrom"):
+        _, r_start, r_end = _merge_intervals(
+            cp.asarray(sub["start"].values, dtype=cp.int64),
+            cp.asarray(sub["end"].values, dtype=cp.int64),
+        )
+        regions[chrom] = (r_start, r_end)
+    return regions
 
 
-def _filter_repeats_in_reads(
-    reads: np.ndarray,
-    sorted_repeats: dict,
-    repeat_regions: np.ndarray,
-    expected_overlap: int,
-) -> np.ndarray:
-    """
-    For each cell's reads on a chromosome, remove fragments that overlap
-    known repetitive regions and recalculate overlap segments.
-
-    Parameters
-    ----------
-    reads : np.ndarray, shape (n_reads, 2)
-        start, end positions sorted by start.
-    sorted_repeats : dict
-        {chrom: np.ndarray} of repeat region starts (sorted ascending).
-    repeat_regions : np.ndarray
-        Repeat regions as [chr, start, end].
-    expected_overlap : int
-        Expected number of reads overlapping.
-
-    Returns
-    -------
-    np.ndarray, shape (n_filtered_reads, 2)
-        Filtered start, end positions.
-    """
-    if len(reads) == 0:
-        return reads
-
-    starts = reads[:, 0]
-    ends = reads[:, 1]
-
-    overlap_mask = np.zeros(len(starts), dtype=bool)
-    for r_start, r_end in zip(repeat_regions[:, 1], repeat_regions[:, 2]):
-        overlap_mask |= ((starts <= r_end) & (ends >= r_start))
-
-    new_starts = starts[~overlap_mask]
-    new_ends = ends[~overlap_mask]
-
-    if len(new_starts) == len(starts):
-        return reads
-    if len(new_starts) <= expected_overlap:
-        return np.zeros((0, 2), dtype=reads.dtype)
-
-    counts = np.empty((len(new_starts), 2), dtype=new_starts.dtype)
-    counts[:, 0] = new_starts
-    counts[:, 1] = 1
-
-    counts2 = np.empty((len(new_ends), 2), dtype=new_ends.dtype)
-    counts2[:, 0] = new_ends
-    counts2[:, 1] = -1
-
-    combinedcounts = np.concatenate((counts, counts2))
-    order = np.argsort(combinedcounts[:, 0], kind="mergesort")
-    combinedcounts = combinedcounts[order]
-
-    runningsum = 0
-    i = 0
-    startoverlap = False
-    startoverlapposition = 0
-    rv: List[List[int]] = []
-
-    while i < len(combinedcounts):
-        runningsum += int(combinedcounts[i, 1])
-        j = i + 1
-        while j < len(combinedcounts) and combinedcounts[j, 0] == combinedcounts[i, 0]:
-            runningsum += int(combinedcounts[j, 1])
-            j += 1
-        if not startoverlap and runningsum > expected_overlap:
-            startoverlap = True
-            startoverlapposition = int(combinedcounts[i, 0])
-        elif startoverlap and runningsum <= expected_overlap:
-            rv.append([startoverlapposition, int(combinedcounts[i, 0])])
-            startoverlap = False
-        i = j
-    if startoverlap:
-        rv.append([startoverlapposition, int(combinedcounts[-1, 0])])
-
-    if not rv:
-        return np.zeros((0, 2), dtype=reads.dtype)
-    return np.array(rv, dtype=reads.dtype)
-
-
-def _process_chrom_parquet(
+def _load_fragments(
     fragment_path: Path,
-    chrom: str,
+    chromosomes: List[str],
     barcodes: List[str],
-    expected_overlap: int,
     max_insert_size: int,
-    repeat_regions: Optional[np.ndarray],
-    sorted_repeats: Optional[dict],
 ) -> dict:
     """
-    Per-chromosome overlap detection using DuckDB.
+    Read candidate-cell fragments into GPU arrays, streaming row groups.
 
     Returns
     -------
-    dict with keys: chrom, overlap_lines (list[str]), overlapcounts (dict)
+    dict of cp.ndarray: chrom (int32 index into ``chromosomes``),
+    cell (int32 index into ``barcodes``), start, end (uint32).
     """
-    overlapthresh = expected_overlap + 1
-    overlapcounts: dict = {bc: 0 for bc in barcodes}
-    overlap_lines: List[str] = []
+    n_row_groups = pq.ParquetFile(fragment_path).metadata.num_row_groups
+    chrom_table = cudf.DataFrame({
+        "chrom": chromosomes,
+        "chrom_idx": cp.arange(len(chromosomes), dtype=cp.int32),
+    })
+    barcode_table = cudf.DataFrame({
+        "barcode": barcodes,
+        "cell": cp.arange(len(barcodes), dtype=cp.int32),
+    })
 
-    con = duckdb.connect()
-    bc_df = pd.DataFrame({"barcode": barcodes})
-    con.register("barcodes", bc_df)
+    parts = {"chrom": [], "cell": [], "start": [], "end": []}
+    for i in range(0, n_row_groups, _ROW_GROUPS_PER_BATCH):
+        df = cudf.read_parquet(
+            fragment_path,
+            columns=["chrom", "start", "end", "barcode"],
+            row_groups=list(range(i, min(i + _ROW_GROUPS_PER_BATCH, n_row_groups))),
+        )
+        df = df[(df["end"] - df["start"]) <= max_insert_size]
+        df = df.merge(chrom_table, on="chrom").merge(barcode_table, on="barcode")
+        parts["chrom"].append(df["chrom_idx"].values)
+        parts["cell"].append(df["cell"].values)
+        parts["start"].append(df["start"].values)
+        parts["end"].append(df["end"].values)
+        del df
 
-    rows = con.execute(f"""
-        SELECT "start", "end", barcode
-        FROM read_parquet('{fragment_path}')
-        INNER JOIN barcodes USING (barcode)
-        WHERE chrom = '{chrom}'
-          AND ("end" - "start") <= {max_insert_size}
-        ORDER BY "start"
-    """).fetchnumpy()
-    con.close()
-
-    if len(rows["start"]) == 0:
-        return {"chrom": chrom, "overlap_lines": [], "overlapcounts": overlapcounts}
-
-    starts = rows["start"]
-    ends = rows["end"]
-    barcodes_arr = rows["barcode"]
-
-    bc_to_reads: dict = {}
-    for i in range(len(starts)):
-        bc = barcodes_arr[i]
-        bc_to_reads.setdefault(bc, []).append((int(starts[i]), int(ends[i])))
-
-    for bc, reads_list in bc_to_reads.items():
-        if not reads_list:
-            continue
-        reads_arr = np.array(reads_list, dtype=np.int64)
-
-        if repeat_regions is not None and len(repeat_regions) > 0:
-            filtered_reads = _filter_repeats_in_reads(
-                reads_arr, sorted_repeats, repeat_regions, expected_overlap
-            )
-            if len(filtered_reads) == 0:
-                continue
-            overlaps = _get_overlaps(filtered_reads, overlapthresh)
-        else:
-            overlaps = _get_overlaps(reads_arr, overlapthresh)
-
-        overlap_lines.extend(_format_frag_overlaps(chrom, bc, overlaps))
-        overlapcounts[bc] += len(overlaps)
-
-    return {"chrom": chrom, "overlap_lines": overlap_lines, "overlapcounts": overlapcounts}
+    return {k: cp.concatenate(v) for k, v in parts.items()}
 
 
-def _find_overlaps_parquet(
-    fragment_path: Union[str, Path],
+def _find_overlaps(
+    fragment_path: Path,
     barcodes: List[str],
     chromosomes: List[str],
-    expected_overlap: int = 2,
-    max_insert_size: int = 900,
-    repeat_filter: Optional[Union[str, Path]] = None,
-    n_threads: int = 1,
-) -> pd.DataFrame:
+    expected_overlap: int,
+    max_insert_size: int,
+    repeat_filter: Optional[Union[str, Path]],
+    min_overlap_bp: int,
+) -> tuple:
     """
-    Find per-cell fragment overlaps in a GATAC parquet file.
-
-    Parameters
-    ----------
-    fragment_path : str or Path
-        GATAC parquet fragment file.
-    barcodes : list of str
-        Barcodes to consider as candidate cells.
-    chromosomes : list of str
-        Chromosomes to scan.
-    expected_overlap : int
-        Minimum overlap count to report.
-    max_insert_size : int
-        Maximum fragment insert size in bp.
-    repeat_filter : str or Path, optional
-        BED file of known repetitive regions to exclude.
-    n_threads : int
-        Number of parallel workers (one per chromosome batch).
+    Find per-cell overlap segments and assign them to union regions.
 
     Returns
     -------
-    pd.DataFrame
-        Columns: chr, start, end, cell_id, min_overlap, max_overlap,
-        mean_mq, min_mq, max_mq.
+    region, cell : cp.ndarray of int64
+        One entry per distinct (union region, cell) pair, i.e. the nonzero
+        entries of AMULET's binary region x cell matrix.
+    n_regions : int
+        Number of union regions.
+    n_overlaps : int
+        Number of overlap segments.
     """
-    fragment_path = Path(fragment_path)
-    if not fragment_path.exists():
-        raise FileNotFoundError(f"Fragment file not found: {fragment_path}")
+    repeats = _load_repeat_regions(repeat_filter, chromosomes) if repeat_filter else {}
 
-    repeat_regions = _load_repeat_regions(repeat_filter) if repeat_filter else None
-    sorted_repeats: Optional[dict] = None
-    if repeat_regions is not None and len(repeat_regions) > 0:
-        sorted_repeats = {}
-        for chrom in np.unique(repeat_regions[:, 0]):
-            mask = repeat_regions[:, 0] == chrom
-            order = np.argsort(repeat_regions[mask, 1], kind="mergesort")
-            sorted_repeats[chrom] = np.column_stack(
-                [repeat_regions[mask, 1][order], np.arange(len(repeat_regions))[mask][order]]
-            )
-
+    frags = _load_fragments(fragment_path, chromosomes, barcodes, max_insert_size)
     logger.info(
-        f"Scanning {len(chromosomes)} chromosomes with {n_threads} worker(s) "
+        f"Scanning {len(frags['start']):,} fragments on {len(chromosomes)} chromosomes "
         f"for cells with >={expected_overlap + 1} overlapping fragments..."
     )
 
-    tasks = [
-        (fragment_path, chrom, barcodes, expected_overlap, max_insert_size,
-         repeat_regions, sorted_repeats)
-        for chrom in chromosomes
-    ]
+    n_cells = len(barcodes)
+    region_parts, cell_parts = [], []
+    n_regions = 0
+    n_overlaps = 0
+    for ci, chrom in enumerate(chromosomes):
+        mask = frags["chrom"] == ci
+        start = frags["start"][mask].astype(cp.int64)
+        end = frags["end"][mask].astype(cp.int64)
+        cell = frags["cell"][mask].astype(cp.int64)
 
-    if n_threads > 1:
-        from multiprocessing import Pool
-        with Pool(min(n_threads, len(tasks))) as pool:
-            results = pool.starmap(_process_chrom_parquet, tasks)
-    else:
-        results = [_process_chrom_parquet(*t) for t in tasks]
+        if chrom in repeats:
+            keep = ~_hits_regions(start, end, *repeats[chrom])
+            start, end, cell = start[keep], end[keep], cell[keep]
 
-    all_lines: List[str] = []
-    for r in results:
-        all_lines.extend(r["overlap_lines"])
-
-    if not all_lines:
-        return pd.DataFrame(
-            columns=["chr", "start", "end", "cell_id", "min_overlap", "max_overlap",
-                     "mean_mq", "min_mq", "max_mq"]
+        seg_cell, seg_start, seg_end = _overlap_segments(
+            start, end, cell, expected_overlap + 1
         )
+        if min_overlap_bp > 1:
+            keep = (seg_end - seg_start + 1) >= min_overlap_bp
+            seg_cell, seg_start, seg_end = seg_cell[keep], seg_start[keep], seg_end[keep]
+        if len(seg_start) == 0:
+            continue
 
-    header = ["chr", "start", "end", "cell_id", "min_overlap", "max_overlap",
-              "mean_mq", "min_mq", "max_mq"]
-    from io import StringIO
-    overlaps_df = pd.read_csv(StringIO("".join(all_lines)), sep="\t", header=None,
-                              names=header)
-    return overlaps_df
+        ids, region_start, _ = _merge_intervals(seg_start, seg_end)
+        pairs = cp.unique(ids * n_cells + seg_cell)
+        region_parts.append(pairs // n_cells + n_regions)
+        cell_parts.append(pairs % n_cells)
+        n_regions += len(region_start)
+        n_overlaps += len(seg_start)
+
+    del frags
+    if not region_parts:
+        empty = cp.zeros(0, dtype=cp.int64)
+        return empty, empty, 0, 0
+    return cp.concatenate(region_parts), cp.concatenate(cell_parts), n_regions, n_overlaps
 
 
 # ---------------------------------------------------------------------------
-# Cell × region matrix and doublet detection
+# Poisson tests
 # ---------------------------------------------------------------------------
 
-def _generate_matrix(
-    overlaps_df: pd.DataFrame,
-    cell_ids: np.ndarray,
-    union_overlaps: np.ndarray,
-) -> np.ndarray:
-    """
-    Build a binary cell × region matrix from overlaps and union peaks.
-
-    Parameters
-    ----------
-    overlaps_df : pd.DataFrame
-        Per-cell overlap segments.
-    cell_ids : np.ndarray
-        Cell IDs (one per column in output matrix).
-    union_overlaps : np.ndarray
-        Union of all overlap regions.
-
-    Returns
-    -------
-    np.ndarray, shape (n_regions, n_cells)
-        Binary matrix.
-    """
-    cell_id_to_idx = {cid: i for i, cid in enumerate(cell_ids)}
-    matrix = np.zeros((len(union_overlaps), len(cell_ids)), dtype=np.uint8)
-
-    if len(overlaps_df) == 0:
-        return matrix
-
-    union_starts = union_overlaps[:, 1]
-    union_ends = union_overlaps[:, 2]
-    union_chroms = union_overlaps[:, 0]
-
-    overlap_chroms = overlaps_df["chr"].values
-    overlap_starts = overlaps_df["start"].values
-    overlap_ends = overlaps_df["end"].values
-    overlap_cells = overlaps_df["cell_id"].values
-
-    for chrom in np.unique(union_chroms):
-        region_mask = union_chroms == chrom
-        region_indices = np.where(region_mask)[0]
-        region_starts = union_starts[region_mask]
-        region_ends = union_ends[region_mask]
-
-        ovl_mask = overlap_chroms == chrom
-        ovl_starts = overlap_starts[ovl_mask]
-        ovl_ends = overlap_ends[ovl_mask]
-        ovl_cells = overlap_cells[ovl_mask]
-
-        for i in range(len(ovl_starts)):
-            hits = np.where(
-                (region_starts <= ovl_ends[i]) & (region_ends >= ovl_starts[i])
-            )[0]
-            if len(hits) == 0:
-                continue
-            cell_idx = cell_id_to_idx.get(ovl_cells[i])
-            if cell_idx is None:
-                continue
-            matrix[region_indices[hits], cell_idx] = 1
-
-    return matrix
-
-
-def _infer_repeats(
-    matrix: np.ndarray,
-    union_overlaps: np.ndarray,
-    threshold: float,
-) -> tuple:
+def _infer_repeats(rowsum: np.ndarray, threshold: float) -> np.ndarray:
     """
     Infer repetitive regions via Poisson test on row sums.
 
     Returns
     -------
-    rep_regions : np.ndarray
-        Regions classified as repetitive.
-    non_rep_regions : np.ndarray
-        Regions classified as non-repetitive.
+    np.ndarray of bool
+        True for regions classified as repetitive.
     """
-    if matrix.shape[0] == 0:
-        return np.zeros((0, 3), dtype=object), union_overlaps
-    rowsum = np.sum(matrix, axis=1)
+    if len(rowsum) == 0:
+        return np.zeros(0, dtype=bool)
     rep_mean = np.mean(rowsum)
     rep_probabilities = stats.poisson.sf(rowsum, rep_mean)
     corrected_rep_probabilities = sm.stats.multipletests(
         rep_probabilities, method="fdr_bh"
     )
-    rep_mask = corrected_rep_probabilities[1] < threshold
-    rep_regions = union_overlaps[rep_mask]
-    non_rep_regions = union_overlaps[~rep_mask]
-    return rep_regions, non_rep_regions
+    return corrected_rep_probabilities[1] < threshold
 
 
-def _get_doublets(
-    matrix: np.ndarray,
-    cell_ids: np.ndarray,
-) -> pd.DataFrame:
+def _get_doublets(colsum: np.ndarray, cell_ids: np.ndarray) -> pd.DataFrame:
     """
     Compute per-cell p-value and q-value from column sums via Poisson test.
 
@@ -515,14 +354,33 @@ def _get_doublets(
     pd.DataFrame
         Columns: cell_id, p_value, q_value
     """
-    colsum = np.sum(matrix, axis=0)
     doublet_mean = np.mean(colsum)
     doublet_probabilities = stats.poisson.sf(colsum, doublet_mean)
+    # A cell with no overlaps carries no multiplet evidence. Upstream AMULET's
+    # sf(0, mean) = 1 - exp(-mean) is ~1 at typical depths, but when almost no
+    # cell has an overlap (shallow samples) the mean collapses toward 0, every
+    # zero-overlap cell gets p ~= mean, and the whole sample is called doublets.
+    doublet_probabilities[colsum == 0] = 1.0
+    if doublet_mean < 1:
+        logger.warning(
+            f"Mean of {doublet_mean:.3g} non-repeat overlaps per cell: too few for "
+            f"the AMULET Poisson test to be informative ({int((colsum > 0).sum()):,} "
+            f"of {len(colsum):,} cells have any overlap)"
+        )
     corrected = sm.stats.multipletests(doublet_probabilities, method="fdr_bh")
     return pd.DataFrame({
         "cell_id": cell_ids,
         "p_value": doublet_probabilities,
         "q_value": corrected[1],
+    })
+
+
+def _no_doublets(cell_ids: np.ndarray) -> pd.DataFrame:
+    return pd.DataFrame({
+        "cell_id": cell_ids,
+        "p_value": np.ones(len(cell_ids)),
+        "q_value": np.ones(len(cell_ids)),
+        "is_doublet": np.zeros(len(cell_ids), dtype=bool),
     })
 
 
@@ -560,7 +418,7 @@ def detect_doublets(
 
     Implements the original AMULET Poisson method of Thibodeau et al. (2021):
     cells with an abnormally high number of overlapping fragment insertions
-    are flagged as doublets/multiplets.
+    are flagged as doublets/multiplets. Overlap detection runs on the GPU.
 
     Parameters
     ----------
@@ -582,11 +440,13 @@ def detect_doublets(
     q_rep_threshold : float
         FDR threshold for inferring repetitive regions (default 0.01).
     repeat_filter : str or Path, optional
-        BED file of known repetitive regions.
+        BED file of known repetitive regions. Fragments intersecting them
+        are dropped before overlap detection.
     min_overlap_bp : int
         Minimum overlap length in bp to retain (default 1).
     n_threads : int
-        Parallel workers for overlap detection (default 1).
+        Ignored; kept for backwards compatibility. Overlap detection now
+        runs on the GPU.
 
     Returns
     -------
@@ -651,76 +511,38 @@ def detect_doublets(
     if len(barcodes) == 0:
         raise ValueError("No barcodes provided or no cells pass min_fragments threshold")
 
-    overlaps_df = _find_overlaps_parquet(
+    cell_ids = np.asarray(barcodes)
+    region, cell, n_regions, n_overlaps = _find_overlaps(
         fragment_path=fragment_path,
-        barcodes=barcodes,
+        barcodes=list(barcodes),
         chromosomes=list(chrom_sizes.keys()),
         expected_overlap=expected_overlap,
         max_insert_size=max_insert_size,
         repeat_filter=repeat_filter,
-        n_threads=n_threads,
+        min_overlap_bp=min_overlap_bp,
     )
 
-    if len(overlaps_df) > 0 and min_overlap_bp > 1:
-        lengths = overlaps_df["end"].values - overlaps_df["start"].values + 1
-        overlaps_df = overlaps_df[lengths >= min_overlap_bp].reset_index(drop=True)
-
-    if len(overlaps_df) == 0:
-        result = pd.DataFrame({
-            "cell_id": barcodes,
-            "p_value": np.ones(len(barcodes)),
-            "q_value": np.ones(len(barcodes)),
-            "is_doublet": np.zeros(len(barcodes), dtype=bool),
-        })
+    if n_overlaps == 0:
+        result = _no_doublets(cell_ids)
     else:
-        logger.info(f"Building union of {len(overlaps_df):,} overlap regions")
-        union_overlaps = _get_union_peaks(overlaps_df)
-
-        cell_ids = np.asarray(barcodes)
-        logger.info(f"Generating {len(union_overlaps):,} x {len(cell_ids):,} matrix")
-        matrix = _generate_matrix(overlaps_df, cell_ids, union_overlaps)
+        logger.info(
+            f"Found {n_overlaps:,} overlap segments in {n_regions:,} union regions"
+        )
+        rowsum = cp.bincount(region, minlength=n_regions).get()
 
         logger.info("Inferring repetitive regions")
-        rep_regions, _ = _infer_repeats(matrix, union_overlaps, q_rep_threshold)
+        rep_mask = _infer_repeats(rowsum, q_rep_threshold)
+        keep = ~cp.asarray(rep_mask)[region]
 
-        if len(rep_regions) > 0:
-            rep_chroms = rep_regions[:, 0]
-            rep_starts = rep_regions[:, 1]
-            rep_ends = rep_regions[:, 2]
-            ovl_chroms = overlaps_df["chr"].values
-            ovl_starts = overlaps_df["start"].values
-            ovl_ends = overlaps_df["end"].values
-            keep = np.ones(len(overlaps_df), dtype=bool)
-            for chrom in np.unique(rep_chroms):
-                region_mask = rep_chroms == chrom
-                r_starts = rep_starts[region_mask]
-                r_ends = rep_ends[region_mask]
-                ovl_mask = ovl_chroms == chrom
-                ovl_idx = np.where(ovl_mask)[0]
-                for i in ovl_idx:
-                    hits = np.where(
-                        (r_starts <= ovl_ends[i]) & (r_ends >= ovl_starts[i])
-                    )[0]
-                    if len(hits) > 0:
-                        keep[i] = False
-            rep_filtered_df = overlaps_df[keep].reset_index(drop=True)
+        if not bool(keep.any()):
+            result = _no_doublets(cell_ids)
         else:
-            rep_filtered_df = overlaps_df
-
-        if len(rep_filtered_df) == 0:
-            result = pd.DataFrame({
-                "cell_id": cell_ids,
-                "p_value": np.ones(len(cell_ids)),
-                "q_value": np.ones(len(cell_ids)),
-                "is_doublet": np.zeros(len(cell_ids), dtype=bool),
-            })
-        else:
-            rep_filtered_union = _get_union_peaks(rep_filtered_df)
-            rep_filtered_matrix = _generate_matrix(
-                rep_filtered_df, cell_ids, rep_filtered_union
-            )
-            result = _get_doublets(rep_filtered_matrix, cell_ids)
+            colsum = cp.bincount(cell[keep], minlength=len(cell_ids)).get()
+            result = _get_doublets(colsum, cell_ids)
             result["is_doublet"] = result["q_value"] < q_threshold
+
+    del region, cell
+    cleanup_gpu_memory()
 
     n_doublets = int(result["is_doublet"].sum())
     logger.info(

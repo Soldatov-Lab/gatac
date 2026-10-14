@@ -39,6 +39,7 @@ import pyarrow.parquet as pq
 import scipy.stats as stats
 import statsmodels.api as sm
 
+from .._cupy_compat import bincount
 from ._utils import cleanup_gpu_memory
 from .genome import get_chrom_sizes
 
@@ -528,7 +529,7 @@ def detect_doublets(
         logger.info(
             f"Found {n_overlaps:,} overlap segments in {n_regions:,} union regions"
         )
-        rowsum = cp.bincount(region, minlength=n_regions).get()
+        rowsum = bincount(region, minlength=n_regions).get()
 
         logger.info("Inferring repetitive regions")
         rep_mask = _infer_repeats(rowsum, q_rep_threshold)
@@ -537,7 +538,7 @@ def detect_doublets(
         if not bool(keep.any()):
             result = _no_doublets(cell_ids)
         else:
-            colsum = cp.bincount(cell[keep], minlength=len(cell_ids)).get()
+            colsum = bincount(cell[keep], minlength=len(cell_ids)).get()
             result = _get_doublets(colsum, cell_ids)
             result["is_doublet"] = result["q_value"] < q_threshold
 

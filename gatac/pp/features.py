@@ -13,6 +13,8 @@ import cupyx.scipy.sparse as cusp
 import numpy as np
 import scipy.sparse as sp
 
+from .._cupy_compat import bincount
+
 logger = logging.getLogger(__name__)
 
 
@@ -137,7 +139,7 @@ def _compute_feature_counts_gpu(
     if isinstance(X, cusp.csr_matrix):
         # Already on GPU — bincount is O(nnz) and avoids format conversion
         if X.data.dtype == cp.bool_:
-            return cp.bincount(X.indices, minlength=n_features).astype(cp.float32)
+            return bincount(X.indices, minlength=n_features).astype(cp.float32)
         else:
             return cp.bincount(
                 X.indices,

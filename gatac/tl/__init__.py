@@ -35,6 +35,8 @@ from .lsi import (
     scale_dims,
 )
 from .lda import lda, MiniBatchLDA
+from .footprint import footprint, FootprintTracks, TrackLayout
+from .bindetect import bindetect, BINDetectResult
 
 __all__ = [
     "call_peaks", 
@@ -68,4 +70,9 @@ __all__ = [
     "scale_dims",
     "lda",
     "MiniBatchLDA",
+    "footprint",
+    "FootprintTracks",
+    "TrackLayout",
+    "bindetect",
+    "BINDetectResult",
 ]

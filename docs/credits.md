@@ -4,7 +4,7 @@
 
 Most of GATAC code was written with AI assistance, used responsibly under strict validation against the expected behavior of the original CPU-based tools being translated. The bulk of the core feature porting/translations and GPU optimization work was carried out with Claude Opus 4.6 and GPT-5.4, while Claude Sonnet 4.6 was used for secondary development tasks.
 
-All AI-assisted implementations were tightly constrained to match reference outputs from [SnapATAC2](https://github.com/scverse/SnapATAC2), [ArchR](https://www.archrproject.com/), [chromVAR](https://greenleaflab.github.io/chromVAR/index.html), [MACS3](https://github.com/macs3-project/MACS), and [AMULET](https://github.com/UcarLab/AMULET). Results were also thoroughly tested for reproducibility on the [Reproducibility](reproducibility) page and in the associated test suite.
+All AI-assisted implementations were tightly constrained to match reference outputs from [SnapATAC2](https://github.com/scverse/SnapATAC2), [ArchR](https://www.archrproject.com/), [chromVAR](https://greenleaflab.github.io/chromVAR/index.html), [MACS3](https://github.com/macs3-project/MACS), [AMULET](https://github.com/UcarLab/AMULET), and [TOBIAS](https://github.com/loosolab/TOBIAS). Results were also thoroughly tested for reproducibility on the [Reproducibility](reproducibility) page and in the associated test suite.
 
 ## Algorithms
 
@@ -29,7 +29,33 @@ The original AMULET tool is distributed under the
 [GNU GPL v3.0](https://github.com/UcarLab/AMULET/blob/main/LICENSE). No AMULET
 source code is bundled with or linked into GATAC.
 
+### TOBIAS
+
+GATAC's footprinting (`gatac.tl.footprint`) and differential binding
+(`gatac.tl.bindetect`) are a **port** of
+[**TOBIAS**](https://github.com/loosolab/TOBIAS) 0.17.5 (`ATACorrect`,
+`ScoreBigwig`, `BINDetect`) of Bentsen M. et al., *Nature Communications*,
+2020. The algorithms are translated line for line and executed on the GPU;
+TOBIAS is run as an external tool in the reproducibility tests. TOBIAS is
+distributed under the
+[MIT License](https://github.com/loosolab/TOBIAS/blob/master/LICENSE).
+
+The motif match thresholds port `threshold_from_p` of
+[MOODS](https://github.com/jhkorhonen/MOODS) (Korhonen J. H. et al.,
+*Bioinformatics*, 2017; GPL v3 or Biopython License, used here under the
+Biopython License), and site scanning follows MOODS's summation order.
+
 ## Third-party code
+
+### MINPACK (via SciPy)
+
+`gatac/tl/_minpack_relu.cu` is a CUDA adaptation of SciPy's C translation of
+MINPACK's `lmdif` (used by `scipy.optimize.curve_fit`), specialised to the
+two-parameter ReLU fits of TOBIAS ATACorrect. SciPy is distributed under the
+BSD 3-Clause License. This product includes software developed by the
+University of Chicago, as Operator of Argonne National Laboratory (MINPACK,
+Copyright 1999 University of Chicago). The full notices are kept in the source
+file.
 
 ### scPrinter
 

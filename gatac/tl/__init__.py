@@ -36,7 +36,7 @@ from .lsi import (
 )
 from .lda import lda, MiniBatchLDA
 from .footprint import footprint, FootprintTracks, TrackLayout
-from .bindetect import bindetect, BINDetectResult
+from .bindetect import bindetect, bindetect_sites, BINDetectResult, SiteSet
 
 __all__ = [
     "call_peaks", 
@@ -74,5 +74,7 @@ __all__ = [
     "FootprintTracks",
     "TrackLayout",
     "bindetect",
+    "bindetect_sites",
     "BINDetectResult",
+    "SiteSet",
 ]

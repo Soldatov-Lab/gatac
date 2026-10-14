@@ -128,7 +128,9 @@ GPU port of the [TOBIAS](https://github.com/loosolab/TOBIAS) pipeline.
 (TOBIAS `ATACorrect`) and computes footprint scores (`ScoreBigwig`), reading
 cut sites straight from the fragments parquet — no BAM or bigwig files.
 `bindetect` scans the peaks for motifs and tests for differential binding
-between groups (`BINDetect`).
+between groups (`BINDetect`). The binding sites depend only on the peaks and
+motifs: `bindetect_sites` builds them once, and `bindetect(..., sites=)` reuses
+them for every set of pseudobulks footprinted on the same peaks.
 
 Every stage matches TOBIAS 0.17.5 exactly when given the same inputs. End to
 end, the DWM bias score differs from TOBIAS only in its last bits (floating-point
@@ -148,7 +150,9 @@ reproduces TOBIAS's quirks; `tobias_compat=False` fixes them:
    :nosignatures:
 
    footprint
+   bindetect_sites
    bindetect
    FootprintTracks
+   SiteSet
    BINDetectResult
 ```

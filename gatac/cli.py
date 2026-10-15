@@ -53,6 +53,10 @@ def convert_command(args):
         logging.error("No input files found")
         sys.exit(1)
 
+    chroms = None
+    if args.chroms:
+        chroms = Path(args.chroms).read_text().split()
+
     if len(input_paths) == 1:
         if args.output_dir:
             output_path = Path(args.output_dir) / input_paths[0].with_suffix('').with_suffix('.parquet').name
@@ -62,6 +66,8 @@ def convert_command(args):
             input_paths[0],
             output_path,
             barcode_prefix=args.barcode_prefix,
+            layout=args.layout,
+            chroms=chroms,
         )
     else:
         if args.output:
@@ -72,6 +78,8 @@ def convert_command(args):
             output_dir=args.output_dir,
             workers=args.workers,
             barcode_prefix=args.barcode_prefix,
+            layout=args.layout,
+            chroms=chroms,
         )
 
 
@@ -454,13 +462,13 @@ def main():
     # Convert subcommand
     convert_parser = subparsers.add_parser(
         'convert',
-        help='Convert ATAC fragments TSV.GZ to Parquet',
+        help='Convert ATAC fragments TSV.GZ to Parquet (or repack a Parquet file)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     convert_parser.add_argument(
         'input',
         nargs='+',
-        help='Input .tsv.gz file(s) or glob pattern (e.g. "samples/*.tsv.gz")'
+        help='Input .tsv.gz or .parquet file(s), or glob pattern (e.g. "samples/*.tsv.gz")'
     )
     convert_parser.add_argument(
         '-o', '--output',
@@ -479,6 +487,18 @@ def main():
     convert_parser.add_argument(
         '--barcode-prefix',
         help='Prefix to add to barcodes'
+    )
+    convert_parser.add_argument(
+        '--layout',
+        choices=['standard', 'compact'],
+        default='standard',
+        help='Parquet layout: chromosome/barcode names per row (standard) or integer ids '
+             'with an in-file barcode table (compact, faster GPU streaming)'
+    )
+    convert_parser.add_argument(
+        '--chroms',
+        help='Compact layout: text file listing the chromosome order for the ids '
+             '(whitespace-separated); use the same file for every library of a cohort'
     )
     convert_parser.set_defaults(func=convert_command)
 

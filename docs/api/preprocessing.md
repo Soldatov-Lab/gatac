@@ -12,6 +12,17 @@ Convert raw fragment TSV.GZ files to columnar Parquet for efficient GPU
 streaming.  Parquet preserves row-group structure so GATAC can process files
 larger than GPU memory.
 
+Two layouts exist. The *standard* layout stores chromosome and barcode names
+in every row. The *compact* layout (`make_parquet(..., layout="compact")`)
+stores integer ids, with the barcode table (original names, fragment and read
+counts per barcode) inside the same file and the chromosome names in the file
+footer. Every function that reads fragments accepts both, through
+`FragmentFile`; on compact files they join cells and chromosomes by integer
+lookups instead of string merges, which makes fragment streaming several
+times faster on deep libraries and the whole-file reads of the gene matrices
+need a fraction of the GPU memory. `make_parquet` also repacks an existing
+Parquet file from one layout to the other.
+
 ```{eval-rst}
 .. currentmodule:: gatac.pp
 
@@ -21,6 +32,7 @@ larger than GPU memory.
 
    make_parquet
    make_parquet_batch
+   FragmentFile
    read_fragments_parquet
 ```
 

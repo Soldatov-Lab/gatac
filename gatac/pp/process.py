@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 from .genome import HG38, HG19, MM10, MM39  # For type checking if needed in other modules, but actually not used here.
 # Actually, let's just remove the .tile and .gene imports.
+from .fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +41,12 @@ def read_fragments_parquet(
     """
     Read ATAC fragments from Parquet file optimized for GPU memory.
 
-    Note: Parquet files contain intrinsic schema metadata. This function
-    expects the file to contain columns matching FRAGMENT_DTYPES keys:
-    ['chrom', 'start', 'end', 'barcode', 'count'].
+    Works with both fragment layouts (see :class:`gatac.pp.FragmentFile`).
+    Returns the columns of FRAGMENT_DTYPES:
+    ['chrom', 'start', 'end', 'barcode', 'count'], with ``chrom`` and
+    ``barcode`` as categoricals. For the compact layout the categoricals are
+    built from the stored integer ids, so the whole file needs about a
+    quarter of the GPU memory.
 
     Examples
     --------
@@ -54,15 +58,14 @@ def read_fragments_parquet(
 
     if columns is None:
         columns = list(FRAGMENT_DTYPES.keys())
-        
-    with cudf.option_context("io.parquet.low_memory", low_memory):
-        df = cudf.read_parquet(str(input_path), columns=columns)
-        
-        # Ensure dtypes match our expectation to save memory
-        for col, dtype in FRAGMENT_DTYPES.items():
-            if col in df.columns and df[col].dtype != dtype:
-                df[col] = df[col].astype(dtype)
-                
+
+    df = FragmentFile(input_path).read_categorical(columns, low_memory=low_memory)
+
+    # Ensure dtypes match our expectation to save memory
+    for col, dtype in FRAGMENT_DTYPES.items():
+        if col in df.columns and df[col].dtype != dtype:
+            df[col] = df[col].astype(dtype)
+
     return df
 
 

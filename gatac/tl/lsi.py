@@ -52,6 +52,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from .._cupy_compat import bincount
 from ._gpu import ChunkedMatrix, _to_gpu_csr
 
 logger = logging.getLogger(__name__)
@@ -379,9 +380,7 @@ def _feature_sums(X: cusp.csr_matrix, binarize: bool) -> cp.ndarray:
     if binarize:
         # In a valid CSR each (row, col) pair appears once, so a bincount over
         # the column indices is the document frequency — no binary copy needed.
-        return cp.bincount(
-            X.indices.astype(cp.intp), minlength=n_features
-        ).astype(cp.float32)
+        return bincount(X.indices, minlength=n_features).astype(cp.float32)
     return cp.asarray(X.sum(axis=0), dtype=cp.float32).ravel()
 
 

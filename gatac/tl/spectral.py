@@ -42,6 +42,7 @@ import numpy as np
 import scipy.sparse as sp
 from anndata import AnnData
 
+from .._cupy_compat import bincount
 from ._gpu import (
     ChunkedMatrix,
     _launch_1d,
@@ -108,9 +109,7 @@ def _idf_gpu(X_csr: cusp.csr_matrix) -> cp.ndarray:
 
     # In a valid CSR each (row, col) pair appears at most once, so
     # bincount(indices) == document-frequency per column.
-    df = cp.bincount(
-        X_csr.indices.astype(cp.intp), minlength=n_features
-    ).astype(cp.float32)
+    df = bincount(X_csr.indices, minlength=n_features).astype(cp.float32)
 
     if cp.all(df == df[0]):
         return cp.ones(n_features, dtype=cp.float32)
@@ -263,7 +262,7 @@ def _idf_gpu_chunked(
         idx_s = int(X_cpu.indptr[start])
         idx_e = int(X_cpu.indptr[end])
         d_indices = cp.asarray(X_cpu.indices[idx_s:idx_e])
-        df += cp.bincount(d_indices.astype(cp.intp), minlength=n_features)
+        df += bincount(d_indices, minlength=n_features)
         del d_indices
         cp.get_default_memory_pool().free_all_blocks()
 

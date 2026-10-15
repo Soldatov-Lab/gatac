@@ -42,6 +42,8 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from ..pp.fragments import FragmentFile
+
 if TYPE_CHECKING:
     from anndata import AnnData
 
@@ -223,17 +225,26 @@ def _load_cuts(parquet_path, barcode_groups: dict[str, int], chrom_sizes: dict[s
     of ``read_length``-bp mates would). ``deduplicate`` keeps one copy of each
     (chrom, start, end) per group, like a duplicate-free pseudobulk BAM.
     """
-    bc = pl.DataFrame({"barcode": list(barcode_groups), "g": np.array(list(barcode_groups.values()), np.int32)})
-    q = (pl.scan_parquet(str(parquet_path))
-         .filter(pl.col("chrom").is_in(list(chrom_sizes)))
-         .select("chrom", "start", "end", "barcode")
-         .join(bc.lazy(), on="barcode", how="inner")
-         .select("g", pl.col("chrom").cast(pl.String), "start", "end"))
+    chroms = list(chrom_sizes)
+    group_of = cp.asarray(np.array(list(barcode_groups.values()), np.int32))
+    parts = []
+    for b in FragmentFile(parquet_path).iter_batches(
+        ["chrom", "start", "end"], chroms=chroms, cells=list(barcode_groups),
+    ):
+        parts.append(pl.DataFrame({
+            "g": group_of[b["cell"].values].get(),
+            "chrom": b["chrom"].values.get(),
+            "start": b["start"].values.get(),
+            "end": b["end"].values.get(),
+        }))
+        del b
+    df = pl.concat(parts) if parts else pl.DataFrame(
+        schema={"g": pl.Int32, "chrom": pl.Int32, "start": pl.UInt32, "end": pl.UInt32})
     if deduplicate:
-        q = q.unique()
-    df = q.collect()
+        df = df.unique()
     cuts: dict[int, dict[str, tuple]] = {g: {} for g in set(barcode_groups.values())}
-    for (g, c), sub in df.partition_by(["g", "chrom"], as_dict=True).items():
+    for (g, ci), sub in df.partition_by(["g", "chrom"], as_dict=True).items():
+        c = chroms[ci]
         length = chrom_sizes[c]
         s = sub["start"].to_numpy().astype(np.int64)
         e = sub["end"].to_numpy().astype(np.int64)

@@ -291,3 +291,16 @@ def test_peaks_agree(data):
         assert res[0].X.nnz > 0
         for r in res[1:]:
             _adata_equal(r, res[0])
+
+
+def test_footprint_cuts_agree(data):
+    from gatac.tl.footprint import _load_cuts
+    adata = _cells_adata(data)
+    groups = dict(zip(adata.obs_names, (adata.obs["group"] == "a").astype(int)))
+    sizes = {c: CHROM_SIZES[c] for c in ("chr1", "chr2")}
+    res = [_load_cuts(data["paths"][layout], groups, sizes, 50, True) for layout in LAYOUTS]
+    for r in res[1:]:
+        for g in res[0]:
+            for c in sizes:
+                for x, y in zip(r[g][c], res[0][g][c]):
+                    assert np.array_equal(x, y)

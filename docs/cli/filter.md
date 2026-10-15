@@ -2,7 +2,8 @@
 
 Filter an ATAC-seq fragment Parquet file by barcode quality thresholds.
 Accepts pre-computed metrics and a Polars query string for flexible filtering.
-Output is written as a new Parquet file using GPU-accelerated streaming.
+Output is written as a new Parquet file, streamed in batches, in the same
+layout as the input (standard or compact; see `gatac convert`).
 
 ---
 
@@ -35,7 +36,7 @@ gatac filter <input.parquet> [-o OUTPUT]
 | `--filter` | — | Polars filter query string (e.g. `"tsse_score > 5"`) |
 | `-g`, `--genome` | — | Genome name (`hg38`, `mm10`, …) for chromosome allowlist filtering |
 | `--barcode-prefix` | — | String prepended to barcodes |
-| `--batch-size` | `64` | Row-groups per GPU batch |
+| `--batch-size` | `64` | Unused (kept for compatibility) |
 
 ---
 

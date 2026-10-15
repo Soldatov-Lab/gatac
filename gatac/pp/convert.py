@@ -6,9 +6,13 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import duckdb
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from .fragments import STANDARD_SCHEMA, FragmentFile, write_fragments
 
 logger = logging.getLogger(__name__)
 
@@ -19,23 +23,28 @@ def make_parquet(
     separator: str = '\t',
     barcode_prefix: Optional[str] = None,
     row_group_size: int = 1_000_000,
+    layout: str = "standard",
+    chroms: Optional[Sequence[str]] = None,
 ) -> Path:
     """
-    Convert ATAC fragments TSV.GZ file to Parquet format.
+    Convert ATAC fragments to GATAC Parquet, or repack a GATAC Parquet file.
 
-    Uses DuckDB for parallel decompression and parsing, enabling
-    processing of files larger than RAM.
+    TSV input is parsed by DuckDB and streamed to the Parquet writer, so
+    files larger than RAM are fine. Both layouts are written with ZSTD and
+    delta-encoded coordinates (about 2.4x smaller than the former Snappy
+    files), keeping the input row order.
 
     Parameters
     ----------
     input_path : str or Path
-        Path to input .tsv.gz (or .bed.gz) file with ATAC fragments.
-        Expected columns: chrom, start, end, barcode, count
+        A .tsv.gz / .bed.gz (or uncompressed) fragment file with columns
+        chrom, start, end, barcode, count, or an existing GATAC .parquet
+        fragment file of either layout to repack.
     output_path : str or Path, optional
         Path for output .parquet file.
         If None, uses input filename with .parquet extension.
     separator : str
-        Column separator (default: tab)
+        Column separator of TSV input (default: tab)
     barcode_prefix : str, optional
         Prefix to prepend to barcodes (e.g. "sample1#")
     row_group_size : int
@@ -44,6 +53,16 @@ def make_parquet(
         via cudf.read_parquet(row_groups=...).  The default is tuned for
         the gatac batch size of 64 row groups (~64 M rows/batch fits
         comfortably on a 12 GB GPU).
+    layout : {'standard', 'compact'}
+        ``'standard'`` (default) stores chromosome and barcode names in
+        every row. ``'compact'`` stores integer ids plus an in-file barcode
+        table (full original names, fragment and read counts per barcode);
+        it streams several times faster on the GPU and reads back the same
+        names. See :class:`gatac.pp.FragmentFile`.
+    chroms : list of str, optional
+        Compact layout only: chromosome order for the ids. Pass the same
+        list for every library of a cohort so ids agree across files.
+        Default: order of first appearance.
 
     Returns
     -------
@@ -56,27 +75,47 @@ def make_parquet(
     >>> out = ga.pp.make_parquet("pbmc.tsv.gz")
     >>> # Or with a sample-specific barcode prefix
     >>> out = ga.pp.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1#")
+    >>> # Compact layout, or repack an existing Parquet file to it
+    >>> out = ga.pp.make_parquet("pbmc.tsv.gz", layout="compact")
+    >>> out = ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet", layout="compact")
     """
     input_path = Path(input_path)
     if output_path is None:
         output_path = input_path.with_suffix('').with_suffix('.parquet')
     else:
         output_path = Path(output_path)
+    if output_path.resolve() == input_path.resolve():
+        raise ValueError(f"output_path must differ from the input: {output_path}")
 
-    logger.info(f"Converting {input_path.name} to Parquet")
+    logger.info(f"Converting {input_path.name} to Parquet ({layout} layout)")
 
-    if barcode_prefix:
-        barcode_expr = f"'{barcode_prefix}' || column3"
+    barcode_stats = None
+    if input_path.suffix == '.parquet':
+        source = FragmentFile(input_path)
+
+        def batches():
+            for t in source.iter_arrow(row_group_size):
+                if barcode_prefix:
+                    t = t.set_column(3, 'barcode', pc.binary_join_element_wise(
+                        pa.scalar(barcode_prefix), t['barcode'], ''))
+                yield t
+
+        if layout == "compact":
+            barcode_stats = source.barcode_counts()[['barcode', 'n_unique', 'n_total']]
+            if chroms is None and source.compact:
+                chroms = source.chroms  # keep the source's chromosome ids
+            if barcode_prefix:
+                barcode_stats['barcode'] = barcode_prefix + barcode_stats['barcode']
     else:
-        barcode_expr = "column3"
-
-    con = duckdb.connect()
-    con.execute(f"""
-        COPY (
+        if barcode_prefix:
+            barcode_expr = f"'{barcode_prefix}' || column3"
+        else:
+            barcode_expr = "column3"
+        query = f"""
             SELECT
                 column0          AS chrom,
                 column1::UINTEGER AS start,
-                column2::UINTEGER AS end,
+                column2::UINTEGER AS "end",
                 {barcode_expr}   AS barcode,
                 column4::USMALLINT AS count
             FROM read_csv(
@@ -86,10 +125,29 @@ def make_parquet(
                 comment='#',
                 ignore_errors=true
             )
-        ) TO '{output_path}'
-        (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE {row_group_size})
-    """)
-    con.close()
+            WHERE column0 IS NOT NULL AND column1 IS NOT NULL
+              AND column2 IS NOT NULL AND column3 IS NOT NULL
+        """
+
+        def batches():
+            con = duckdb.connect()
+            try:
+                for b in con.execute(query).to_arrow_reader(row_group_size):
+                    yield pa.Table.from_batches([b]).cast(STANDARD_SCHEMA)
+            finally:
+                con.close()
+
+        if layout == "compact":
+            with duckdb.connect() as con:
+                barcode_stats = con.execute(f"""
+                    SELECT barcode, count(*)::BIGINT AS n_unique, sum(count)::BIGINT AS n_total
+                    FROM ({query}) GROUP BY barcode
+                """).fetchdf()
+
+    write_fragments(
+        batches, output_path, layout=layout, chroms=chroms,
+        row_group_size=row_group_size, barcode_stats=barcode_stats,
+    )
 
     logger.info(f"Created {output_path.name}")
     return output_path
@@ -100,8 +158,10 @@ def make_parquet_batch(
     output_dir: Optional[str | Path] = None,
     workers: Optional[int] = None,
     separator: str = '\t',
-    barcode_prefix: Optional[str] = None,
+    barcode_prefix: Optional[str | Sequence[str]] = None,
     row_group_size: int = 1_000_000,
+    layout: str = "standard",
+    chroms: Optional[Sequence[str]] = None,
 ) -> list[Path]:
     """
     Convert multiple ATAC fragment TSV.GZ files to Parquet in parallel.
@@ -121,10 +181,15 @@ def make_parquet_batch(
         Defaults to ``min(len(input_paths), os.cpu_count())``.
     separator : str
         Column separator forwarded to :func:`make_parquet`.
-    barcode_prefix : str, optional
-        Prefix forwarded to :func:`make_parquet`.
+    barcode_prefix : str or list of str, optional
+        Prefix forwarded to :func:`make_parquet`: one for all files, or one
+        per input file.
     row_group_size : int
         Row-group size forwarded to :func:`make_parquet`.
+    layout : {'standard', 'compact'}
+        Layout forwarded to :func:`make_parquet`.
+    chroms : list of str, optional
+        Chromosome order forwarded to :func:`make_parquet` (compact layout).
 
     Returns
     -------
@@ -152,6 +217,12 @@ def make_parquet_batch(
     ... )
     """
     input_paths = [Path(p) for p in input_paths]
+    if isinstance(barcode_prefix, str) or barcode_prefix is None:
+        prefixes = [barcode_prefix] * len(input_paths)
+    else:
+        prefixes = list(barcode_prefix)
+        if len(prefixes) != len(input_paths):
+            raise ValueError(f"{len(prefixes)} barcode prefixes for {len(input_paths)} input files")
 
     if output_dir is not None:
         output_dir = Path(output_dir)
@@ -181,10 +252,12 @@ def make_parquet_batch(
                 inp,
                 out,
                 separator,
-                barcode_prefix,
+                prefix,
                 row_group_size,
+                layout,
+                chroms,
             ): i
-            for i, (inp, out) in enumerate(zip(input_paths, output_paths))
+            for i, (inp, out, prefix) in enumerate(zip(input_paths, output_paths, prefixes))
         }
         for future in as_completed(future_to_idx):
             i = future_to_idx[future]

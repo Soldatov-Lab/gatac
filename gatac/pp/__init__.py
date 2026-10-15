@@ -1,4 +1,5 @@
 from .convert import make_parquet, make_parquet_batch
+from .fragments import FragmentFile
 from .process import read_fragments_parquet, combine
 from .tile import make_tile_matrix
 from .gene import make_gene_matrix
@@ -22,6 +23,7 @@ MM39 = _MM39
 __all__ = [
     "make_parquet",
     "make_parquet_batch",
+    "FragmentFile",
     "make_tile_matrix",
     "make_gene_matrix",
     "make_gene_score_matrix",

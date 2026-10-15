@@ -17,6 +17,7 @@ import cupyx
 import numpy as np
 
 from ._utils import cleanup_gpu_memory
+from .fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +162,6 @@ def compute_metrics(
     """
 
     import polars as pl
-    import pyarrow.parquet as pq
 
     # Resolve TSS source: accept either a GTF path or a pre-loaded DataFrame.
     if isinstance(tss_source, (str, Path)):
@@ -170,60 +170,22 @@ def compute_metrics(
         tss_df = tss_source
 
     logger.info(f"Computing metrics (streaming mode, row_groups_per_batch={row_groups_per_batch})")
-    parquet_path = Path(parquet_path)
-    
+    fragments = FragmentFile(parquet_path)
+
     # =========================================================================
-    # Phase 1: Compute cell QC metrics using row groups
+    # Phase 1: Per-barcode fragment and read counts (DuckDB scan)
     # =========================================================================
-    parquet_file = pq.ParquetFile(str(parquet_path))
-    num_row_groups = parquet_file.metadata.num_row_groups
-    
-    qc_summary = None
-    valid_chroms_qc = list(chrom_sizes.keys()) if chrom_sizes is not None else None
-    
-    logger.info(f"Aggregating QC metrics from {num_row_groups} row groups in batches of {row_groups_per_batch}...")
-    
-    for i in range(0, num_row_groups, row_groups_per_batch):
-        batch_groups = list(range(i, min(i + row_groups_per_batch, num_row_groups)))
-        
-        # Load batch into GPU memory
-        chunk_df = cudf.read_parquet(
-            str(parquet_path), 
-            row_groups=batch_groups, 
-            columns=['chrom', 'barcode', 'count']
-        )
-        
-        if valid_chroms_qc:
-            chunk_df = chunk_df[chunk_df['chrom'].isin(valid_chroms_qc)]
-        
-        # Identify mitochondrial fragments
-        chunk_df['n_mito'] = chunk_df['chrom'].isin(['chrM', 'M']).astype('uint32') * chunk_df['count']
-        
-        # Group by barcode for this chunk
-        chunk_agg = chunk_df.groupby('barcode').agg({
-            'count': ['sum', 'size'],
-            'n_mito': 'sum'
-        })
-        chunk_agg.columns = ['n_total', 'n_unique', 'n_mito']
-        chunk_agg = chunk_agg.reset_index()
-        
-        if qc_summary is None:
-            qc_summary = chunk_agg
-        else:
-            qc_summary = cudf.concat([qc_summary, chunk_agg])
-            # Re-aggregate to keep memory low
-            qc_summary = qc_summary.groupby('barcode').sum().reset_index()
-        
-        del chunk_df, chunk_agg
-        cleanup_gpu_memory()
-        
-    if qc_summary is None or len(qc_summary) == 0:
+    valid_chroms_qc = list(chrom_sizes.keys()) if chrom_sizes else None
+    qc_summary = fragments.barcode_counts(chroms=valid_chroms_qc, mito_chroms=['chrM', 'M'])
+
+    if len(qc_summary) == 0:
         logger.warning("No cells passed the minimum fragment filter!")
         return cudf.DataFrame({
             'barcode': [], 'tsse_score': [], 'n_unique': [], 
             'duplicate_fraction': [], 'mito_fraction': []
         })
-        
+    qc_summary = cudf.from_pandas(qc_summary.sort_values('barcode', ignore_index=True))
+
     # Filter by min_unique_frags and compute final QC metrics
     qc_metrics = qc_summary[qc_summary['n_unique'] >= min_unique_frags].copy()
     qc_metrics['duplicate_fraction'] = (qc_metrics['n_total'] - qc_metrics['n_unique']) / (qc_metrics['n_total'] + 1e-9)
@@ -231,10 +193,6 @@ def compute_metrics(
     
     n_cells = len(qc_metrics)
     logger.info(f"Found {n_cells:,} cells with >= {min_unique_frags} unique fragments")
-    
-    # Create barcode -> cell_idx mapping (on GPU)
-    barcode_to_idx_gpu = qc_metrics[['barcode']].copy()
-    barcode_to_idx_gpu['cell_idx'] = cp.arange(n_cells, dtype='int32')
     
     # Clean up summary
     del qc_summary
@@ -266,46 +224,30 @@ def compute_metrics(
     data_cp = cp.zeros((n_cells, 3), dtype='float32')
     half_smooth = smooth_window // 2
     
-    parquet_file = pq.ParquetFile(str(parquet_path))
-    num_row_groups = parquet_file.metadata.num_row_groups
-    
+    stream_chroms = [c for c in tss_chroms if valid_chroms_qc is None or c in valid_chroms_qc]
+    cells = qc_metrics['barcode'].to_arrow().to_pylist()
+    num_row_groups = fragments.num_row_groups
+
     logger.info(f"Processing {num_row_groups} row groups in batches of {row_groups_per_batch}...")
     
-    for i in range(0, num_row_groups, row_groups_per_batch):
-        batch_groups = list(range(i, min(i + row_groups_per_batch, num_row_groups)))
-        
-        # Load batch directly to GPU memory
-        chunk_df = cudf.read_parquet(
-            str(parquet_path), 
-            row_groups=batch_groups, 
-            columns=['chrom', 'start', 'end', 'barcode']
-        )
-        
-        # Filter chromosomes
-        chunk_df = chunk_df[chunk_df['chrom'].isin(tss_chroms)]
-        if valid_chroms_qc:
-            chunk_df = chunk_df[chunk_df['chrom'].isin(valid_chroms_qc)]
-        
-        # Join with barcodes to filter and get cell_idx
-        chunk_df = chunk_df.merge(barcode_to_idx_gpu, on='barcode')
-        
+    batches = fragments.iter_batches(
+        ['chrom', 'start', 'end'], row_groups_per_batch, chroms=stream_chroms, cells=cells,
+    )
+    for i, chunk_df in zip(range(0, num_row_groups, row_groups_per_batch), batches):
         if len(chunk_df) == 0:
             continue
         
-        # Process fragments
-        chunk_chroms = chunk_df['chrom'].unique().to_arrow().to_pylist()
+        # Process fragments, one chromosome at a time
+        chunk_chrom = chunk_df['chrom'].values
         tpb = 256
         
-        for chrom in chunk_chroms:
-            if chrom not in tss_by_chrom:
-                continue
-                
-            tss_pos, tss_strand = tss_by_chrom[chrom]
-            chrom_df = chunk_df[chunk_df['chrom'] == chrom]
+        for ci in cp.unique(chunk_chrom).get():
+            tss_pos, tss_strand = tss_by_chrom[stream_chroms[ci]]
+            on_chrom = chunk_chrom == ci
             
-            cell_idx = chrom_df['cell_idx'].values.astype('int32')
-            starts = chrom_df['start'].values.astype('int32')
-            ends = (chrom_df['end'] - 1).values.astype('int32')
+            cell_idx = chunk_df['cell'].values[on_chrom].astype('int32')
+            starts = chunk_df['start'].values[on_chrom].astype('int32')
+            ends = (chunk_df['end'].values[on_chrom] - 1).astype('int32')
             
             n_frags = len(starts)
             bpg = (n_frags + tpb - 1) // tpb

@@ -21,6 +21,7 @@ from cupyx.scipy.ndimage import maximum_filter1d
 from cupyx.scipy.special import pdtr, pdtrc
 from numba import njit, prange
 
+from ..pp.fragments import FragmentFile
 from ..pp.genome import get_chrom_sizes
 from ..pp.gene import optimize_sparse_matrix_dtype
 
@@ -501,6 +502,7 @@ def _accumulate_to_chrom_groups(
     chrom_groups_host: dict,
     fragment_df: "cudf.DataFrame",
     frag_count: list,
+    chrom_names: list,
 ):
     """
     Accumulate fragments from a small cuDF DataFrame into per-chromosome
@@ -512,16 +514,23 @@ def _accumulate_to_chrom_groups(
         Mutable dict of {chrom: (starts_list, ends_list)} where each list
         contains numpy arrays to be concatenated later.
     fragment_df : cudf.DataFrame
-        Small filtered chunk with 'chrom', 'start', 'end' columns.
+        Small filtered chunk with 'chrom' (index into ``chrom_names``),
+        'start', 'end' columns.
     frag_count : list
         Single-element list used as a mutable counter for total fragments.
+    chrom_names : list of str
+        Chromosome names indexed by the 'chrom' column.
     """
     if len(fragment_df) == 0:
         return
-    # Transfer small chunk to host and group by chromosome
+
+    # Transfer small chunk to host and group by chromosome (in name order)
     pdf = fragment_df[['chrom', 'start', 'end']].to_pandas()
     frag_count[0] += len(pdf)
-    for chrom, group in pdf.groupby('chrom'):
+
+    groups = dict(list(pdf.groupby('chrom')))
+    for ci in sorted(groups, key=lambda i: chrom_names[i]):
+        chrom, group = chrom_names[ci], groups[ci]
         if chrom not in chrom_groups_host:
             chrom_groups_host[chrom] = ([], [])
         chrom_groups_host[chrom][0].append(group['start'].values)
@@ -552,7 +561,7 @@ def _finalize_chrom_groups(chrom_groups_host: dict) -> dict:
 
 
 def _read_fragments_to_chrom_groups(
-    parquet_path: Path,
+    parquet_path: Union[Path, FragmentFile],
     barcodes: set,
     batch_size: int = 10,
     valid_chroms: set = None,
@@ -560,14 +569,15 @@ def _read_fragments_to_chrom_groups(
     """
     Read fragments from parquet file, returning per-chromosome cupy arrays.
 
-    Unlike _read_fragments_for_barcodes_chunked, this never builds a
-    monolithic cuDF DataFrame. Each chunk is transferred to host memory
-    per-chromosome, avoiding GPU OOM on very large datasets.
+    This never builds a monolithic cuDF DataFrame. Each chunk is
+    transferred to host memory per-chromosome, avoiding GPU OOM on very
+    large datasets.
 
     Parameters
     ----------
-    parquet_path : Path
-        Path to parquet file
+    parquet_path : Path or FragmentFile
+        Fragment parquet file (either layout). Pass a FragmentFile to reuse
+        its barcode table across calls.
     barcodes : set
         Set of barcodes to extract
     batch_size : int
@@ -582,53 +592,20 @@ def _read_fragments_to_chrom_groups(
     total_frags : int
         Total number of fragments read
     """
-    import pyarrow.parquet as pq
+    fragments = parquet_path if isinstance(parquet_path, FragmentFile) else FragmentFile(parquet_path)
+    logger.debug(f"Reading {fragments.path.name}: {fragments.num_row_groups} row groups")
 
-    parquet_path = Path(parquet_path)
-    pf = pq.ParquetFile(str(parquet_path))
-    n_row_groups = pf.metadata.num_row_groups
-
-    logger.debug(f"Reading {parquet_path.name}: {n_row_groups} row groups")
+    chroms = sorted(valid_chroms) if valid_chroms is not None else None
+    chrom_names = chroms if chroms is not None else fragments.chroms
 
     chrom_groups_host = {}  # {chrom: ([np_starts, ...], [np_ends, ...])}
     frag_count = [0]
 
-    for batch_start in range(0, n_row_groups, batch_size):
-        batch_end = min(batch_start + batch_size, n_row_groups)
-        row_group_batch = list(range(batch_start, batch_end))
-
-        try:
-            chunk_df = cudf.read_parquet(
-                str(parquet_path),
-                columns=['chrom', 'start', 'end', 'barcode'],
-                row_groups=row_group_batch,
-            )
-        except TypeError:
-            logger.warning("Row group reading not supported, reading full file")
-            chunk_df = cudf.read_parquet(
-                str(parquet_path),
-                columns=['chrom', 'start', 'end', 'barcode'],
-            )
-            barcodes_series = cudf.Series(list(barcodes))
-            filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
-            if valid_chroms is not None and len(filtered) > 0:
-                chrom_series = cudf.Series(list(valid_chroms))
-                filtered = filtered[filtered['chrom'].isin(chrom_series)]
-            _accumulate_to_chrom_groups(chrom_groups_host, filtered, frag_count)
-            del chunk_df, filtered
-            mempool.free_all_blocks()
-            break
-
-        barcodes_series = cudf.Series(list(barcodes))
-        filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
-
-        if valid_chroms is not None and len(filtered) > 0:
-            chrom_series = cudf.Series(list(valid_chroms))
-            filtered = filtered[filtered['chrom'].isin(chrom_series)]
-
-        _accumulate_to_chrom_groups(chrom_groups_host, filtered, frag_count)
-
-        del chunk_df, filtered
+    for chunk_df in fragments.iter_batches(
+        ['chrom', 'start', 'end'], batch_size, chroms=chroms, cells=list(barcodes),
+    ):
+        _accumulate_to_chrom_groups(chrom_groups_host, chunk_df, frag_count, chrom_names)
+        del chunk_df
         mempool.free_all_blocks()
 
     total_frags = frag_count[0]
@@ -642,106 +619,6 @@ def _read_fragments_to_chrom_groups(
     gc.collect()
 
     return chrom_groups, total_frags
-
-
-def _read_fragments_for_barcodes_chunked(
-    parquet_path: Path,
-    barcodes: set,
-    batch_size: int = 10,
-    valid_chroms: set = None,
-) -> cudf.DataFrame:
-    """
-    Read fragments from parquet file, filtering to specific barcodes.
-    
-    Uses chunked reading (row groups) to avoid OOM when extracting
-    a small subset of cells from a large parquet file.
-    
-    Parameters
-    ----------
-    parquet_path : Path
-        Path to parquet file
-    barcodes : set
-        Set of barcodes to extract
-    batch_size : int
-        Number of row groups to load at once (default: 10)
-    valid_chroms : set, optional
-        If provided, only keep fragments on these chromosomes.
-        Filtering is done per-chunk to avoid GPU OOM on large datasets.
-        
-    Returns
-    -------
-    cudf.DataFrame
-        Filtered fragments DataFrame with chrom, start, end columns
-    """
-    import pyarrow.parquet as pq
-    
-    parquet_path = Path(parquet_path)
-    
-    # Get parquet file metadata
-    pf = pq.ParquetFile(str(parquet_path))
-    n_row_groups = pf.metadata.num_row_groups
-    
-    logger.debug(f"Reading {parquet_path.name}: {n_row_groups} row groups")
-    
-    chunks = []
-    total_frags = 0
-    
-    # Process row groups in batches
-    for batch_start in range(0, n_row_groups, batch_size):
-        batch_end = min(batch_start + batch_size, n_row_groups)
-        row_group_batch = list(range(batch_start, batch_end))
-        
-        # Read batch of row groups at once
-        try:
-            chunk_df = cudf.read_parquet(
-                str(parquet_path),
-                columns=['chrom', 'start', 'end', 'barcode'],
-                row_groups=row_group_batch,
-            )
-        except TypeError:
-            # Fallback for older cuDF versions - read entire file
-            logger.warning("Row group reading not supported, reading full file")
-            chunk_df = cudf.read_parquet(
-                str(parquet_path),
-                columns=['chrom', 'start', 'end', 'barcode'],
-            )
-            # Filter and return immediately
-            barcodes_series = cudf.Series(list(barcodes))
-            filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
-            if valid_chroms is not None and len(filtered) > 0:
-                chrom_series = cudf.Series(list(valid_chroms))
-                filtered = filtered[filtered['chrom'].isin(chrom_series)]
-            # Note: No sorting needed - _gmacs_core groups by chromosome internally
-            return filtered[['chrom', 'start', 'end']]
-        
-        # Filter to target barcodes
-        barcodes_series = cudf.Series(list(barcodes))
-        filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
-        
-        # Filter to valid chromosomes per-chunk to avoid GPU OOM
-        if valid_chroms is not None and len(filtered) > 0:
-            chrom_series = cudf.Series(list(valid_chroms))
-            filtered = filtered[filtered['chrom'].isin(chrom_series)]
-        
-        if len(filtered) > 0:
-            chunks.append(filtered[['chrom', 'start', 'end']])
-            total_frags += len(filtered)
-        
-        del chunk_df, filtered
-        mempool.free_all_blocks()
-    
-    if len(chunks) == 0:
-        return cudf.DataFrame({'chrom': [], 'start': [], 'end': []})
-    
-    result = cudf.concat(chunks, ignore_index=True)
-    # Free memory from individual chunks immediately
-    del chunks
-    mempool.free_all_blocks()
-    # Note: No sorting needed - _gmacs_core groups by chromosome internally
-    
-    logger.debug(f"Extracted {total_frags:,} fragments for {len(barcodes):,} barcodes")
-    
-    return result
 
 
 # =============================================================================
@@ -884,6 +761,13 @@ def call_peaks(
         return f"{name}.parquet"
     
     peaks_dict = {}
+    # One FragmentFile per parquet, reused across groups
+    fragment_files = {}
+
+    def _fragment_file(path):
+        if path not in fragment_files:
+            fragment_files[path] = FragmentFile(path)
+        return fragment_files[path]
     
     # Import tqdm for progress bars
     if verbose:
@@ -930,7 +814,7 @@ def call_peaks(
                 file_mask = mask & (adata.obs['source_file'] == src_file)
                 file_barcodes = set(adata.obs.index[file_mask])
                 file_groups, file_frags = _read_fragments_to_chrom_groups(
-                    src_path, file_barcodes, batch_size=batch_size,
+                    _fragment_file(src_path), file_barcodes, batch_size=batch_size,
                     valid_chroms=valid_chroms,
                 )
                 # Merge GPU arrays back to host for cross-file accumulation
@@ -957,7 +841,7 @@ def call_peaks(
         else:
             # Single file mode
             chrom_groups, num_reads = _read_fragments_to_chrom_groups(
-                parquet_path, group_barcodes, batch_size=batch_size,
+                _fragment_file(parquet_path), group_barcodes, batch_size=batch_size,
                 valid_chroms=valid_chroms,
             )
         
@@ -1406,7 +1290,8 @@ def merge_peaks(
 def _count_fragments_in_peaks_gpu(
     fragments_df: cudf.DataFrame,
     peaks_by_chrom: dict,
-    barcode_mapping: cudf.DataFrame,
+    cell_index: cp.ndarray,
+    chrom_names: list,
     n_peaks: int,
     counting_strategy: str = "paired-insertion",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1418,11 +1303,14 @@ def _count_fragments_in_peaks_gpu(
     Parameters
     ----------
     fragments_df : cudf.DataFrame
-        Fragments with 'chrom', 'start', 'end', 'barcode' columns
+        Fragments with 'chrom' (index into ``chrom_names``), 'start', 'end'
+        and 'cell' (index into ``cell_index``) columns
     peaks_by_chrom : dict
         Pre-grouped peaks dict: {chrom: (starts_cp, ends_cp, peak_indices_cp)}
-    barcode_mapping : cudf.DataFrame
-        Pre-created mapping with 'barcode' and 'cell_idx' columns
+    cell_index : cp.ndarray
+        Output row (cell index) of each value of the 'cell' column
+    chrom_names : list of str
+        Chromosome names indexed by the 'chrom' column
     n_peaks : int
         Total number of peaks
     counting_strategy : str
@@ -1440,13 +1328,12 @@ def _count_fragments_in_peaks_gpu(
     fragments_df['_global_frag_idx'] = cp.arange(len(fragments_df), dtype=cp.int64)
     
     # Process each chromosome
-    chroms = fragments_df['chrom'].to_pandas().unique()
-    
-    for chrom in chroms:
+    for ci in cp.unique(fragments_df['chrom'].values).get():
+        chrom = chrom_names[ci]
         if chrom not in peaks_by_chrom:
             continue
             
-        chrom_frags = fragments_df[fragments_df['chrom'] == chrom]
+        chrom_frags = fragments_df[fragments_df['chrom'] == ci]
         peak_starts, peak_ends, peak_indices = peaks_by_chrom[chrom]
         
         if len(chrom_frags) == 0:
@@ -1547,16 +1434,9 @@ def _count_fragments_in_peaks_gpu(
     all_overlaps = cudf.concat(all_results, ignore_index=True)
     del all_results
     
-    # Get barcodes for overlapping fragments (GPU join)
-    # Create a temporary mapping for fragments to barcodes
-    # We only need the columns barcode and _global_frag_idx
-    frag_barcodes = fragments_df[['barcode', '_global_frag_idx']].rename(columns={'_global_frag_idx': 'frag_idx'})
-    
-    # Join to get barcodes
-    all_overlaps = all_overlaps.merge(frag_barcodes, on='frag_idx', how='left')
-    
-    # Join to get cell indices
-    all_overlaps = all_overlaps.merge(barcode_mapping, on='barcode', how='inner')
+    # Cell index of each overlapping fragment (frag_idx is the row in fragments_df)
+    frag_cells = fragments_df['cell'].values
+    all_overlaps['cell_idx'] = cell_index[frag_cells[all_overlaps['frag_idx'].values]]
     
     # For paired-insertion, deduplicate (frag_idx, peak_idx) pairs
     # (Note: my optimized logic for paired-insertion already handles same-peak case, 
@@ -1573,7 +1453,7 @@ def _count_fragments_in_peaks_gpu(
     cols = counts['peak_idx'].to_pandas().values
     data = counts['count'].to_pandas().values
     
-    del all_overlaps, counts, frag_barcodes
+    del all_overlaps, counts, frag_cells
     mempool.free_all_blocks()
     
     return rows, cols, data
@@ -1598,7 +1478,7 @@ def _read_and_count_fragments_batched(
     Parameters
     ----------
     parquet_path : Path
-        Path to parquet file
+        Path to the fragment parquet file (either layout)
     barcodes : set
         Set of barcodes to include
     peaks_gpu : cudf.DataFrame
@@ -1621,24 +1501,12 @@ def _read_and_count_fragments_batched(
     tuple[np.ndarray, np.ndarray, np.ndarray]
         (rows, cols, data) as numpy arrays for sparse matrix construction
     """
-    import pyarrow.parquet as pq
+    fragments = FragmentFile(parquet_path)
+    logger.debug(f"Reading {fragments.path.name}: {fragments.num_row_groups} row groups")
     
-    parquet_path = Path(parquet_path)
-    
-    # Get parquet file metadata
-    pf = pq.ParquetFile(str(parquet_path))
-    n_row_groups = pf.metadata.num_row_groups
-    
-    logger.debug(f"Reading {parquet_path.name}: {n_row_groups} row groups")
-    
-    # Pre-create barcode mapping on GPU (once)
-    barcode_mapping = cudf.DataFrame({
-        'barcode': list(barcode_to_idx.keys()),
-        'cell_idx': list(barcode_to_idx.values()),
-    })
-    
-    # Pre-create barcode Series for filtering (once)
-    barcodes_series = cudf.Series(list(barcodes))
+    # Output row of each barcode of this file (once)
+    cells = list(barcodes)
+    cell_index = cp.asarray([barcode_to_idx[b] for b in cells], dtype=cp.int64)
     
     # Pre-group peaks by chromosome (once)
     peaks_by_chrom = {}
@@ -1650,59 +1518,27 @@ def _read_and_count_fragments_batched(
             chrom_peaks['peak_idx'].to_cupy(),
         )
     
+    # Only fragments on chromosomes with peaks can overlap one
+    allowed = set(chrom_names) if filter_chromosomes and chrom_names is not None else None
+    chroms = [c for c in peaks_by_chrom if allowed is None or c in allowed]
+    
     all_rows = []
     all_cols = []
     all_data = []
     
     # Process row groups in batches
-    for batch_start in range(0, n_row_groups, batch_size):
-        batch_end = min(batch_start + batch_size, n_row_groups)
-        row_group_batch = list(range(batch_start, batch_end))
-        
-        # Read batch of row groups
-        try:
-            chunk_df = cudf.read_parquet(
-                str(parquet_path),
-                columns=['chrom', 'start', 'end', 'barcode'],
-                row_groups=row_group_batch,
-            )
-        except TypeError:
-            # Fallback for older cuDF versions - read entire file once
-            logger.warning("Row group reading not supported, reading full file")
-            chunk_df = cudf.read_parquet(
-                str(parquet_path),
-                columns=['chrom', 'start', 'end', 'barcode'],
-            )
-            # Filter to target barcodes
-            filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
-            
-            # Filter chromosomes if requested
-            if filter_chromosomes and chrom_names is not None:
-                filtered = filtered[filtered['chrom'].isin(chrom_names)]
-            
-            if len(filtered) > 0:
-                rows, cols, data = _count_fragments_in_peaks_gpu(
-                    filtered, peaks_by_chrom, barcode_mapping, n_peaks, counting_strategy
-                )
-                return rows, cols, data
-            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-        
-        # Filter to target barcodes
-        filtered = chunk_df[chunk_df['barcode'].isin(barcodes_series)]
-        
-        # Filter chromosomes if requested
-        if filter_chromosomes and chrom_names is not None:
-            filtered = filtered[filtered['chrom'].isin(chrom_names)]
-        
+    for filtered in fragments.iter_batches(
+        ['chrom', 'start', 'end'], batch_size, chroms=chroms, cells=cells,
+    ):
         if len(filtered) > 0:
             rows, cols, data = _count_fragments_in_peaks_gpu(
-                filtered, peaks_by_chrom, barcode_mapping, n_peaks, counting_strategy
+                filtered, peaks_by_chrom, cell_index, chroms, n_peaks, counting_strategy
             )
             all_rows.append(rows)
             all_cols.append(cols)
             all_data.append(data)
         
-        del chunk_df, filtered
+        del filtered
         mempool.free_all_blocks()
         pinned_mempool.free_all_blocks()
     

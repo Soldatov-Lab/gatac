@@ -48,6 +48,12 @@ p.caption .caption-text,
   transform: translateY(-2px);
 }
 
+/* Card footers with several buttons: side by side, not stacked */
+.sd-card-footer p.sd-card-text {
+  display: inline-block;
+  margin: 0 0.5rem 0 0;
+}
+
 /* ── API summary tables ──────────────────────────────────────────────────── */
 table.autosummary td:first-child code {
   white-space: nowrap;

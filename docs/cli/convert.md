@@ -70,7 +70,7 @@ a DuckDB view with `chrom`, `start`, `end`, `barcode`, `count`).
 
 Parquet files written by earlier GATAC versions (names in every row) are
 still read by every function; repack them with `gatac convert` to get the
-speed-up. See [Fragment files](../fragment_files.md) for how the layout works.
+speed-up. See [Anatomy of a GATAC Parquet file](../fragment_files.md) for how the layout works.
 
 ---
 

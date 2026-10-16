@@ -109,9 +109,10 @@ class FragmentFile:
         self._metadata = pf.metadata
         names = set(pf.schema_arrow.names)
         kv = pf.metadata.metadata or {}
-        self.compact = kv.get(b"gatac.format") == b"compact"
+        # Compact files carry a format version in the footer; legacy ones do not
+        self.compact = b"gatac.format_version" in kv
         if self.compact:
-            version = kv.get(b"gatac.format_version", b"").decode()
+            version = kv[b"gatac.format_version"].decode()
             if version != COMPACT_VERSION:
                 raise ValueError(
                     f"{self.path.name}: compact fragment format version {version!r} "
@@ -622,7 +623,6 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
                 f"{chrom_list[n_given:][:5]}"
             )
         writer.add_key_value_metadata({
-            "gatac.format": "compact",
             "gatac.format_version": COMPACT_VERSION,
             "gatac.chroms": json.dumps(chrom_list),
             "gatac.n_barcodes": str(n_bc),

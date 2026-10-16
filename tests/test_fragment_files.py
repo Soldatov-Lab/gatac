@@ -59,8 +59,7 @@ def data(tmp_path_factory):
     with gzip.open(tsv, "wt") as fh:
         fh.write("# header comment\n")
         df.to_csv(fh, sep="\t", header=False, index=False)
-    path = ga.pp.make_parquet(tsv, d / "frags.parquet", barcode_prefix="S1_", row_group_size=9_000,
-                              chroms=["chr1", "chr2"])
+    path = ga.pp.make_parquet(tsv, d / "frags.parquet", barcode_prefix="S1_", row_group_size=9_000)
     df["barcode"] = "S1_" + df["barcode"]
     gtf = d / "genes.gtf"
     rows = []
@@ -91,9 +90,8 @@ def test_round_trip_keeps_rows_order_and_names(data):
 
 def test_file_layout(data):
     ff = FragmentFile(data["path"])
-    # Given chromosomes first, the others appended in order of appearance
-    assert ff.chroms[:2] == ["chr1", "chr2"]
-    assert set(ff.chroms) == set(data["df"]["chrom"])
+    # Chromosome ids in order of first appearance
+    assert ff.chroms == list(dict.fromkeys(data["df"]["chrom"]))
     # Barcode table: original names, ids by decreasing fragment count
     counts = ff.barcode_counts()
     expected = data["df"].groupby("barcode")["count"].agg(["size", "sum"])

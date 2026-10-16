@@ -436,10 +436,10 @@ def write_fragments(
         (once to count fragments per barcode).
     output_path : str or Path
     chroms : list of str, optional
-        Chromosome order for ``chrom_id``. Chromosomes of the
-        data missing from the list are appended in order of first
-        appearance. Give the same list to every library of a cohort to
-        share ids. Default: order of first appearance.
+        Chromosome order for ``chrom_id`` (``filter_fragments`` passes the
+        input's, to keep its ids). Chromosomes of the data missing from the
+        list are appended in order of first appearance. Default: order of
+        first appearance.
     row_group_size : int
         Rows per Parquet row group (default 1,000,000).
     barcode_stats : pd.DataFrame, optional

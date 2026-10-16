@@ -38,6 +38,14 @@ the names once, inside the same file:
 The barcode table also gives the fragment counts per barcode without
 reading the fragments (`FragmentFile.barcode_counts()`).
 
+```{note}
+Ids are per file: chromosomes are numbered in the order they first appear in
+the `fragments.tsv.gz`, barcodes by decreasing fragment count. A function
+asked for chromosomes or cells by name maps them through that file's own
+`gatac.chroms` and barcode table, so the same chromosome can have different
+ids in two libraries and the results do not depend on it.
+```
+
 ## Reading by integer lookups
 
 Every GATAC function that reads fragments goes through
@@ -80,26 +88,6 @@ Fragments are sorted by position in a `fragments.tsv.gz`, so consecutive
 Pages are compressed with ZSTD and written as data page v1, which cuDF's
 chunked reader requires. Row groups hold 1,000,000 fragments
 (`row_group_size`), the unit GATAC streams in.
-
-## Several libraries
-
-Chromosome ids are per file, in order of first appearance by default. GATAC
-always resolves chromosomes by name through each file's own `gatac.chroms`,
-so libraries converted separately can have different ids and still give the
-same results. To give every library of a cohort the same ids anyway (handy
-when reading the files outside GATAC), pass the same chromosome list to each
-conversion:
-
-```bash
-gatac convert "samples/*.tsv.gz" --output-dir parquets/ --chroms chroms.txt
-```
-
-```python
-ga.pp.make_parquet_batch(paths, output_dir="parquets/", chroms=["chr1", "chr2", ...])
-```
-
-Chromosomes of the data missing from the list are appended after it, with a
-warning. Barcode ids are always per file.
 
 ## Reading a file outside GATAC
 

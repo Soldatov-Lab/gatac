@@ -73,17 +73,6 @@ code.literal {
   font-size: 0.88em;
 }
 
-/* ── Admonition tweaks ───────────────────────────────────────────────────── */
-div.admonition.note > p.admonition-title::before {
-  content: "ℹ️  ";
-}
-div.admonition.warning > p.admonition-title::before {
-  content: "⚠️  ";
-}
-div.admonition.tip > p.admonition-title::before {
-  content: "💡  ";
-}
-
 /* ── Mermaid diagrams ────────────────────────────────────────────────────── */
 .mermaid svg {
   max-width: 100%;

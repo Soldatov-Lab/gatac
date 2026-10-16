@@ -40,7 +40,7 @@ combine
 :link-type: doc
 :shadow: none
 
-Convert TSV.GZ fragment files to Parquet.
+Convert TSV.GZ fragment files to Parquet, and back.
 :::
 
 :::{grid-item-card} {fas}`chart-bar` metrics

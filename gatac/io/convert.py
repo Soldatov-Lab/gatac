@@ -1,5 +1,5 @@
 """
-ATAC fragments TSV.GZ to Parquet conversion.
+ATAC fragments TSV.GZ to Parquet conversion, and back.
 """
 
 import logging
@@ -11,7 +11,7 @@ from typing import Optional, Sequence
 import duckdb
 import pyarrow as pa
 
-from .fragments import NAMED_SCHEMA, write_fragments
+from .fragments import NAMED_SCHEMA, FragmentFile, write_fragments
 
 logger = logging.getLogger(__name__)
 
@@ -222,3 +222,45 @@ def make_parquet_batch(
             results[i] = future.result()  # propagate worker exceptions
 
     return results  # type: ignore[return-value]
+
+
+def to_tsv(
+    input_path: str | Path,
+    output_path: Optional[str | Path] = None,
+    compresslevel: int = 6,
+) -> Path:
+    """
+    Convert a GATAC Parquet fragment file back to a fragments TSV.
+
+    Writes ``chrom, start, end, barcode, count`` rows in file order (the
+    order of the original ``fragments.tsv.gz``); see
+    :meth:`gatac.io.FragmentFile.to_tsv`. A ``.gz`` output is BGZF, so
+    ``tabix -p bed`` can index it.
+
+    Parameters
+    ----------
+    input_path : str or Path
+        Fragment Parquet file written by :func:`make_parquet`.
+    output_path : str or Path, optional
+        Output ``.tsv.gz`` (BGZF) or ``.tsv`` file.
+        If None, uses the input filename with a .tsv.gz extension.
+    compresslevel : int
+        zlib compression level of the BGZF blocks (default 6).
+
+    Returns
+    -------
+    Path
+        Path to the written file.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> out = ga.io.to_tsv("pbmc.parquet")  # pbmc.tsv.gz
+    """
+    input_path = Path(input_path)
+    if output_path is None:
+        output_path = input_path.with_suffix(".tsv.gz")
+    logger.info(f"Writing {input_path.name} to TSV")
+    output_path = FragmentFile(input_path).to_tsv(output_path, compresslevel=compresslevel)
+    logger.info(f"Created {Path(output_path).name}")
+    return output_path

@@ -15,6 +15,9 @@
   whole-file read of `read_fragments_parquet` (gene matrices) needs about a
   quarter of the GPU memory.
 - `make_parquet_batch` accepts one barcode prefix per input file.
+- `io.to_tsv` / `io.FragmentFile.to_tsv` write a Parquet fragment file back to
+  a `fragments.tsv.gz` in file order, BGZF-compressed (tabix-indexable);
+  `gatac convert` does the same for `.parquet` inputs.
 - GPU-accelerated TSS enrichment scoring with streaming Parquet support.
 - Tile matrix builder with SnapATAC2-compatible `"unique"` count strategy.
 - Gene activity matrix builder using paired-insertion counting.

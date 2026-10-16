@@ -173,6 +173,18 @@ def test_batch_prefixes_and_no_partial_file(data, tmp_path):
 
 
 
+def test_to_tsv_round_trip(data, tmp_path):
+    cols = list(data["df"].columns)
+    gz = ga.io.to_tsv(data["path"], tmp_path / "frags.tsv.gz")
+    plain = FragmentFile(data["path"]).to_tsv(tmp_path / "frags.tsv")
+    for out in (gz, plain):
+        got = pd.read_csv(out, sep="\t", header=None, names=cols)
+        pd.testing.assert_frame_equal(got, data["df"], check_dtype=False)
+    raw = gz.read_bytes()
+    assert gzip.decompress(raw) == plain.read_bytes()
+    assert raw[12:14] == b"BC" and raw.endswith(bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000"))
+    assert ga.io.make_parquet(gz, tmp_path / "again.parquet").exists()
+
 def test_read_fragments_parquet_categoricals(data):
     got = ga.io.read_fragments_parquet(data["path"]).to_pandas()
     assert got["chrom"].dtype == "category" and got["barcode"].dtype == "category"

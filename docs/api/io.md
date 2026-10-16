@@ -1,7 +1,7 @@
 # Fragment I/O — `gatac.io`
 
 The `gatac.io` namespace converts raw fragment TSV.GZ files to GATAC's Parquet
-fragment format and reads them back. Every GATAC function that reads fragments
+fragment format, reads them back, and converts them back to TSV. Every GATAC function that reads fragments
 goes through `FragmentFile`; the format itself is described
 [below](#parquet-fragment-format).
 
@@ -14,6 +14,7 @@ goes through `FragmentFile`; the format itself is described
 
    make_parquet
    make_parquet_batch
+   to_tsv
    FragmentFile
    read_fragments_parquet
 ```
@@ -130,7 +131,11 @@ con.sql("SELECT barcode, count(*) AS n FROM fragments GROUP BY barcode")
 ```
 
 `FragmentFile(path).iter_arrow()` streams Arrow tables with the same
-columns. Without GATAC, any Parquet reader gets the ids and the tables:
+columns, and {func}`gatac.io.to_tsv` writes the fragments back to a
+`fragments.tsv.gz` in file order, BGZF-compressed so `tabix` can index it.
+Barcodes keep any prefix added at conversion.
+
+Without GATAC, any Parquet reader gets the ids and the tables:
 
 ```python
 import json

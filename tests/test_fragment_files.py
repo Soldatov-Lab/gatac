@@ -269,6 +269,21 @@ def test_gene_matrices_run(data, fn):
     assert set(res.obs_names) <= set(data["df"]["barcode"])
 
 
+@pytest.mark.parametrize("fn", ["gene", "genescore"])
+def test_gene_matrices_barcode_only_metrics(data, fn):
+    # A metrics table with only barcodes selects those cells; the fragment
+    # counts are computed from the file
+    import cudf
+    make = ga.pp.make_gene_matrix if fn == "gene" else ga.pp.make_gene_score_matrix
+    cells = _cells(data, 40)
+    sel = make(data["path"], data["gtf"], metrics=cudf.DataFrame({"barcode": cells}),
+               min_fragments_per_cell=50)
+    full = make(data["path"], data["gtf"], min_fragments_per_cell=50)
+    assert set(sel.obs_names) == set(cells)
+    ref = full[sel.obs_names, sel.var_names]
+    assert (sp.csr_matrix(sel.X) != sp.csr_matrix(ref.X)).nnz == 0
+
+
 def _cells_adata(data):
     import anndata as ad
     cells = _cells(data, 80)

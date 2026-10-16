@@ -229,7 +229,7 @@ def _binomial_test_gpu(
     return p_values, log2_fc, mean_fg, mean_bg, mean_diff
 
 
-def marker_peaks(
+def markers(
     adata,
     groupby: str,
     groups: Optional[Union[str, Sequence[str]]] = None,
@@ -315,13 +315,13 @@ def marker_peaks(
     --------
     >>> import gatac as ga
     >>> # Find marker peaks for all clusters
-    >>> results = ga.tl.marker_peaks(adata, groupby="cluster")
+    >>> results = ga.peak.markers(adata, groupby="cluster")
     >>>
     >>> # Get top markers for a specific cluster
     >>> cd8_markers = results["CD8_T"].filter(pl.col("fdr") < 0.05).head(100)
     >>>
     >>> # For more sensitive detection (more hits), increase max_cells:
-    >>> results = ga.tl.marker_peaks(adata, groupby="cluster", max_cells=1000, min_log2_fc=0.5)
+    >>> results = ga.peak.markers(adata, groupby="cluster", max_cells=1000, min_log2_fc=0.5)
     """
     logger.info(f"Running marker peak detection for groups in '{groupby}'")
     
@@ -478,7 +478,7 @@ def marker_peaks(
     return {k: v.to_pandas() for k, v in results.items()}
 
 
-def get_marker_peaks(
+def get_markers(
     adata,
     key: str = "marker_peaks",
     group: Optional[str] = None,
@@ -496,7 +496,7 @@ def get_marker_peaks(
     adata : AnnData
         Annotated data with marker peak results in uns.
     key : str
-        Key in adata.uns containing results from marker_peaks.
+        Key in adata.uns containing results from markers.
     group : str, optional
         Specific group to extract. If None, return all groups.
     fdr_threshold : float
@@ -515,13 +515,13 @@ def get_marker_peaks(
     --------
     >>> import gatac as ga
     >>> # All groups at once
-    >>> markers_by_group = ga.tl.get_marker_peaks(adata, fdr_threshold=0.05)
+    >>> markers_by_group = ga.peak.get_markers(adata, fdr_threshold=0.05)
     >>> # A single group's top peaks
-    >>> top_peak_names = ga.tl.get_marker_peaks(adata, group="CD8_T", fdr_threshold=0.05, n_peaks=100)
+    >>> top_peak_names = ga.peak.get_markers(adata, group="CD8_T", fdr_threshold=0.05, n_peaks=100)
     """
 
     if key not in adata.uns:
-        raise KeyError(f"'{key}' not found in adata.uns. Run marker_peaks first.")
+        raise KeyError(f"'{key}' not found in adata.uns. Run markers first.")
     
     results_dict = adata.uns[key]["results"]
     

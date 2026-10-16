@@ -30,17 +30,15 @@ import re
 from pathlib import Path
 from typing import Optional, Union, List
 
-import cudf
 import cupy as cp
-import duckdb
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import scipy.stats as stats
 import statsmodels.api as sm
 
 from .._cupy_compat import bincount
 from ._utils import cleanup_gpu_memory
+from ..io.fragments import FragmentFile
 from .genome import get_chrom_sizes
 
 logger = logging.getLogger(__name__)
@@ -228,26 +226,12 @@ def _load_fragments(
     dict of cp.ndarray: chrom (int32 index into ``chromosomes``),
     cell (int32 index into ``barcodes``), start, end (uint32).
     """
-    n_row_groups = pq.ParquetFile(fragment_path).metadata.num_row_groups
-    chrom_table = cudf.DataFrame({
-        "chrom": chromosomes,
-        "chrom_idx": cp.arange(len(chromosomes), dtype=cp.int32),
-    })
-    barcode_table = cudf.DataFrame({
-        "barcode": barcodes,
-        "cell": cp.arange(len(barcodes), dtype=cp.int32),
-    })
-
     parts = {"chrom": [], "cell": [], "start": [], "end": []}
-    for i in range(0, n_row_groups, _ROW_GROUPS_PER_BATCH):
-        df = cudf.read_parquet(
-            fragment_path,
-            columns=["chrom", "start", "end", "barcode"],
-            row_groups=list(range(i, min(i + _ROW_GROUPS_PER_BATCH, n_row_groups))),
-        )
+    for df in FragmentFile(fragment_path).iter_batches(
+        ["chrom", "start", "end"], _ROW_GROUPS_PER_BATCH, chroms=chromosomes, cells=barcodes,
+    ):
         df = df[(df["end"] - df["start"]) <= max_insert_size]
-        df = df.merge(chrom_table, on="chrom").merge(barcode_table, on="barcode")
-        parts["chrom"].append(df["chrom_idx"].values)
+        parts["chrom"].append(df["chrom"].values)
         parts["cell"].append(df["cell"].values)
         parts["start"].append(df["start"].values)
         parts["end"].append(df["end"].values)
@@ -496,21 +480,16 @@ def detect_doublets(
 
     if barcodes is None:
         logger.info(f"Auto-detecting barcodes with >={min_fragments} fragments")
-        con = duckdb.connect()
-        chrom_values = ", ".join(f"'{c}'" for c in chrom_sizes.keys())
-        rows = con.execute(f"""
-            SELECT barcode, COUNT(*) AS n_frag
-            FROM read_parquet('{fragment_path}')
-            WHERE chrom IN ({chrom_values})
-            GROUP BY barcode
-            HAVING COUNT(*) >= {min_fragments}
-        """).fetchall()
-        con.close()
-        barcodes = [r[0] for r in rows]
+        counts = FragmentFile(fragment_path).barcode_counts(chroms=list(chrom_sizes.keys()))
+        barcodes = counts.loc[counts["n_unique"] >= min_fragments, "barcode"].tolist()
         logger.info(f"Found {len(barcodes):,} candidate cells")
 
     if len(barcodes) == 0:
         raise ValueError("No barcodes provided or no cells pass min_fragments threshold")
+    n_given = len(barcodes)
+    barcodes = list(dict.fromkeys(barcodes))
+    if len(barcodes) < n_given:
+        logger.warning(f"Dropped {n_given - len(barcodes):,} duplicate barcode(s)")
 
     cell_ids = np.asarray(barcodes)
     region, cell, n_regions, n_overlaps = _find_overlaps(

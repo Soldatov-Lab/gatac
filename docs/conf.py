@@ -73,6 +73,7 @@ napoleon_include_init_with_doc = False
 napoleon_use_rtype = True
 napoleon_use_param = True
 napoleon_preprocess_types = True
+napoleon_use_ivar = True
 
 # Autodoc settings
 autodoc_default_options = {
@@ -123,6 +124,7 @@ exclude_patterns = [
     "Thumbs.db",
     ".DS_Store",
     ".ipynb_checkpoints",
+    "notebooks/README.md",  # the gatac-notebooks repo readme
 ]
 
 # -- Options for HTML output -------------------------------------------------
@@ -151,3 +153,23 @@ source_suffix = {
     ".md": "myst-nb",
     ".ipynb": "myst-nb",
 }
+
+
+# The tutorials live in the gatac-notebooks submodule and enter the docs
+# through the docs/notebooks symlink. MyST resolves a notebook's link to a
+# sibling notebook through the symlink's real path, outside the source tree,
+# and names the target by that absolute path; map it back to its docname.
+_NOTEBOOKS = str((Path(__file__).parent / "notebooks").resolve()) + "/"
+
+
+def _relink_notebooks(app, doctree):
+    from sphinx.addnodes import pending_xref
+
+    for node in doctree.findall(pending_xref):
+        target = node.get("reftarget", "")
+        if node.get("reftype") == "myst" and target.startswith(_NOTEBOOKS):
+            node["reftarget"] = "notebooks/" + target[len(_NOTEBOOKS):]
+
+
+def setup(app):
+    app.connect("doctree-read", _relink_notebooks)

@@ -77,7 +77,7 @@ gatac combine sample1.h5ad sample2.h5ad -o combined.h5ad
 import gatac as ga
 
 # Convert to parquet
-ga.pp.make_parquet("fragments.tsv.gz")
+ga.io.make_parquet("fragments.tsv.gz")
 
 # Compute metrics (Streaming Polars GPU)
 metrics = ga.pp.compute_metrics("fragments.parquet", "annotations.gtf")

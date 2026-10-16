@@ -1,5 +1,5 @@
 """
-The batched GPU logistic fitter behind ``motif_enrichment_regression`` agrees
+The batched GPU logistic fitter behind ``enrichment_regression`` agrees
 with an independent maximum-likelihood fit.
 
 Self-contained — synthetic design, no genome or motif scan — so it guards the
@@ -15,7 +15,7 @@ import pytest
 cp = pytest.importorskip("cupy")
 sm = pytest.importorskip("statsmodels.api")
 
-from gatac.tl.motif import _design_products, _fit_logistic_batch  # noqa: E402
+from gatac.motif.motif import _design_products, _fit_logistic_batch  # noqa: E402
 
 
 def _synthetic(n: int = 4000, n_cov: int = 5, n_motifs: int = 6, seed: int = 0):

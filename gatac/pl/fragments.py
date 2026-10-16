@@ -26,7 +26,7 @@ def fragment_size_distribution(
     Parameters
     ----------
     parquet_path:
-        Path to the Parquet fragment file produced by :func:`gatac.pp.make_parquet`.
+        Path to the Parquet fragment file produced by :func:`gatac.io.make_parquet`.
     max_size:
         Upper bound on fragment size (bp) to include in the histogram.
     bins:

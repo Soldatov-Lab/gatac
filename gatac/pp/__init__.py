@@ -1,5 +1,4 @@
-from .convert import make_parquet, make_parquet_batch
-from .process import read_fragments_parquet, combine
+from .process import combine
 from .tile import make_tile_matrix
 from .gene import make_gene_matrix
 from .genescore import make_gene_score_matrix
@@ -20,12 +19,9 @@ MM10 = _MM10
 MM39 = _MM39
 
 __all__ = [
-    "make_parquet",
-    "make_parquet_batch",
     "make_tile_matrix",
     "make_gene_matrix",
     "make_gene_score_matrix",
-    "read_fragments_parquet",
     "select_features",
     "select_features_multi",
     "combine",

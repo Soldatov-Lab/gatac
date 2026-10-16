@@ -3,6 +3,7 @@ GATAC Command Line Interface.
 
 Usage:
     gatac convert <input.tsv.gz> [output.parquet]
+    gatac convert <input.parquet> [output.tsv.gz]
     gatac tile <input.parquet|input.h5ad|input.h5> [-o output] [-t tile_size] [-m min_frags]
     gatac gene <input.parquet> -g <annotations.gtf> [-o output]
     gatac features <input.h5ad> [-n n_features] [-o output]
@@ -30,7 +31,7 @@ def setup_logging(verbose: bool = False):
 def convert_command(args):
     """Handle 'gatac convert' subcommand."""
     import glob
-    from .pp.convert import make_parquet, make_parquet_batch
+    from .io.convert import make_parquet, make_parquet_batch, to_tsv
 
     # Expand inputs - support glob patterns
     input_paths = []
@@ -52,6 +53,32 @@ def convert_command(args):
     if len(input_paths) == 0:
         logging.error("No input files found")
         sys.exit(1)
+
+    # Parquet inputs are written back to fragments TSV
+    is_parquet = [p.suffix == '.parquet' for p in input_paths]
+    if any(is_parquet):
+        if not all(is_parquet):
+            logging.error("Inputs mix .parquet and TSV files; convert one direction at a time")
+            sys.exit(1)
+        if args.barcode_prefix:
+            logging.error("--barcode-prefix applies to TSV inputs only")
+            sys.exit(1)
+        if args.output and len(input_paths) > 1:
+            logging.error("Use --output-dir instead of --output when converting multiple files")
+            sys.exit(1)
+        for p in input_paths:
+            if args.output:
+                output_path = Path(args.output)
+            elif args.output_dir:
+                Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+                output_path = Path(args.output_dir) / p.with_suffix('.tsv.gz').name
+            else:
+                output_path = p.with_suffix('.tsv.gz')
+            if output_path.exists() and not args.overwrite:
+                logging.error(f"{output_path} exists; use --output or --overwrite")
+                sys.exit(1)
+            to_tsv(p, output_path, overwrite=args.overwrite)
+        return
 
     if len(input_paths) == 1:
         if args.output_dir:
@@ -454,21 +481,22 @@ def main():
     # Convert subcommand
     convert_parser = subparsers.add_parser(
         'convert',
-        help='Convert ATAC fragments TSV.GZ to Parquet',
+        help='Convert ATAC fragments TSV.GZ to Parquet, or Parquet back to TSV.GZ',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     convert_parser.add_argument(
         'input',
         nargs='+',
-        help='Input .tsv.gz file(s) or glob pattern (e.g. "samples/*.tsv.gz")'
+        help='Input .tsv.gz file(s) or glob pattern (e.g. "samples/*.tsv.gz"); '
+             '.parquet inputs are written back to .tsv.gz'
     )
     convert_parser.add_argument(
         '-o', '--output',
-        help='Output .parquet file (single-file mode only)'
+        help='Output .parquet file, or .tsv.gz / .tsv for a .parquet input (single-file mode only)'
     )
     convert_parser.add_argument(
         '--output-dir',
-        help='Output directory for Parquet files (multi-file mode)'
+        help='Output directory (multi-file mode)'
     )
     convert_parser.add_argument(
         '-j', '--workers',
@@ -479,6 +507,11 @@ def main():
     convert_parser.add_argument(
         '--barcode-prefix',
         help='Prefix to add to barcodes'
+    )
+    convert_parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Replace existing .tsv.gz / .tsv outputs of .parquet inputs'
     )
     convert_parser.set_defaults(func=convert_command)
 

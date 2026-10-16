@@ -21,8 +21,9 @@ import cupy as cp
 import cupyx.scipy.sparse as cusp
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import scipy.sparse as sp
+
+from ..io.fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
 
@@ -63,20 +64,38 @@ def _process_batch_on_gpu(
     """
     # Merge chrom → tile_offset (also filters to known chroms)
     batch_df = batch_df.merge(chrom_offset_df, on='chrom', how='inner')
-
-    # Extract CuPy arrays — avoids cuDF arithmetic overhead
-    cell_idx = batch_df['cell_idx'].values
-    start = batch_df['start'].values
-    end = batch_df['end'].values.astype(cp.int32)
-    tile_offset = batch_df['tile_offset'].values
-    n = len(cell_idx)
-
-    if count_strategy == 'unique':
-        count = cp.ones(n, dtype=cp.uint8)
-    else:  # 'count'
-        count = batch_df['count'].values
-
+    count = None if count_strategy == 'unique' else batch_df['count'].values
+    rows, cols, data = _tile_counts_gpu(
+        batch_df['cell_idx'].values,
+        batch_df['tile_offset'].values,
+        batch_df['start'].values,
+        batch_df['end'].values,
+        count,
+        tile_size,
+    )
     del batch_df
+    return rows, cols, data
+
+
+def _tile_counts_gpu(
+    cell_idx: cp.ndarray,
+    tile_offset: cp.ndarray,
+    start: cp.ndarray,
+    end: cp.ndarray,
+    count: Optional[cp.ndarray],
+    tile_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per (cell, tile) insertion counts for one batch of fragments.
+
+    ``tile_offset`` is the global index of the first tile of each fragment's
+    chromosome. ``count`` None counts each fragment once (``"unique"``).
+    Returns the COO components on the host.
+    """
+    end = end.astype(cp.int32)
+    n = len(cell_idx)
+    if count is None:
+        count = cp.ones(n, dtype=cp.uint8)
 
     # Global tile indices for the two insertion sites
     tile_s = (tile_offset + start // tile_size).astype(cp.int32)
@@ -880,21 +899,14 @@ def make_tile_matrix(
     )
 
     # ------------------------------------------------------------------ #
-    # 3. Parquet metadata for streaming                                    #
+    # 3. Fragment file                                                     #
     # ------------------------------------------------------------------ #
-    meta = pq.read_metadata(str(input_path))
-    n_row_groups = meta.num_row_groups
-
-    def _rg_batches():
-        for i in range(0, n_row_groups, row_groups_per_batch):
-            yield list(range(i, min(i + row_groups_per_batch, n_row_groups)))
+    fragments = FragmentFile(input_path)
 
     # ------------------------------------------------------------------ #
     # 4. Count barcodes with DuckDB (fast CPU scan, no GPU memory)         #
     # ------------------------------------------------------------------ #
-    import duckdb
-    chrom_values = ", ".join(f"'{c}'" for c in all_chroms)
-    con = duckdb.connect()
+    barcode_counts = fragments.barcode_counts(chroms=all_chroms)[['barcode', 'n_unique']]
 
     if metrics is not None:
         if isinstance(metrics, cudf.DataFrame):
@@ -913,41 +925,18 @@ def make_tile_matrix(
                 cell_metadata_input = cell_metadata_input.query(filter_query)
             cell_meta_extra = cell_metadata_input.to_pandas()
             cell_meta_extra['barcode'] = cell_meta_extra['barcode'].astype(str)
-            candidate_barcodes = cell_meta_extra['barcode'].tolist()
             del cell_metadata_input
 
-            # Register candidate barcodes for DuckDB join
-            candidate_df = pd.DataFrame({'barcode': candidate_barcodes})
-            con.register('candidate_bc', candidate_df)
-            barcode_counts = con.execute(f"""
-                SELECT f.barcode, COUNT(*) as n_unique
-                FROM read_parquet('{str(input_path)}') f
-                INNER JOIN candidate_bc c ON f.barcode = c.barcode
-                WHERE f.chrom IN ({chrom_values})
-                GROUP BY f.barcode
-                HAVING COUNT(*) >= {int(min_fragments_per_cell)}
-            """).fetchdf()
+            # Restrict to candidate barcodes
+            barcode_counts = barcode_counts[
+                barcode_counts['barcode'].isin(set(cell_meta_extra['barcode']))
+            ]
         else:
             cell_meta_extra = None
-            barcode_counts = con.execute(f"""
-                SELECT barcode, COUNT(*) as n_unique
-                FROM read_parquet('{str(input_path)}')
-                WHERE chrom IN ({chrom_values})
-                GROUP BY barcode
-                HAVING COUNT(*) >= {int(min_fragments_per_cell)}
-            """).fetchdf()
     else:
         cell_meta_extra = None
-        barcode_counts = con.execute(f"""
-            SELECT barcode, COUNT(*) as n_unique
-            FROM read_parquet('{str(input_path)}')
-            WHERE chrom IN ({chrom_values})
-            GROUP BY barcode
-            HAVING COUNT(*) >= {int(min_fragments_per_cell)}
-        """).fetchdf()
 
-    con.close()
-
+    barcode_counts = barcode_counts[barcode_counts['n_unique'] >= int(min_fragments_per_cell)]
     valid_barcodes = sorted(barcode_counts['barcode'].values)
     n_unique_map = dict(zip(barcode_counts['barcode'], barcode_counts['n_unique']))
     n_cells = len(valid_barcodes)
@@ -955,39 +944,38 @@ def make_tile_matrix(
         raise ValueError("No cells passed the min_fragments_per_cell filter.")
     logger.debug(f"Retained {n_cells:,} cells")
 
-    # GPU lookup: barcode → cell_idx
-    barcode_idx_df = cudf.DataFrame({
-        'barcode': valid_barcodes,
-        'cell_idx': np.arange(n_cells, dtype=np.int32),
-    })
-
     # ------------------------------------------------------------------ #
     # 5. Stream row groups: build tile COO                                 #
     # ------------------------------------------------------------------ #
     effective_strategy = (
         'unique' if count_strategy == 'binarize' else count_strategy
     )
+    # Tile offset of each included chromosome (built in `included_chroms` order)
+    tile_offsets = chrom_offset_df['tile_offset'].values
 
     host_rows: list[np.ndarray] = []
     host_cols: list[np.ndarray] = []
     host_data: list[np.ndarray] = []
 
-    frag_columns = ['chrom', 'start', 'end', 'barcode', 'count']
+    frag_columns = ['chrom', 'start', 'end']
+    if effective_strategy == 'count':
+        frag_columns.append('count')
 
-    for rg in _rg_batches():
-        batch = cudf.read_parquet(
-            str(input_path), row_groups=rg, columns=frag_columns,
-        )
-
-        # Inner merge: keeps only valid barcodes AND adds cell_idx
-        batch = batch.merge(barcode_idx_df, on='barcode', how='inner')
+    for batch in fragments.iter_batches(
+        frag_columns, row_groups_per_batch, chroms=included_chroms, cells=valid_barcodes,
+    ):
         if len(batch) == 0:
             del batch
             _cleanup_gpu()
             continue
 
-        rows, cols, data = _process_batch_on_gpu(
-            batch, tile_size, chrom_offset_df, effective_strategy,
+        rows, cols, data = _tile_counts_gpu(
+            batch['cell'].values,
+            tile_offsets[batch['chrom'].values],
+            batch['start'].values,
+            batch['end'].values,
+            batch['count'].values if effective_strategy == 'count' else None,
+            tile_size,
         )
         del batch
         _cleanup_gpu()

@@ -24,51 +24,6 @@ from .genome import HG38, HG19, MM10, MM39  # For type checking if needed in oth
 logger = logging.getLogger(__name__)
 
 # Predefined dtypes to minimize memory footprint
-FRAGMENT_DTYPES = {
-    'chrom': 'category',
-    'start': 'uint32',
-    'end': 'uint32',
-    'barcode': 'category',
-    'count': 'uint16'
-}
-
-def read_fragments_parquet(
-    input_path: str | Path,
-    low_memory: bool = True,
-    columns: Optional[List[str]] = None,
-) -> cudf.DataFrame:
-    """
-    Read ATAC fragments from Parquet file optimized for GPU memory.
-
-    Note: Parquet files contain intrinsic schema metadata. This function
-    expects the file to contain columns matching FRAGMENT_DTYPES keys:
-    ['chrom', 'start', 'end', 'barcode', 'count'].
-
-    Examples
-    --------
-    >>> import gatac as ga
-    >>> df = ga.pp.read_fragments_parquet("pbmc.parquet")
-    >>> df.columns.tolist()
-    ['chrom', 'start', 'end', 'barcode', 'count']
-    """
-
-    if columns is None:
-        columns = list(FRAGMENT_DTYPES.keys())
-        
-    with cudf.option_context("io.parquet.low_memory", low_memory):
-        df = cudf.read_parquet(str(input_path), columns=columns)
-        
-        # Ensure dtypes match our expectation to save memory
-        for col, dtype in FRAGMENT_DTYPES.items():
-            if col in df.columns and df[col].dtype != dtype:
-                df[col] = df[col].astype(dtype)
-                
-    return df
-
-
-
-
-
 def combine(
     input_paths: list[str | Path],
     output_path: str | Path,

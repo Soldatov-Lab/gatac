@@ -60,7 +60,7 @@ __all__ = ["spectral"]
 # CUDA kernels – avoid materialising O(nnz) index arrays
 #
 # _scale_rows_kernel, _row_norms_sq_kernel, _launch_1d, _to_gpu_csr and
-# _PinnedChunk now live in gatac.tl._gpu, shared with gatac.tl.lsi.
+# _PinnedChunk now live in gatac.dr._gpu, shared with gatac.dr.lsi.
 # ---------------------------------------------------------------------------
 
 _idf_l2_normalize_kernel = cp.RawKernel(
@@ -438,7 +438,7 @@ def spectral(
     computation runs on the GPU via CuPy, using a matrix-free approach
     that never materializes the N × N similarity matrix.
 
-    This is a GPU-accelerated port of SnapATAC2's ``tl.spectral``.
+    This is a GPU-accelerated port of SnapATAC2's ``dr.spectral``.
 
     Parameters
     ----------
@@ -510,13 +510,13 @@ def spectral(
     >>> import gatac
     >>> # After tile matrix creation and feature selection:
     >>> gatac.pp.select_features(adata)
-    >>> gatac.tl.spectral(adata)
+    >>> gatac.dr.spectral(adata)
     >>> adata.obsm["X_spectral"].shape
     (n_cells, n_effective_comps)
 
     For large datasets that cause GPU OOM:
 
-    >>> gatac.tl.spectral(adata, chunk_size=30_000)
+    >>> gatac.dr.spectral(adata, chunk_size=30_000)
     """
     logger.info("Running GPU-accelerated spectral embedding ...")
 

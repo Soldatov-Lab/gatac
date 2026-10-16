@@ -17,7 +17,9 @@
 - `make_parquet_batch` accepts one barcode prefix per input file.
 - `io.to_tsv` / `io.FragmentFile.to_tsv` write a Parquet fragment file back to
   a `fragments.tsv.gz` in file order, BGZF-compressed (tabix-indexable);
-  `gatac convert` does the same for `.parquet` inputs.
+  `gatac convert` does the same for `.parquet` inputs. An existing output,
+  such as the original fragments file, is only replaced with
+  `overwrite=True` / `--overwrite`.
 - GPU-accelerated TSS enrichment scoring with streaming Parquet support.
 - Tile matrix builder with SnapATAC2-compatible `"unique"` count strategy.
 - Gene activity matrix builder using paired-insertion counting.
@@ -58,6 +60,14 @@
 
 ### Changed
 
+- Fragment Parquet files written before this format are no longer read: every
+  fragment reader raises "not a GATAC fragment file" on them. Convert the
+  original `fragments.tsv.gz` again with `make_parquet` / `gatac convert`.
+- `make_parquet` and `gatac convert` no longer take `chroms` (a fixed
+  chromosome id order): ids follow the order of first appearance in each
+  file, and readers map them to names through the file's own chromosome list.
+- `detect_doublets` drops duplicate entries in `barcodes`, with a warning;
+  each barcode used to be scored once per occurrence.
 - Fragment file I/O moved to a new `gatac.io` namespace: `make_parquet`,
   `make_parquet_batch`, `FragmentFile` and `read_fragments_parquet` are no
   longer in `gatac.pp`.

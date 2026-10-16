@@ -1,9 +1,10 @@
-"""bincount workaround for the CuPy 14 CUB histogram crash."""
+"""bincount workaround for the CuPy 14 CUB histogram crash, and the chunked host -> device copy."""
 import cupy as cp
 import numpy as np
 import pytest
 
-from gatac._cupy_compat import bincount
+import gatac._cupy_compat as compat
+from gatac._cupy_compat import bincount, to_device
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.int64])
@@ -24,3 +25,26 @@ def test_bincount_edge_cases():
         bincount(cp.asarray([-1, 2]))
     with pytest.raises(TypeError):
         bincount(cp.asarray([1.0]))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int16, np.int64, np.bool_])
+def test_to_device_matches_asarray(dtype, monkeypatch):
+    # a small chunk size exercises the chunked path, including a partial last chunk
+    monkeypatch.setattr(compat, "_H2D_CHUNK", 1000)
+    rng = np.random.default_rng(1)
+    for shape in [(0,), (7,), (12_345,), (301, 7)]:
+        h = (rng.random(shape) * 1000).astype(dtype)
+        d = to_device(h)
+        assert d.dtype == h.dtype and d.shape == h.shape
+        assert np.array_equal(d.get(), h)
+
+
+def test_to_device_views_casts_and_device_input(monkeypatch):
+    monkeypatch.setattr(compat, "_H2D_CHUNK", 1000)
+    h = np.arange(20_000, dtype=np.int32).reshape(200, 100)
+    assert np.array_equal(to_device(h[:, ::3]).get(), h[:, ::3])        # non-contiguous view
+    d = to_device(h, cp.int64)
+    assert d.dtype == cp.int64 and np.array_equal(d.get(), h)
+    x = cp.arange(5)
+    assert to_device(x) is x
+    assert to_device(x, cp.float32).dtype == cp.float32

@@ -1,11 +1,11 @@
 """
-The standard and compact fragment layouts are interchangeable.
+Compact fragment files and legacy ones are interchangeable.
 
-``make_parquet(layout="compact")`` stores chromosomes and barcodes as integer
-ids with the barcode table inside the file. Everything that reads fragments
-goes through ``FragmentFile``, so every function must return the same result
-from either layout, and from a file written by the former DuckDB writer
-(Snappy, no delta encoding). Synthetic data, GPU required.
+``make_parquet`` stores chromosomes and barcodes as integer ids with the
+barcode table inside the file. Everything that reads fragments goes through
+``FragmentFile``, so every function must return the same result from a
+compact file and from a legacy file written by the former DuckDB writer
+(names in every row, Snappy, no delta encoding). Synthetic data, GPU required.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import gatac as ga  # noqa: E402
 from gatac.pp.fragments import FragmentFile  # noqa: E402
 
 CHROM_SIZES = {"chr1": 3_000_000, "chr2": 2_500_000, "chr3": 2_000_000, "chrX": 1_500_000}
-LAYOUTS = ["standard", "compact", "legacy"]
+LAYOUTS = ["compact", "legacy"]
 
 
 def _fragments(seed: int = 0) -> pd.DataFrame:
@@ -59,9 +59,8 @@ def data(tmp_path_factory):
         fh.write("# header comment\n")
         df.to_csv(fh, sep="\t", header=False, index=False)
     paths = {
-        "standard": ga.pp.make_parquet(tsv, d / "standard.parquet", barcode_prefix="S1_", row_group_size=9_000),
         "compact": ga.pp.make_parquet(tsv, d / "compact.parquet", barcode_prefix="S1_", row_group_size=9_000,
-                                      layout="compact", chroms=["chr1", "chr2"]),
+                                      chroms=["chr1", "chr2"]),
         "legacy": d / "legacy.parquet",
     }
     # The former writer: DuckDB COPY, Snappy, no delta encoding
@@ -94,7 +93,7 @@ def _cells(data, n=60):
 
 def test_round_trip_keeps_rows_order_and_names(data):
     expected = data["df"]
-    for layout in ("standard", "compact"):
+    for layout in LAYOUTS:
         got = pa.concat_tables(FragmentFile(data["paths"][layout]).iter_arrow()).to_pandas()
         for c in expected.columns:
             assert np.array_equal(got[c].to_numpy().astype(str), expected[c].to_numpy().astype(str)), (layout, c)
@@ -142,11 +141,12 @@ def test_iter_batches_agree(data):
         pd.testing.assert_frame_equal(df, out[0], check_dtype=False)
 
 
-def test_repack_and_guard(data):
+def test_repack_legacy_and_guard(data):
     d = data["dir"]
-    back = ga.pp.make_parquet(data["paths"]["compact"], d / "back.parquet")
-    a = pa.concat_tables(FragmentFile(back).iter_arrow())
-    b = pa.concat_tables(FragmentFile(data["paths"]["standard"]).iter_arrow())
+    out = FragmentFile(ga.pp.make_parquet(data["paths"]["legacy"], d / "repacked.parquet"))
+    assert out.compact
+    a = pa.concat_tables(out.iter_arrow())
+    b = pa.concat_tables(FragmentFile(data["paths"]["compact"]).iter_arrow())
     assert a.equals(b)
     with pytest.raises(ValueError):
         ga.pp.make_parquet(data["paths"]["compact"], data["paths"]["compact"])
@@ -154,7 +154,7 @@ def test_repack_and_guard(data):
 
 def test_repack_compact_keeps_ids(data):
     src = FragmentFile(data["paths"]["compact"])
-    out = FragmentFile(ga.pp.make_parquet(src.path, data["dir"] / "recompact.parquet", layout="compact"))
+    out = FragmentFile(ga.pp.make_parquet(src.path, data["dir"] / "recompact.parquet"))
     assert out.chroms == src.chroms
     assert list(out.barcodes) == list(src.barcodes)
 
@@ -167,7 +167,7 @@ def test_empty_selection_yields_nothing(data):
 
 
 def test_batch_prefixes_and_no_partial_file(data, tmp_path):
-    src = data["paths"]["standard"]
+    src = data["paths"]["legacy"]
     outs = ga.pp.make_parquet_batch([src, src.with_name("compact.parquet")], output_dir=tmp_path / "out",
                                     barcode_prefix=["A_", "B_"], workers=2)
     for out, prefix in zip(outs, ["A_", "B_"]):
@@ -175,8 +175,7 @@ def test_batch_prefixes_and_no_partial_file(data, tmp_path):
     bad = pd.DataFrame({"barcode": ["not-in-file"], "n_unique": [1], "n_total": [1]})
     target = tmp_path / "bad.parquet"
     with pytest.raises(ValueError):
-        ga.pp.fragments.write_fragments(lambda: FragmentFile(src).iter_arrow(), target,
-                                        layout="compact", barcode_stats=bad)
+        ga.pp.fragments.write_fragments(lambda: FragmentFile(src).iter_arrow(), target, barcode_stats=bad)
     assert not target.exists() and not list(tmp_path.glob("bad.parquet*"))
 
 
@@ -230,20 +229,19 @@ def test_doublets_agree(data):
         pd.testing.assert_frame_equal(r, res[0], check_dtype=False)
 
 
-def test_filter_keeps_layout_and_agrees(data):
+def test_filter_writes_compact_and_agrees(data):
     d = data["dir"]
     tables = []
     for layout in LAYOUTS:
         out = ga.pp.filter_fragments(data["paths"][layout], d / f"filtered_{layout}.parquet",
                                      min_fragments_per_cell=200, chrom_sizes=CHROM_SIZES)
         ff = FragmentFile(out)
-        assert ff.compact == (layout == "compact")
+        assert ff.compact
         t = pa.concat_tables(ff.iter_arrow()).to_pandas()
         tables.append(t)
-        if ff.compact:
-            # The barcode table describes the filtered fragments
-            counts = ff.barcode_counts().set_index("barcode")["n_unique"].sort_index()
-            assert counts.equals(t.groupby("barcode").size().sort_index().rename("n_unique"))
+        # The barcode table describes the filtered fragments
+        counts = ff.barcode_counts().set_index("barcode")["n_unique"].sort_index()
+        assert counts.equals(t.groupby("barcode").size().sort_index().rename("n_unique"))
     ref = data["df"]
     kept = ref[ref["chrom"].isin(CHROM_SIZES)]
     n = kept.groupby("barcode").size()

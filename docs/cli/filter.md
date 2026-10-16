@@ -2,8 +2,8 @@
 
 Filter an ATAC-seq fragment Parquet file by barcode quality thresholds.
 Accepts pre-computed metrics and a Polars query string for flexible filtering.
-Output is written as a new Parquet file, streamed in batches, in the same
-layout as the input (standard or compact; see `gatac convert`).
+Output is written as a new Parquet file, streamed in batches, in the compact
+layout (see `gatac convert`), also when the input is a legacy file.
 
 ---
 

@@ -23,23 +23,26 @@ def make_parquet(
     separator: str = '\t',
     barcode_prefix: Optional[str] = None,
     row_group_size: int = 1_000_000,
-    layout: str = "standard",
     chroms: Optional[Sequence[str]] = None,
 ) -> Path:
     """
     Convert ATAC fragments to GATAC Parquet, or repack a GATAC Parquet file.
 
-    TSV input is parsed by DuckDB and streamed to the Parquet writer, so
-    files larger than RAM are fine. Both layouts are written with ZSTD and
-    delta-encoded coordinates (about 2.4x smaller than the former Snappy
-    files), keeping the input row order.
+    Fragments are stored in the compact layout: chromosome and barcode ids,
+    with an in-file barcode table (full original names, fragment and read
+    counts per barcode); see :class:`gatac.pp.FragmentFile`. Files are
+    written with ZSTD and delta-encoded coordinates, keeping the input row
+    order, about 2.6x smaller than the fragments.tsv.gz. TSV input is parsed
+    by DuckDB and streamed to the Parquet writer, so files larger than RAM
+    are fine.
 
     Parameters
     ----------
     input_path : str or Path
         A .tsv.gz / .bed.gz (or uncompressed) fragment file with columns
         chrom, start, end, barcode, count, or an existing GATAC .parquet
-        fragment file of either layout to repack.
+        fragment file to repack (e.g. a legacy file from an earlier GATAC
+        version).
     output_path : str or Path, optional
         Path for output .parquet file.
         If None, uses input filename with .parquet extension.
@@ -53,16 +56,10 @@ def make_parquet(
         via cudf.read_parquet(row_groups=...).  The default is tuned for
         the gatac batch size of 64 row groups (~64 M rows/batch fits
         comfortably on a 12 GB GPU).
-    layout : {'standard', 'compact'}
-        ``'standard'`` (default) stores chromosome and barcode names in
-        every row. ``'compact'`` stores integer ids plus an in-file barcode
-        table (full original names, fragment and read counts per barcode);
-        it streams several times faster on the GPU and reads back the same
-        names. See :class:`gatac.pp.FragmentFile`.
     chroms : list of str, optional
-        Compact layout only: chromosome order for the ids. Pass the same
-        list for every library of a cohort so ids agree across files.
-        Default: order of first appearance.
+        Chromosome order for the ids. Pass the same list for every library
+        of a cohort so ids agree across files. Default: the ids of a compact
+        input file, else order of first appearance.
 
     Returns
     -------
@@ -75,9 +72,8 @@ def make_parquet(
     >>> out = ga.pp.make_parquet("pbmc.tsv.gz")
     >>> # Or with a sample-specific barcode prefix
     >>> out = ga.pp.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1#")
-    >>> # Compact layout, or repack an existing Parquet file to it
-    >>> out = ga.pp.make_parquet("pbmc.tsv.gz", layout="compact")
-    >>> out = ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet", layout="compact")
+    >>> # Repack a Parquet file written by an earlier GATAC version
+    >>> out = ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet")
     """
     input_path = Path(input_path)
     if output_path is None:
@@ -87,9 +83,8 @@ def make_parquet(
     if output_path.resolve() == input_path.resolve():
         raise ValueError(f"output_path must differ from the input: {output_path}")
 
-    logger.info(f"Converting {input_path.name} to Parquet ({layout} layout)")
+    logger.info(f"Converting {input_path.name} to Parquet")
 
-    barcode_stats = None
     if input_path.suffix == '.parquet':
         source = FragmentFile(input_path)
 
@@ -100,12 +95,11 @@ def make_parquet(
                         pa.scalar(barcode_prefix), t['barcode'], ''))
                 yield t
 
-        if layout == "compact":
-            barcode_stats = source.barcode_counts()[['barcode', 'n_unique', 'n_total']]
-            if chroms is None and source.compact:
-                chroms = source.chroms  # keep the source's chromosome ids
-            if barcode_prefix:
-                barcode_stats['barcode'] = barcode_prefix + barcode_stats['barcode']
+        barcode_stats = source.barcode_counts()[['barcode', 'n_unique', 'n_total']]
+        if chroms is None and source.compact:
+            chroms = source.chroms  # keep the source's chromosome ids
+        if barcode_prefix:
+            barcode_stats['barcode'] = barcode_prefix + barcode_stats['barcode']
     else:
         if barcode_prefix:
             barcode_expr = f"'{barcode_prefix}' || column3"
@@ -137,15 +131,14 @@ def make_parquet(
             finally:
                 con.close()
 
-        if layout == "compact":
-            with duckdb.connect() as con:
-                barcode_stats = con.execute(f"""
-                    SELECT barcode, count(*)::BIGINT AS n_unique, sum(count)::BIGINT AS n_total
-                    FROM ({query}) GROUP BY barcode
-                """).fetchdf()
+        with duckdb.connect() as con:
+            barcode_stats = con.execute(f"""
+                SELECT barcode, count(*)::BIGINT AS n_unique, sum(count)::BIGINT AS n_total
+                FROM ({query}) GROUP BY barcode
+            """).fetchdf()
 
     write_fragments(
-        batches, output_path, layout=layout, chroms=chroms,
+        batches, output_path, chroms=chroms,
         row_group_size=row_group_size, barcode_stats=barcode_stats,
     )
 
@@ -160,7 +153,6 @@ def make_parquet_batch(
     separator: str = '\t',
     barcode_prefix: Optional[str | Sequence[str]] = None,
     row_group_size: int = 1_000_000,
-    layout: str = "standard",
     chroms: Optional[Sequence[str]] = None,
 ) -> list[Path]:
     """
@@ -186,10 +178,8 @@ def make_parquet_batch(
         per input file.
     row_group_size : int
         Row-group size forwarded to :func:`make_parquet`.
-    layout : {'standard', 'compact'}
-        Layout forwarded to :func:`make_parquet`.
     chroms : list of str, optional
-        Chromosome order forwarded to :func:`make_parquet` (compact layout).
+        Chromosome order forwarded to :func:`make_parquet`.
 
     Returns
     -------
@@ -254,7 +244,6 @@ def make_parquet_batch(
                 separator,
                 prefix,
                 row_group_size,
-                layout,
                 chroms,
             ): i
             for i, (inp, out, prefix) in enumerate(zip(input_paths, output_paths, prefixes))

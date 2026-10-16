@@ -1,13 +1,9 @@
 """
-Fragment Parquet files: the standard and compact layouts, one reader for both,
-and the streaming writer behind :func:`gatac.pp.make_parquet`.
+Fragment Parquet files: the compact layout written by GATAC, the reader, and
+the streaming writer behind :func:`gatac.pp.make_parquet`.
 
-Standard layout, one row per fragment::
-
-    chrom (string)  start (uint32)  end (uint32)  barcode (string)  count (uint16)
-
-Compact layout: chromosomes and barcodes are integer ids, and the lookup tables
-travel inside the same file::
+Chromosomes and barcodes are integer ids, and the lookup tables travel inside
+the same file::
 
     chrom_id (uint16)  start (uint32)  end (uint32)  barcode_id (uint32)  count (uint16)
     bc_name (string)   bc_n_unique (uint32)          bc_n_total (uint32)
@@ -18,11 +14,16 @@ and its read count) and they are null after the last barcode. Barcode ids are
 ordered by decreasing fragment count. Chromosome names are in the footer
 (``gatac.chroms``), indexed by ``chrom_id``.
 
-Both layouts are sorted like the input fragments and written with ZSTD and
-delta-encoded coordinates. Reading a compact file never builds a string column
-on the GPU: barcodes and chromosomes are joined by integer lookups instead of
-string merges, which is where most of the time of the fragment-streaming
-functions went on deep libraries.
+Files keep the order of the input fragments and are written with ZSTD and
+delta-encoded coordinates. Reading them never builds a string column on the
+GPU: barcodes and chromosomes are joined by integer lookups instead of string
+merges, which is where most of the time of the fragment-streaming functions
+went on deep libraries.
+
+Files written by earlier GATAC versions (the legacy layout: one row per
+fragment with ``chrom``, ``start``, ``end``, ``barcode``, ``count`` as names)
+are still read, through slower string merges. :func:`gatac.pp.make_parquet`
+repacks them to the compact layout.
 """
 from __future__ import annotations
 
@@ -43,7 +44,6 @@ import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
-LAYOUTS = ("standard", "compact")
 COMPACT_VERSION = "1"
 STANDARD_COLUMNS = ("chrom", "start", "end", "barcode", "count")
 
@@ -71,11 +71,12 @@ _COMPACT_NAME = {"chrom": "chrom_id", "barcode": "barcode_id"}
 
 class FragmentFile:
     """
-    A GATAC fragment Parquet file, in the standard or the compact layout.
+    A GATAC fragment Parquet file: compact, or legacy (names in every row,
+    written by earlier GATAC versions).
 
     Every GATAC function that reads fragments goes through this class, so
-    both layouts work everywhere. The compact layout is faster to stream
-    because chromosomes and barcodes come back as integers.
+    legacy files still work everywhere, only slower: compact files stream
+    chromosomes and barcodes as integers.
 
     Parameters
     ----------
@@ -86,7 +87,7 @@ class FragmentFile:
     ----------
     path : Path
     compact : bool
-        True for the compact layout.
+        True for the compact layout, False for a legacy file.
     num_row_groups : int
 
     Examples
@@ -134,8 +135,8 @@ class FragmentFile:
 
     @property
     def layout(self) -> str:
-        """``'compact'`` or ``'standard'``."""
-        return "compact" if self.compact else "standard"
+        """``'compact'`` or ``'legacy'``."""
+        return "compact" if self.compact else "legacy"
 
     @property
     def num_row_groups(self) -> int:
@@ -150,8 +151,8 @@ class FragmentFile:
     def chroms(self) -> List[str]:
         """
         Chromosome names. For the compact layout, ``chrom_id`` indexes this
-        list. For the standard layout it is computed with one scan of the
-        file, in order of first appearance.
+        list. For a legacy file it is computed with one scan of the file, in
+        order of first appearance.
         """
         if self._chroms is None:
             rows = duckdb.connect().execute(f"""
@@ -166,8 +167,8 @@ class FragmentFile:
         """
         Barcode names as an object array indexed by barcode id. For the
         compact layout this is the stored barcode table (ids by decreasing
-        fragment count); for the standard layout the ids are the sorted
-        distinct barcodes, computed with one scan of the file.
+        fragment count); for a legacy file the ids are the sorted distinct
+        barcodes, computed with one scan of the file.
         """
         if self._barcodes is None:
             if self.compact:
@@ -363,7 +364,7 @@ class FragmentFile:
                 yield batch(rgs)
             return
 
-        # Standard layout: the same result through string merges.
+        # Legacy layout: the same result through string merges.
         chrom_table = cell_table = barcode_table = None
         if need_chrom:
             names = list(chroms) if chroms is not None else self.chroms
@@ -523,76 +524,48 @@ def _categorical_from_ids(ids: cp.ndarray, names: np.ndarray) -> cudf.Series:
 def write_fragments(
     batches: Callable[[], Iterator[pa.Table]],
     output_path: Union[str, Path],
-    layout: str = "standard",
     chroms: Optional[Sequence[str]] = None,
     row_group_size: int = 1_000_000,
     barcode_stats: Optional[pd.DataFrame] = None,
 ) -> Path:
     """
-    Write fragments to Parquet in either layout.
+    Write fragments to a compact Parquet file.
 
     Parameters
     ----------
     batches : callable
         Returns a fresh iterator of Arrow tables with the standard columns,
-        in the order to write. Called twice for the compact layout (once to
-        count fragments per barcode, unless ``barcode_stats`` is given).
+        in the order to write. Called twice unless ``barcode_stats`` is given
+        (once to count fragments per barcode).
     output_path : str or Path
-    layout : {'standard', 'compact'}
     chroms : list of str, optional
-        Compact only: chromosome order for ``chrom_id``. Chromosomes of the
+        Chromosome order for ``chrom_id``. Chromosomes of the
         data missing from the list are appended in order of first
         appearance. Give the same list to every library of a cohort to
         share ids. Default: order of first appearance.
     row_group_size : int
         Rows per Parquet row group (default 1,000,000).
     barcode_stats : pd.DataFrame, optional
-        Compact only: ``barcode``, ``n_unique``, ``n_total`` of the data
+        ``barcode``, ``n_unique``, ``n_total`` of the data
         being written, to skip the counting pass.
 
     Returns
     -------
     Path
     """
-    if layout not in LAYOUTS:
-        raise ValueError(f"layout must be one of {LAYOUTS}, got {layout!r}")
     output_path = Path(output_path)
     # Write next to the target and rename on success: no partial file on error
     tmp_path = output_path.with_name(output_path.name + ".tmp")
     try:
-        _write_fragments(batches, tmp_path, layout, chroms, row_group_size, barcode_stats)
+        _write_fragments(batches, tmp_path, chroms, row_group_size, barcode_stats)
         os.replace(tmp_path, output_path)
     finally:
         tmp_path.unlink(missing_ok=True)
     return output_path
 
 
-def _write_fragments(batches, output_path, layout, chroms, row_group_size, barcode_stats) -> None:
+def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats) -> None:
     """Body of :func:`write_fragments`, writing to ``output_path`` directly."""
-    # Data page v1: cuDF's chunked (low_memory) reader fails on v2 data pages
-    common = dict(
-        compression="zstd",
-        write_page_index=True,
-        dictionary_pagesize_limit=64 << 20,
-    )
-
-    if layout == "standard":
-        if chroms is not None:
-            logger.warning("`chroms` only applies to the compact layout; ignored")
-        writer = pq.ParquetWriter(
-            output_path, STANDARD_SCHEMA,
-            use_dictionary=["chrom", "barcode", "count"],
-            column_encoding={"start": "DELTA_BINARY_PACKED", "end": "DELTA_BINARY_PACKED"},
-            **common,
-        )
-        n = 0
-        with writer:
-            for chunk in _fixed_size_chunks(batches(), row_group_size):
-                writer.write_table(chunk.cast(STANDARD_SCHEMA), row_group_size=row_group_size)
-                n += chunk.num_rows
-        logger.debug(f"Wrote {n:,} fragments (standard layout)")
-        return
-
     if barcode_stats is None:
         barcode_stats = _count_barcodes(batches())
     stats = barcode_stats.sort_values(["n_unique", "barcode"], ascending=[False, True], kind="stable")
@@ -611,7 +584,10 @@ def _write_fragments(batches, output_path, layout, chroms, row_group_size, barco
         column_encoding={"start": "DELTA_BINARY_PACKED", "end": "DELTA_BINARY_PACKED",
                          "bc_name": "DELTA_BYTE_ARRAY", "bc_n_unique": "DELTA_BINARY_PACKED",
                          "bc_n_total": "DELTA_BINARY_PACKED"},
-        **common,
+        # Data page v1: cuDF's chunked (low_memory) reader fails on v2 data pages
+        compression="zstd",
+        write_page_index=True,
+        dictionary_pagesize_limit=64 << 20,
     )
     n = 0
     with writer:
@@ -639,7 +615,7 @@ def _write_fragments(batches, output_path, layout, chroms, row_group_size, barco
         if n < n_bc:
             raise ValueError("The barcode statistics list barcodes that have no fragment")
         if len(chrom_list) > 65535:
-            raise ValueError("More than 65,535 chromosomes; use layout='standard'")
+            raise ValueError("More than 65,535 chromosomes are not supported (chrom_id is uint16)")
         if chroms is not None and len(chrom_list) > n_given:
             logger.warning(
                 f"{len(chrom_list) - n_given} chromosome(s) not in `chroms` were appended: "
@@ -651,7 +627,7 @@ def _write_fragments(batches, output_path, layout, chroms, row_group_size, barco
             "gatac.chroms": json.dumps(chrom_list),
             "gatac.n_barcodes": str(n_bc),
         })
-    logger.debug(f"Wrote {n:,} fragments, {n_bc:,} barcodes (compact layout)")
+    logger.debug(f"Wrote {n:,} fragments, {n_bc:,} barcodes")
 
 
 def _encode(values: pa.ChunkedArray, pos: dict, names: list) -> np.ndarray:

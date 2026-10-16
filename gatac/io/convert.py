@@ -28,7 +28,7 @@ def make_parquet(
 
     Chromosomes and barcodes are stored as integer ids, with an in-file
     barcode table (full original names, fragment and read counts per
-    barcode); see :class:`gatac.pp.FragmentFile`. Files are written with
+    barcode); see :class:`gatac.io.FragmentFile`. Files are written with
     ZSTD and delta-encoded coordinates, keeping the input row order. The
     TSV is parsed by DuckDB and streamed to the Parquet writer, so files
     larger than RAM are fine.
@@ -60,9 +60,9 @@ def make_parquet(
     Examples
     --------
     >>> import gatac as ga
-    >>> out = ga.pp.make_parquet("pbmc.tsv.gz")
+    >>> out = ga.io.make_parquet("pbmc.tsv.gz")
     >>> # Or with a sample-specific barcode prefix
-    >>> out = ga.pp.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1#")
+    >>> out = ga.io.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1#")
     """
     input_path = Path(input_path)
     if output_path is None:
@@ -166,12 +166,12 @@ def make_parquet_batch(
     --------
     >>> import gatac as ga
     >>> # Convert multiple samples in parallel
-    >>> paths = ga.pp.make_parquet_batch(
+    >>> paths = ga.io.make_parquet_batch(
     ...     ["sampleA.tsv.gz", "sampleB.tsv.gz"],
     ...     output_dir="parquet/",
     ... )
     >>> # With per-sample barcode prefixes (must match input order)
-    >>> paths = ga.pp.make_parquet_batch(
+    >>> paths = ga.io.make_parquet_batch(
     ...     ["sampleA.tsv.gz", "sampleB.tsv.gz"],
     ...     barcode_prefix=["A_", "B_"],
     ... )

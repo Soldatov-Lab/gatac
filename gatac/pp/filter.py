@@ -14,7 +14,7 @@ import cupy as cp
 import pandas as pd
 
 from ._utils import cleanup_gpu_memory
-from .fragments import FragmentFile, write_fragments
+from ..io.fragments import FragmentFile, write_fragments
 
 logger = logging.getLogger(__name__)
 

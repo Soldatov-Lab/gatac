@@ -1,6 +1,6 @@
 """
 GATAC fragment Parquet files: the layout, the reader, and the streaming
-writer behind :func:`gatac.pp.make_parquet`.
+writer behind :func:`gatac.io.make_parquet`.
 
 Chromosomes and barcodes are integer ids, and the lookup tables travel inside
 the same file::
@@ -66,7 +66,7 @@ _STORED_NAME = {"chrom": "chrom_id", "barcode": "barcode_id"}
 
 class FragmentFile:
     """
-    A GATAC fragment Parquet file, as written by :func:`gatac.pp.make_parquet`.
+    A GATAC fragment Parquet file, as written by :func:`gatac.io.make_parquet`.
 
     Every GATAC function that reads fragments goes through this class. It
     streams chromosomes and barcodes as integer ids and decodes them to
@@ -75,7 +75,7 @@ class FragmentFile:
     Parameters
     ----------
     path : str or Path
-        Fragment Parquet file written by :func:`gatac.pp.make_parquet`.
+        Fragment Parquet file written by :func:`gatac.io.make_parquet`.
 
     Attributes
     ----------
@@ -89,7 +89,7 @@ class FragmentFile:
     Examples
     --------
     >>> import gatac as ga
-    >>> ff = ga.pp.FragmentFile("pbmc.parquet")
+    >>> ff = ga.io.FragmentFile("pbmc.parquet")
     >>> counts = ff.barcode_counts()          # barcode, n_unique, n_total
     >>> for batch in ff.iter_batches(["chrom", "start", "end"],
     ...                              chroms=["chr1", "chr2"],
@@ -105,7 +105,7 @@ class FragmentFile:
         if b"gatac.format_version" not in kv:
             raise ValueError(
                 f"{self.path.name} is not a GATAC fragment file; convert the "
-                "fragments.tsv.gz with gatac.pp.make_parquet"
+                "fragments.tsv.gz with gatac.io.make_parquet"
             )
         version = kv[b"gatac.format_version"].decode()
         if version != FORMAT_VERSION:
@@ -379,6 +379,50 @@ class FragmentFile:
                 barcode_names.take(b.column("barcode_id")),
                 b.column("count"),
             ], schema=NAMED_SCHEMA)
+
+
+
+FRAGMENT_DTYPES = {
+    'chrom': 'category',
+    'start': 'uint32',
+    'end': 'uint32',
+    'barcode': 'category',
+    'count': 'uint16'
+}
+
+
+def read_fragments_parquet(
+    input_path: str | Path,
+    low_memory: bool = True,
+    columns: Optional[List[str]] = None,
+) -> cudf.DataFrame:
+    """
+    Read ATAC fragments from Parquet file optimized for GPU memory.
+
+    Returns the columns of FRAGMENT_DTYPES:
+    ['chrom', 'start', 'end', 'barcode', 'count'], with ``chrom`` and
+    ``barcode`` as categoricals built from the stored integer ids (see
+    :class:`gatac.io.FragmentFile`).
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> df = ga.io.read_fragments_parquet("pbmc.parquet")
+    >>> df.columns.tolist()
+    ['chrom', 'start', 'end', 'barcode', 'count']
+    """
+
+    if columns is None:
+        columns = list(FRAGMENT_DTYPES.keys())
+
+    df = FragmentFile(input_path).read_categorical(columns, low_memory=low_memory)
+
+    # Ensure dtypes match our expectation to save memory
+    for col, dtype in FRAGMENT_DTYPES.items():
+        if col in df.columns and df[col].dtype != dtype:
+            df[col] = df[col].astype(dtype)
+
+    return df
 
 
 def _empty_counts(with_mito: bool) -> pd.DataFrame:

@@ -25,7 +25,7 @@ import pyarrow.parquet as pq  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
 import gatac as ga  # noqa: E402
-from gatac.pp.fragments import FragmentFile  # noqa: E402
+from gatac.io.fragments import FragmentFile  # noqa: E402
 
 CHROM_SIZES = {"chr1": 3_000_000, "chr2": 2_500_000, "chr3": 2_000_000, "chrX": 1_500_000}
 
@@ -59,7 +59,7 @@ def data(tmp_path_factory):
     with gzip.open(tsv, "wt") as fh:
         fh.write("# header comment\n")
         df.to_csv(fh, sep="\t", header=False, index=False)
-    path = ga.pp.make_parquet(tsv, d / "frags.parquet", barcode_prefix="S1_", row_group_size=9_000)
+    path = ga.io.make_parquet(tsv, d / "frags.parquet", barcode_prefix="S1_", row_group_size=9_000)
     df["barcode"] = "S1_" + df["barcode"]
     gtf = d / "genes.gtf"
     rows = []
@@ -160,20 +160,21 @@ def test_rejects_other_parquet(data, tmp_path):
 def test_batch_prefixes_and_no_partial_file(data, tmp_path):
     tsv_b = tmp_path / "other.tsv.gz"
     shutil.copy(data["tsv"], tsv_b)
-    outs = ga.pp.make_parquet_batch([data["tsv"], tsv_b], output_dir=tmp_path / "out",
+    outs = ga.io.make_parquet_batch([data["tsv"], tsv_b], output_dir=tmp_path / "out",
                                     barcode_prefix=["A_", "B_"], workers=2)
     for out, prefix in zip(outs, ["A_", "B_"]):
         assert all(b.startswith(prefix) for b in FragmentFile(out).barcode_counts()["barcode"])
     bad = pd.DataFrame({"barcode": ["not-in-file"], "n_unique": [1], "n_total": [1]})
     target = tmp_path / "bad.parquet"
     with pytest.raises(ValueError):
-        ga.pp.fragments.write_fragments(lambda: FragmentFile(data["path"]).iter_arrow(), target,
+        ga.io.fragments.write_fragments(lambda: FragmentFile(data["path"]).iter_arrow(), target,
                                         barcode_stats=bad)
     assert not target.exists() and not list(tmp_path.glob("bad.parquet*"))
 
 
+
 def test_read_fragments_parquet_categoricals(data):
-    got = ga.pp.read_fragments_parquet(data["path"]).to_pandas()
+    got = ga.io.read_fragments_parquet(data["path"]).to_pandas()
     assert got["chrom"].dtype == "category" and got["barcode"].dtype == "category"
     df = data["df"]
     assert list(got["chrom"].cat.categories) == sorted(df["chrom"].unique())

@@ -30,7 +30,7 @@ def setup_logging(verbose: bool = False):
 def convert_command(args):
     """Handle 'gatac convert' subcommand."""
     import glob
-    from .pp.convert import make_parquet, make_parquet_batch
+    from .io.convert import make_parquet, make_parquet_batch
 
     # Expand inputs - support glob patterns
     input_paths = []

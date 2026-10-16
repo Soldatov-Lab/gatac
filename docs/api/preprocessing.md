@@ -1,38 +1,8 @@
 # Preprocessing — `gatac.pp`
 
-The `gatac.pp` namespace covers the full preprocessing pipeline: reading raw
-fragment files, computing quality metrics, filtering barcodes, and building
-count matrices.
-
----
-
-## Fragment I/O
-
-Convert raw fragment TSV.GZ files to columnar Parquet for efficient GPU
-streaming.  Parquet preserves row-group structure so GATAC can process files
-larger than GPU memory.
-
-Chromosomes and barcodes are stored as integer ids, with the barcode table
-(original names, fragment and read counts per barcode) inside the same file
-and the chromosome names in the file footer. Every function that reads
-fragments goes through `FragmentFile` and joins cells and chromosomes by
-integer lookups instead of string merges, which makes fragment streaming
-several times faster on deep libraries and the whole-file reads of the gene
-matrices need a fraction of the GPU memory. See
-[Parquet fragment format](../fragment_files.md).
-
-```{eval-rst}
-.. currentmodule:: gatac.pp
-
-.. autosummary::
-   :toctree: generated/
-   :nosignatures:
-
-   make_parquet
-   make_parquet_batch
-   FragmentFile
-   read_fragments_parquet
-```
+The `gatac.pp` namespace covers the preprocessing pipeline: computing quality
+metrics, filtering barcodes, and building count matrices from the fragment
+files written by [`gatac.io`](io.md).
 
 ---
 
@@ -45,6 +15,8 @@ accepts a pre-computed metrics DataFrame or CSV and a Polars query string;
 `detect_doublets` returns per-cell p/q values and an `is_doublet` flag.
 
 ```{eval-rst}
+.. currentmodule:: gatac.pp
+
 .. autosummary::
    :toctree: generated/
    :nosignatures:

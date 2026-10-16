@@ -21,7 +21,7 @@ from cupyx.scipy.ndimage import maximum_filter1d
 from cupyx.scipy.special import pdtr, pdtrc
 from numba import njit, prange
 
-from ..pp.fragments import FragmentFile
+from ..io.fragments import FragmentFile
 from ..pp.genome import get_chrom_sizes
 from ..pp.gene import optimize_sparse_matrix_dtype
 

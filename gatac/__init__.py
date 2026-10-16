@@ -2,6 +2,7 @@
 GATAC - GPU-accelerated ATAC-seq processing toolkit.
 
 Public API:
+    - io: Fragment files (reading, writing, conversion)
     - pp: Preprocessing functions
     - tl: Tools (analysis functions)
 """
@@ -15,12 +16,13 @@ import sys
 if not sys.stderr.isatty():
     os.environ.setdefault("TQDM_DISABLE", "1")
 
+from . import io
 from . import pp
 from . import tl
 from . import pl
 
 __version__ = "0.1.0"
-__all__ = ["pp", "tl", "pl", "set_verbosity"]
+__all__ = ["io", "pp", "tl", "pl", "set_verbosity"]
 
 # ---------------------------------------------------------------------------
 # Package-level logging

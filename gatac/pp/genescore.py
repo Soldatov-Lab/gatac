@@ -603,7 +603,7 @@ def make_gene_score_matrix(
     -------
     AnnData of shape ``(cells, genes)`` with normalised gene scores.
     """
-    from .process import read_fragments_parquet
+    from ..io.fragments import read_fragments_parquet
     import scanpy as sc
 
     input_parquet = Path(input_parquet)

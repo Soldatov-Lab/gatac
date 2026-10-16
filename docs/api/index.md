@@ -1,26 +1,35 @@
 # API Reference
 
-GATAC's Python API is organized into two namespaces that mirror the
-preprocessing → analysis workflow.
+GATAC's Python API is organized into three namespaces that mirror the
+fragment files → preprocessing → analysis workflow.
 
 ```{toctree}
 :maxdepth: 2
 :hidden:
 
+io
 preprocessing
 tools
 ```
 
-::::{grid} 1 1 2 2
+::::{grid} 1 1 3 3
 :gutter: 2
+
+:::{grid-item-card} {fas}`file-import` Fragment I/O — `gatac.io`
+:link: io
+:link-type: doc
+:shadow: none
+
+Convert fragment TSV.GZ files to Parquet and read them back.
+:::
 
 :::{grid-item-card} {fas}`cogs` Preprocessing — `gatac.pp`
 :link: preprocessing
 :link-type: doc
 :shadow: none
 
-Fragment I/O, tile/gene matrix construction, QC metrics, filtering, and
-feature selection.
+Tile/gene matrix construction, QC metrics, filtering, and feature
+selection.
 :::
 
 :::{grid-item-card} {fas}`chart-line` Tools — `gatac.tl`
@@ -41,10 +50,11 @@ chromVAR, and GSEA.
 ```python
 import gatac as ga
 
-# ── Preprocessing ─────────────────────────────────────────────────────────
+# ── Fragment I/O ──────────────────────────────────────────────────────────
 # 1. Convert fragment TSV → Parquet
-ga.pp.make_parquet("sample.tsv.gz")
+ga.io.make_parquet("sample.tsv.gz")
 
+# ── Preprocessing ─────────────────────────────────────────────────────────
 # 2. Compute QC metrics
 metrics = ga.pp.compute_metrics("sample.parquet", "GRCh38.gtf.gz")
 

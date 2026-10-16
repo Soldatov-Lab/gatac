@@ -5,7 +5,6 @@
 
 installation
 tutorials/index
-fragment_files
 changelog
 contributing
 ```

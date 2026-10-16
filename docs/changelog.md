@@ -7,7 +7,7 @@
 - Parquet fragment format written by `make_parquet` / `gatac convert`:
   chromosome and barcode ids with the barcode table (original names, fragment
   and read counts) inside the file, ZSTD and delta-encoded coordinates. All
-  fragment readers go through the new `pp.FragmentFile` and join cells and
+  fragment readers go through the new `io.FragmentFile` and join cells and
   chromosomes by integer lookups.
   On a 484M-fragment library (RTX 5070): `compute_metrics` 51 s -> 9 s,
   `detect_doublets` 56 s -> 13 s, `make_peak_matrix` 14 s -> 6 s,
@@ -55,6 +55,9 @@
 
 ### Changed
 
+- Fragment file I/O moved to a new `gatac.io` namespace: `make_parquet`,
+  `make_parquet_batch`, `FragmentFile` and `read_fragments_parquet` are no
+  longer in `gatac.pp`.
 - Preranked GSEA now scores the running enrichment score at hit positions only
   instead of running a length-N cumulative sum per permutation. The extrema of
   the running score are pinned to hit positions, so this is an exact rewrite,

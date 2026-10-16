@@ -23,7 +23,7 @@ into GPU memory with zero CPU round-trips — enabling aggregation over datasets
 that far exceed available GPU RAM.
 
 +++
-```{button-link} fragment_files.html
+```{button-link} api/io.html#parquet-fragment-format
 :color: primary
 :outline:
 Inside the Parquet file
@@ -66,7 +66,7 @@ View Tutorials
 Convert raw TSV.GZ fragment files to columnar Parquet for fast GPU streaming,
 with optional barcode prefixing for multi-sample projects.
 
-<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/preprocessing.html#fragment-i-o">→ API: pp</a> · <a href="fragment_files.html">→ File format</a>
+<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/io.html">→ API: io</a> · <a href="api/io.html#parquet-fragment-format">→ File format</a>
 :::
 
 :::{grid-item-card} {fas}`filter` Quality & Filtering

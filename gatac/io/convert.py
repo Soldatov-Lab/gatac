@@ -99,7 +99,11 @@ def make_parquet(
     def batches():
         con = duckdb.connect()
         try:
-            for b in con.execute(query).to_arrow_reader(row_group_size):
+            result = con.execute(query)
+            # to_arrow_reader is DuckDB >= 1.5; fetch_record_batch (deprecated
+            # there) is the same reader on older versions
+            reader = getattr(result, "to_arrow_reader", None) or result.fetch_record_batch
+            for b in reader(row_group_size):
                 yield pa.Table.from_batches([b]).cast(NAMED_SCHEMA)
         finally:
             con.close()
@@ -228,6 +232,7 @@ def to_tsv(
     input_path: str | Path,
     output_path: Optional[str | Path] = None,
     compresslevel: int = 6,
+    overwrite: bool = False,
 ) -> Path:
     """
     Convert a GATAC Parquet fragment file back to a fragments TSV.
@@ -246,6 +251,9 @@ def to_tsv(
         If None, uses the input filename with a .tsv.gz extension.
     compresslevel : int
         zlib compression level of the BGZF blocks (default 6).
+    overwrite : bool
+        Replace ``output_path`` if it exists (default False). With the default
+        output name this is usually the original ``fragments.tsv.gz``.
 
     Returns
     -------
@@ -261,6 +269,8 @@ def to_tsv(
     if output_path is None:
         output_path = input_path.with_suffix(".tsv.gz")
     logger.info(f"Writing {input_path.name} to TSV")
-    output_path = FragmentFile(input_path).to_tsv(output_path, compresslevel=compresslevel)
+    output_path = FragmentFile(input_path).to_tsv(
+        output_path, compresslevel=compresslevel, overwrite=overwrite
+    )
     logger.info(f"Created {Path(output_path).name}")
     return output_path

@@ -384,7 +384,12 @@ class FragmentFile:
                 b.column("count"),
             ], schema=NAMED_SCHEMA)
 
-    def to_tsv(self, output_path: Union[str, Path], compresslevel: int = 6) -> Path:
+    def to_tsv(
+        self,
+        output_path: Union[str, Path],
+        compresslevel: int = 6,
+        overwrite: bool = False,
+    ) -> Path:
         """
         Write the fragments back to a fragments TSV, in file order.
 
@@ -401,6 +406,10 @@ class FragmentFile:
             Output ``.tsv.gz`` (BGZF) or ``.tsv`` file.
         compresslevel : int
             zlib compression level of the BGZF blocks (default 6).
+        overwrite : bool
+            Replace ``output_path`` if it exists (default False). The default
+            output name of :func:`gatac.io.to_tsv` is usually the original
+            ``fragments.tsv.gz``, which this protects.
 
         Returns
         -------
@@ -415,14 +424,25 @@ class FragmentFile:
         output_path = Path(output_path)
         if output_path.resolve() == self.path.resolve():
             raise ValueError(f"output_path must differ from the input: {output_path}")
+        if output_path.exists() and not overwrite:
+            raise FileExistsError(
+                f"{output_path} exists; pass another output path or overwrite=True"
+            )
         options = pa_csv.WriteOptions(include_header=False, delimiter="\t", quoting_style="none")
-        out = (_BgzfWriter(output_path, compresslevel) if output_path.suffix == ".gz"
-               else open(output_path, "wb"))
-        with out:
-            for table in self.iter_arrow():
-                sink = pa.BufferOutputStream()
-                pa_csv.write_csv(table, sink, options)
-                out.write(sink.getvalue())
+        # Write next to the target and rename on success: an existing file is
+        # only replaced by a complete one
+        tmp_path = output_path.with_name(output_path.name + ".tmp")
+        try:
+            out = (_BgzfWriter(tmp_path, compresslevel) if output_path.suffix == ".gz"
+                   else open(tmp_path, "wb"))
+            with out:
+                for table in self.iter_arrow():
+                    sink = pa.BufferOutputStream()
+                    pa_csv.write_csv(table, sink, options)
+                    out.write(sink.getvalue())
+            os.replace(tmp_path, output_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
         return output_path
 
 

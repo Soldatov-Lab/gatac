@@ -68,13 +68,16 @@ def convert_command(args):
             sys.exit(1)
         for p in input_paths:
             if args.output:
-                output_path = args.output
+                output_path = Path(args.output)
             elif args.output_dir:
                 Path(args.output_dir).mkdir(parents=True, exist_ok=True)
                 output_path = Path(args.output_dir) / p.with_suffix('.tsv.gz').name
             else:
-                output_path = None
-            to_tsv(p, output_path)
+                output_path = p.with_suffix('.tsv.gz')
+            if output_path.exists() and not args.overwrite:
+                logging.error(f"{output_path} exists; use --output or --overwrite")
+                sys.exit(1)
+            to_tsv(p, output_path, overwrite=args.overwrite)
         return
 
     if len(input_paths) == 1:
@@ -504,6 +507,11 @@ def main():
     convert_parser.add_argument(
         '--barcode-prefix',
         help='Prefix to add to barcodes'
+    )
+    convert_parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='Replace existing .tsv.gz / .tsv outputs of .parquet inputs'
     )
     convert_parser.set_defaults(func=convert_command)
 

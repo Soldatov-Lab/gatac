@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from .._cupy_compat import to_device
 from .footprint import FootprintTracks, _fai, _region_bytes
 
 logger = logging.getLogger(__name__)
@@ -528,6 +529,27 @@ def _round5(x: np.ndarray) -> np.ndarray:
     return r
 
 
+# Elements per chunk of the host-side elementwise steps over all sites (32 MB of float64)
+_CHUNK = 1 << 22
+
+
+def _gather_dev(values: cp.ndarray, idx: cp.ndarray) -> cp.ndarray:
+    """``values[idx]`` as float64, 0 where ``idx`` is -1 (a position no track covers)."""
+    x = cp.zeros(len(idx), cp.float64)
+    ok = idx >= 0
+    x[ok] = values[idx[ok]]
+    return x
+
+
+def _log2fc(s1: np.ndarray, s2: np.ndarray, pseudo: float) -> np.ndarray:
+    """Per-site ``round(log2((s1 + pseudo) / (s2 + pseudo)), 5)``, in chunks."""
+    out = np.empty(len(s1))
+    for a in range(0, len(s1), _CHUNK):
+        b = a + _CHUNK
+        out[a:b] = np.round(np.log2((s1[a:b] + pseudo) / (s2[a:b] + pseudo)), 5)
+    return out
+
+
 def _round5_dev(x: cp.ndarray) -> cp.ndarray:
     """``_round5`` on the device: ``cp.around`` equals ``np.round`` bit for bit; the rare values
     within 1e-6 of a rounding tie take the host string path."""
@@ -690,7 +712,8 @@ def _sample_changes(n: int, bg_mean: float, bg_std: float) -> np.ndarray:
     One ``standard_normal`` stream of ``100 * n_obs`` draws equals the 100 successive calls."""
     rs = np.random.RandomState(n)
     out = np.empty(100)
-    rows = max(1, min(100, 20_000_000 // max(n, 1)))     # bound memory; the stream stays continuous
+    # bound memory (one chunk per thread of the pool); the stream stays continuous
+    rows = max(1, min(100, 2_000_000 // max(n, 1)))
     for r0 in range(0, 100, rows):
         r1 = min(100, r0 + rows)
         s = (rs.standard_normal((r1 - r0) * n) * bg_std + bg_mean).reshape(r1 - r0, n)
@@ -880,7 +903,7 @@ def bindetect_sites(
     t_scan = 0.0
     sm, sp, ss = _short_run_hits(seq, fwd + rev, ord_f + ord_r, np.concatenate([thr, thr]), n_mot)
     s_mot = sm % n_mot
-    seq_d = cp.asarray(seq)
+    seq_d = to_device(seq)
     del seq
     rstart_d, reg_s_d, reg_c_d = cp.asarray(rstart), cp.asarray(reg_s), cp.asarray(reg_c.astype(np.int32))
     hp_bits = max(1, int(ntot).bit_length())
@@ -997,8 +1020,9 @@ class BINDetectResult:
         ``{g1}_{g2}_highlighted``.
     sites : pandas.DataFrame or None
         One row per TFBS (TOBIAS ``*_overview.txt`` content for all TFs): position,
-        motif, match score, strand, peak, normalised footprint score and bound
-        call per group, log2FC per comparison.
+        motif, match score, strand, peak, and the normalised footprint score
+        (``{group}_score``) and bound call (``{group}_bound``) per group. The
+        per-site log2FC of a comparison is :meth:`site_log2fc`.
     clusters : pandas.DataFrame
         Mean of each numeric column per motif cluster (TOBIAS "Motif clusters" sheet).
     distances : pandas.DataFrame
@@ -1021,6 +1045,29 @@ class BINDetectResult:
     groups: list[str]
     comparisons: list[tuple[str, str]]
     params: dict
+
+    def site_log2fc(self, group1: str, group2: str) -> pd.Series:
+        """Per-site log2 fold change of the footprint scores, ``group1`` over ``group2``.
+
+        ``round(log2((score1 + pseudo) / (score2 + pseudo)), 5)`` on the columns of
+        :attr:`sites`, as in TOBIAS's ``*_overview.txt``. It is computed on request
+        rather than stored: one column per comparison would double the size of the
+        site table at a few groups.
+
+        Returns
+        -------
+        pandas.Series
+            Aligned with :attr:`sites`, named ``{group1}_{group2}_log2fc``.
+        """
+        if self.sites is None:
+            raise ValueError("no site table; run bindetect(..., return_sites=True)")
+        missing = [g for g in (group1, group2) if g not in self.groups]
+        if missing:
+            raise ValueError(f"groups not in this result: {missing}; groups are {self.groups}")
+        s1 = self.sites[f"{group1}_score"].to_numpy()
+        s2 = self.sites[f"{group2}_score"].to_numpy()
+        return pd.Series(_log2fc(s1, s2, self.pseudo), index=self.sites.index,
+                         name=f"{group1}_{group2}_log2fc")
 
     def __repr__(self) -> str:
         n_sites = "no sites kept" if self.sites is None else f"{len(self.sites):,} sites"
@@ -1060,21 +1107,30 @@ def _sample_changes_exact_null(n: int, bg_mean: float, bg_std: float, seed=None,
     return (mean - bg_mean) / ((std + bg_std) / 2.0)
 
 
-def _tobias_site_order(sites: SiteSet, idx: np.ndarray) -> np.ndarray:
-    """Order of sites ``idx`` (sorted by motif) by TOBIAS's groupby key "chrom_start_end" within
-    each motif: Python string order of the id, computed on the device from its characters."""
+def _tobias_site_order(sites: SiteSet, idx: Optional[np.ndarray] = None) -> np.ndarray:
+    """Order of sites ``idx`` (sorted by motif; default: all sites) by TOBIAS's groupby key
+    "chrom_start_end" within each motif: Python string order of the id, computed on the device
+    from its characters. The order indexes ``idx`` and has its smallest integer dtype."""
+    def col(a):
+        return a if idx is None else a[idx]
+
+    n = len(sites.start) if idx is None else len(idx)
+    out_t = np.int32 if n < 2**31 else np.int64
     if any("_" in c for c in sites.chroms):            # a chrom name could prefix another's id
-        key = (pl.DataFrame({"m": sites.motif[idx], "c": np.asarray(sites.chroms)[sites.chrom[idx]],
-                             "s": sites.start[idx], "e": sites.end[idx]})
+        key = (pl.DataFrame({"m": col(sites.motif), "c": np.asarray(sites.chroms)[col(sites.chrom)],
+                             "s": col(sites.start), "e": col(sites.end)})
                .with_columns(k=pl.concat_str([pl.col("c"), pl.col("s").cast(pl.String),
                                               pl.col("e").cast(pl.String)], separator="_"))
                .with_row_index("i").sort(["m", "k"], maintain_order=True))
-        return key["i"].to_numpy()
+        return key["i"].to_numpy().astype(out_t)
     # without "_" in names, "chrA_..." vs "chrB_..." is decided by chrA + "_" vs chrB + "_"
     rank = np.empty(len(sites.chroms), np.int64)
     rank[sorted(range(len(sites.chroms)), key=lambda i: sites.chroms[i] + "_")] = np.arange(len(sites.chroms))
-    hi, lo = _strkey_kernel(cp.asarray(sites.start[idx].astype(np.int64)), cp.asarray(sites.end[idx].astype(np.int64)))
-    return _stable_order(cp.asarray(sites.motif[idx]), cp.asarray(rank[sites.chrom[idx]]), hi, lo).get()
+    # columns go to the device as stored and are widened there, with no host copies
+    hi, lo = _strkey_kernel(to_device(col(sites.start)).astype(cp.int64),
+                            to_device(col(sites.end)).astype(cp.int64))
+    chrom_rank = cp.asarray(rank)[to_device(col(sites.chrom))]
+    return _stable_order(to_device(col(sites.motif)), chrom_rank, hi, lo).astype(out_t).get()
 
 
 def bindetect(
@@ -1138,7 +1194,8 @@ def bindetect(
         function). False uses the corrected behaviours and draws the same
         null from its exact sampling distribution (2 draws per replicate).
     return_sites : bool, default True
-        Return the per-site table.
+        Return the per-site table (scores and bound calls per group; the per-site
+        log2FCs come from :meth:`BINDetectResult.site_log2fc`).
     verbose : bool, default True
         Log timings.
 
@@ -1186,27 +1243,13 @@ def bindetect(
     n_mot = len(mlist)
     off = sites.motif_offsets
 
-    # ---- footprint score at each site centre and background position (uncovered = 0, a bigwig gap) ----
+    # ---- footprint score at each background position (uncovered = 0, a bigwig gap); the sites
+    # come after the normalisation, which depends on the background only ----
     t0 = time.perf_counter()
     flay = tracks.layouts["footprint"]
-    chrom_d = cp.asarray(sites.chrom)
-    mid_d = cp.asarray(sites.start).astype(cp.int64)
-    mid_d += (cp.asarray(sites.end) - cp.asarray(sites.start)) // 2
-    idx_site = _layout_index_dev(flay, sites.chroms, chrom_d, mid_d)
-    idx_bg = _layout_index_dev(flay, sites.chroms, cp.asarray(sites.bg_chrom), cp.asarray(sites.bg_pos))
-    del chrom_d, mid_d
-    site_raw, bg_raw = {}, {}
-    for g in groups:
-        v = cp.asarray(tracks.values["footprint"][g])
-        for idx, outd in ((idx_site, site_raw), (idx_bg, bg_raw)):
-            x = cp.zeros(len(idx), cp.float64)
-            ok = idx >= 0
-            x[ok] = v[idx[ok]]
-            outd[g] = x
-        site_raw[g] = _round5_dev(site_raw[g]).get()      # BINDetect writes "{:.5f}" of the bigwig value
-        bg_raw[g] = bg_raw[g].get()
-        del v
-    del idx_site, idx_bg
+    idx_bg = _layout_index_dev(flay, sites.chroms, to_device(sites.bg_chrom), to_device(sites.bg_pos))
+    bg_raw = {g: _gather_dev(to_device(tracks.values["footprint"][g]), idx_bg).get() for g in groups}
+    del idx_bg
     T["footprints"] = time.perf_counter() - t0
 
     # ---- normalisation, bound threshold, background log2FC ----
@@ -1234,15 +1277,27 @@ def bindetect(
         log2fc_params[(g1, g2)] = scipy.stats.norm.fit(l2[(l2 >= lo) & (l2 <= hi)])
     T["background"] = time.perf_counter() - t0
 
-    # ---- per-site scores (exp and log2 stay in NumPy: CUDA's differ in the last bit) ----
+    # ---- per-site scores, one group at a time (exp and log2 stay in NumPy: CUDA's differ in the
+    # last bit); the elementwise steps run in chunks, in place, to bound their temporaries ----
     t0 = time.perf_counter()
+    chrom_d = to_device(sites.chrom)
+    start_d = to_device(sites.start)
+    mid_d = start_d.astype(cp.int64)
+    mid_d += (to_device(sites.end) - start_d) // 2
+    del start_d
+    idx_site = _layout_index_dev(flay, sites.chroms, chrom_d, mid_d)
+    del chrom_d, mid_d
     cols = {}
     for g in groups:
-        v = norms[g].normalize(site_raw.pop(g))
-        cols[f"{g}_score"] = np.round(np.where(v > 0, v, 0), 5)
-        cols[f"{g}_bound"] = (cols[f"{g}_score"] > threshold).astype(np.int8)
-    for g1, g2 in comps:
-        cols[f"{g1}_{g2}_log2fc"] = np.round(np.log2((cols[f"{g1}_score"] + pseudo) / (cols[f"{g2}_score"] + pseudo)), 5)
+        # BINDetect writes "{:.5f}" of the bigwig value
+        s = _round5_dev(_gather_dev(to_device(tracks.values["footprint"][g]), idx_site)).get()
+        for a in range(0, len(s), _CHUNK):
+            v = norms[g].normalize(s[a:a + _CHUNK])
+            v[~(v > 0)] = 0                                  # np.where(v > 0, v, 0)
+            s[a:a + _CHUNK] = np.round(v, 5)
+        cols[f"{g}_score"] = s
+        cols[f"{g}_bound"] = (s > threshold).astype(np.int8)
+    del idx_site
     T["site_table"] = time.perf_counter() - t0
 
     # ---- per-TF summaries ----
@@ -1260,28 +1315,40 @@ def bindetect(
         ms[has] = [np.round(np.mean(sc[off[m]:off[m + 1]]), 5) for m in has]
         nb = np.zeros(n_mot, np.int64)
         if len(has):
-            nb[has] = np.add.reduceat(bd.astype(np.int64), off[has])
+            nb[has] = np.add.reduceat(bd, off[has], dtype=np.int64)
         res[f"{g}_mean_score"] = ms
         res[f"{g}_bound"] = nb
     sample_cache: dict[tuple, np.ndarray] = {}
     sampler = _sample_changes if tobias_compat else _sample_changes_exact_null
+    order_all = None
+    if tobias_compat and comps and len(sites.start):
+        # TOBIAS's site order within each motif is one total order for every comparison: sort all
+        # sites once and keep the included ones per comparison (the sort is stable, so this is
+        # the order of sorting them alone)
+        order_all = _tobias_site_order(sites)
     for g1, g2 in comps:
         base = f"{g1}_{g2}"
-        inc = np.flatnonzero((cols[f"{g1}_score"] > 0) | (cols[f"{g2}_score"] > 0))
-        l2 = cols[f"{base}_log2fc"]
+        s1, s2 = cols[f"{g1}_score"], cols[f"{g2}_score"]
+        included = (s1 > 0) | (s2 > 0)
+        l2 = _log2fc(s1, s2, pseudo)                     # not kept: see BINDetectResult.site_log2fc
         if tobias_compat:
             # groupby("peak_id") on "chrom_start_end" of the *TFBS*: one site per group, string order
-            ii = inc[_tobias_site_order(sites, inc)] if len(inc) else inc
+            ii = order_all[included[order_all]] if order_all is not None else np.zeros(0, np.int64)
             obs_all, mm = l2[ii], sites.motif[ii]
-        elif len(inc):
-            # mean log2FC per peak: sites of a motif in a peak are contiguous
-            key = sites.motif[inc].astype(np.int64) * (len(sites.peak_start) + 1) + sites.peak[inc]
-            seg = np.flatnonzero(np.concatenate([[True], key[1:] != key[:-1]]))
-            cnt = np.diff(np.append(seg, len(inc)))
-            obs_all = np.add.reduceat(l2[inc], seg) / cnt
-            mm = sites.motif[inc][seg]
+            del ii
         else:
-            obs_all, mm = np.zeros(0), np.zeros(0, np.int32)
+            inc = np.flatnonzero(included)
+            if len(inc):
+                # mean log2FC per peak: sites of a motif in a peak are contiguous
+                key = sites.motif[inc].astype(np.int64) * (len(sites.peak_start) + 1) + sites.peak[inc]
+                seg = np.flatnonzero(np.concatenate([[True], key[1:] != key[:-1]]))
+                cnt = np.diff(np.append(seg, len(inc)))
+                obs_all = np.add.reduceat(l2[inc], seg) / cnt
+                mm = sites.motif[inc][seg]
+            else:
+                obs_all, mm = np.zeros(0), np.zeros(0, np.int32)
+            del inc
+        del included, l2
         mb = np.concatenate([[0], np.flatnonzero(np.diff(mm)) + 1, [len(mm)]]) if len(mm) else np.array([0])
         bg_mean, bg_std = log2fc_params[(g1, g2)]
         change, n_obs = {}, {}

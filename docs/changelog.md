@@ -7,7 +7,10 @@
 - TOBIAS footprinting on the GPU in `gatac.tobias`: `footprint` (Tn5 bias
   correction and footprint scores per pseudobulk, from the fragments parquet),
   `bindetect` and `bindetect_sites` (differential TF binding), and the
-  `pl.bindetect_volcano` / `pl.footprint_aggregate` plots.
+  `pl.bindetect_volcano` / `pl.footprint_aggregate` plots. The per-site table
+  of `bindetect` keeps the footprint score and bound call per group;
+  `BINDetectResult.site_log2fc(g1, g2)` gives the per-site log2FC of a
+  comparison.
 - Parquet fragment format written by `make_parquet` / `gatac convert`:
   chromosome and barcode ids with the barcode table (original names, fragment
   and read counts) inside the file, ZSTD and delta-encoded coordinates. All
@@ -102,6 +105,16 @@
 
 ### Fixed
 
+- `tobias.bindetect` needs far less host memory: genome-wide on 5 pseudobulks
+  with the 3,935 cisBP motifs (102M binding sites) it ran out of memory on a
+  23 GB machine. Per-site scores are normalised one group at a time in chunks,
+  TOBIAS's site order is computed once for all comparisons, the per-site
+  log2FCs are no longer stored, and the null is sampled in smaller chunks.
+  On 34M sites and 5 groups the call adds 3.6 GB instead of 10.4 GB. Results
+  are unchanged.
+- Large host-to-device copies in `bindetect` and `bindetect_sites` go in
+  64 MB chunks: with the WSL2 CUDA driver, each copy of about 1 GB or more left
+  a host buffer of its size allocated for the rest of the process.
 - `make_gene_matrix` with a `metrics` table that has no `n_unique` column
   (e.g. only barcodes) kept no cells and failed with "blocks must be 2-D";
   the listed cells are now kept, with their fragment counts read from the file.

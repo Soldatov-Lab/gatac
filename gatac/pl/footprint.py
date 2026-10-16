@@ -26,7 +26,7 @@ def bindetect_volcano(res, group1=None, group2=None, label_top=5, ax=None):
     group1, group2 : str, optional
         The comparison to plot (default: the first comparison of ``res``).
     label_top : int, default 5
-        Number of highlighted motifs labelled on each side, by largest |change|.
+        Number of highlighted motifs labelled on each side, by largest ``|change|``.
     ax : matplotlib.axes.Axes, optional
         Axes to draw on.
 

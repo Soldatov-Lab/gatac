@@ -73,6 +73,7 @@ napoleon_include_init_with_doc = False
 napoleon_use_rtype = True
 napoleon_use_param = True
 napoleon_preprocess_types = True
+napoleon_use_ivar = True
 
 # Autodoc settings
 autodoc_default_options = {

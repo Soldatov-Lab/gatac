@@ -812,9 +812,10 @@ def footprint(
         merge-end quirk). False uses the corrected behaviours.
     deduplicate : bool, default True
         Keep one copy of identical fragments within a pseudobulk.
-    keep_tracks : sequence of str, default ("corrected",)
+    keep_tracks : sequence of str
         ATACorrect tracks to keep besides the footprint scores; any of
-        ``"uncorrected"``, ``"bias"``, ``"expected"``, ``"corrected"``.
+        ``"uncorrected"``, ``"bias"``, ``"expected"``, ``"corrected"``
+        (default ``("corrected",)``).
     chromosomes : sequence of str, optional
         Restrict to these chromosomes (default: chromosomes with peaks that are
         in the FASTA).

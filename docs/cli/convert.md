@@ -1,10 +1,9 @@
 # `gatac convert`
 
-Convert raw ATAC-seq fragment files from TSV.GZ to Parquet format, or repack
-an existing GATAC Parquet file.  Uses DuckDB for parallel decompression and
-Parquet row-group sizing tuned for efficient GPU streaming.  Files are written
-in the compact layout (below) with ZSTD and delta-encoded coordinates, about
-2.6x smaller than the input `fragments.tsv.gz`.
+Convert raw ATAC-seq fragment files from TSV.GZ to Parquet format.  Uses
+DuckDB for parallel decompression and Parquet row-group sizing tuned for
+efficient GPU streaming.  Files are written with ZSTD and delta-encoded
+coordinates, with chromosomes and barcodes stored as integer ids (below).
 
 ---
 
@@ -24,7 +23,7 @@ gatac convert <input> [--output OUTPUT] [--output-dir DIR]
 
 | Argument | Description |
 |----------|-------------|
-| `input` | Path (or glob pattern) to one or more TSV.GZ fragment files, or GATAC `.parquet` files to repack |
+| `input` | Path (or glob pattern) to one or more TSV.GZ fragment files |
 
 ### Options
 
@@ -54,7 +53,7 @@ Compressed with gzip (`.tsv.gz`) or uncompressed (`.tsv`) are both supported.
 
 ---
 
-## Output layout
+## Output
 
 Columns: `chrom_id`, `start`, `end`, `barcode_id`, `count`, plus the
 per-barcode table `bc_name`, `bc_n_unique`, `bc_n_total`.
@@ -66,11 +65,8 @@ names are stored in the file footer (`gatac.chroms`). GATAC joins cells and
 chromosomes by integer lookups, so these files stream several times faster on
 the GPU than names in every row. To read a file outside GATAC, use
 `gatac.pp.FragmentFile` (e.g. `FragmentFile(path).register(duckdb_con)` gives
-a DuckDB view with `chrom`, `start`, `end`, `barcode`, `count`).
-
-Parquet files written by earlier GATAC versions (names in every row) are
-still read by every function; repack them with `gatac convert` to get the
-speed-up. See [Anatomy of a GATAC Parquet file](../fragment_files.md) for how the layout works.
+a DuckDB view with `chrom`, `start`, `end`, `barcode`, `count`). See
+[Parquet fragment format](../fragment_files.md) for how the format works.
 
 ---
 
@@ -103,11 +99,10 @@ gatac convert "data/*/fragments.tsv.gz" \
 gatac convert "samples/*.tsv.gz" --output-dir out/ -j 8
 ```
 
-### Repack Parquet files from an earlier GATAC version
+### Shared chromosome ids for a cohort
 
 ```bash
-# Repack a cohort with shared chromosome ids
-gatac convert "parquets/*.parquet" --output-dir compact/ --chroms chroms.txt
+gatac convert "samples/*.tsv.gz" --output-dir parquets/ --chroms chroms.txt
 ```
 
 ---
@@ -119,9 +114,6 @@ import gatac as ga
 
 # Single file
 ga.pp.make_parquet("pbmc_fragments.tsv.gz", barcode_prefix="PBMC_")
-
-# Repack a Parquet file from an earlier GATAC version
-ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet")
 
 # Batch
 ga.pp.make_parquet_batch(

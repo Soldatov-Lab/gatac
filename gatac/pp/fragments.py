@@ -1,6 +1,6 @@
 """
-Fragment Parquet files: the compact layout written by GATAC, the reader, and
-the streaming writer behind :func:`gatac.pp.make_parquet`.
+GATAC fragment Parquet files: the layout, the reader, and the streaming
+writer behind :func:`gatac.pp.make_parquet`.
 
 Chromosomes and barcodes are integer ids, and the lookup tables travel inside
 the same file::
@@ -19,11 +19,6 @@ delta-encoded coordinates. Reading them never builds a string column on the
 GPU: barcodes and chromosomes are joined by integer lookups instead of string
 merges, which is where most of the time of the fragment-streaming functions
 went on deep libraries.
-
-Files written by earlier GATAC versions (the legacy layout: one row per
-fragment with ``chrom``, ``start``, ``end``, ``barcode``, ``count`` as names)
-are still read, through slower string merges. :func:`gatac.pp.make_parquet`
-repacks them to the compact layout.
 """
 from __future__ import annotations
 
@@ -44,17 +39,17 @@ import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
-COMPACT_VERSION = "1"
-STANDARD_COLUMNS = ("chrom", "start", "end", "barcode", "count")
+FORMAT_VERSION = "1"
+FRAGMENT_COLUMNS = ("chrom", "start", "end", "barcode", "count")
 
-STANDARD_SCHEMA = pa.schema([
+NAMED_SCHEMA = pa.schema([
     ("chrom", pa.string()),
     ("start", pa.uint32()),
     ("end", pa.uint32()),
     ("barcode", pa.string()),
     ("count", pa.uint16()),
 ])
-COMPACT_SCHEMA = pa.schema([
+FILE_SCHEMA = pa.schema([
     ("chrom_id", pa.uint16()),
     ("start", pa.uint32()),
     ("end", pa.uint32()),
@@ -65,18 +60,17 @@ COMPACT_SCHEMA = pa.schema([
     ("bc_n_total", pa.uint32()),
 ])
 
-# Fragment columns read from each layout for a requested logical column
-_COMPACT_NAME = {"chrom": "chrom_id", "barcode": "barcode_id"}
+# Stored column behind each logical fragment column
+_STORED_NAME = {"chrom": "chrom_id", "barcode": "barcode_id"}
 
 
 class FragmentFile:
     """
-    A GATAC fragment Parquet file: compact, or legacy (names in every row,
-    written by earlier GATAC versions).
+    A GATAC fragment Parquet file, as written by :func:`gatac.pp.make_parquet`.
 
-    Every GATAC function that reads fragments goes through this class, so
-    legacy files still work everywhere, only slower: compact files stream
-    chromosomes and barcodes as integers.
+    Every GATAC function that reads fragments goes through this class. It
+    streams chromosomes and barcodes as integer ids and decodes them to
+    names when asked.
 
     Parameters
     ----------
@@ -86,16 +80,16 @@ class FragmentFile:
     Attributes
     ----------
     path : Path
-    compact : bool
-        True for the compact layout, False for a legacy file.
+    chroms : list of str
+        Chromosome names, indexed by ``chrom_id``.
+    n_barcodes : int
+        Number of barcodes (rows of the barcode table).
     num_row_groups : int
 
     Examples
     --------
     >>> import gatac as ga
     >>> ff = ga.pp.FragmentFile("pbmc.parquet")
-    >>> ff.layout
-    'compact'
     >>> counts = ff.barcode_counts()          # barcode, n_unique, n_total
     >>> for batch in ff.iter_batches(["chrom", "start", "end"],
     ...                              chroms=["chr1", "chr2"],
@@ -107,37 +101,25 @@ class FragmentFile:
         self.path = Path(path)
         pf = pq.ParquetFile(self.path)
         self._metadata = pf.metadata
-        names = set(pf.schema_arrow.names)
         kv = pf.metadata.metadata or {}
-        # Compact files carry a format version in the footer; legacy ones do not
-        self.compact = b"gatac.format_version" in kv
-        if self.compact:
-            version = kv[b"gatac.format_version"].decode()
-            if version != COMPACT_VERSION:
-                raise ValueError(
-                    f"{self.path.name}: compact fragment format version {version!r} "
-                    f"is not supported (expected {COMPACT_VERSION!r})"
-                )
-            self._chroms = json.loads(kv[b"gatac.chroms"])
-            self.n_barcodes = int(kv[b"gatac.n_barcodes"])
-        else:
-            missing = [c for c in STANDARD_COLUMNS if c not in names]
-            if missing:
-                raise ValueError(
-                    f"{self.path.name} is not a GATAC fragment file: missing columns {missing}"
-                )
-            self._chroms = None
-            self.n_barcodes = None
+        if b"gatac.format_version" not in kv:
+            raise ValueError(
+                f"{self.path.name} is not a GATAC fragment file; convert the "
+                "fragments.tsv.gz with gatac.pp.make_parquet"
+            )
+        version = kv[b"gatac.format_version"].decode()
+        if version != FORMAT_VERSION:
+            raise ValueError(
+                f"{self.path.name}: fragment format version {version!r} "
+                f"is not supported (expected {FORMAT_VERSION!r})"
+            )
+        self.chroms: List[str] = json.loads(kv[b"gatac.chroms"])
+        self.n_barcodes = int(kv[b"gatac.n_barcodes"])
         self._barcodes = None
         self._barcode_index = None
 
     def __repr__(self) -> str:
-        return f"FragmentFile('{self.path}', layout='{self.layout}', rows={self.num_rows:,})"
-
-    @property
-    def layout(self) -> str:
-        """``'compact'`` or ``'legacy'``."""
-        return "compact" if self.compact else "legacy"
+        return f"FragmentFile('{self.path}', rows={self.num_rows:,}, barcodes={self.n_barcodes:,})"
 
     @property
     def num_row_groups(self) -> int:
@@ -149,39 +131,15 @@ class FragmentFile:
         return self._metadata.num_rows
 
     @property
-    def chroms(self) -> List[str]:
-        """
-        Chromosome names. For the compact layout, ``chrom_id`` indexes this
-        list. For a legacy file it is computed with one scan of the file, in
-        order of first appearance.
-        """
-        if self._chroms is None:
-            rows = duckdb.connect().execute(f"""
-                SELECT chrom FROM read_parquet('{self.path}', file_row_number = true)
-                GROUP BY chrom ORDER BY min(file_row_number)
-            """).fetchall()
-            self._chroms = [r[0] for r in rows]
-        return self._chroms
-
-    @property
     def barcodes(self) -> np.ndarray:
         """
-        Barcode names as an object array indexed by barcode id. For the
-        compact layout this is the stored barcode table (ids by decreasing
-        fragment count); for a legacy file the ids are the sorted distinct
-        barcodes, computed with one scan of the file.
+        Barcode names as an object array indexed by barcode id (the stored
+        barcode table: ids by decreasing fragment count).
         """
         if self._barcodes is None:
-            if self.compact:
-                self._barcodes = self._barcode_table(["bc_name"])["bc_name"].to_numpy(
-                    zero_copy_only=False
-                )
-            else:
-                rows = duckdb.connect().execute(
-                    f"SELECT DISTINCT barcode FROM read_parquet('{self.path}') ORDER BY barcode"
-                ).fetchall()
-                self._barcodes = np.array([r[0] for r in rows], dtype=object)
-                self.n_barcodes = len(self._barcodes)
+            self._barcodes = self._barcode_table(["bc_name"])["bc_name"].to_numpy(
+                zero_copy_only=False
+            )
         return self._barcodes
 
     def barcode_ids(self, barcodes: Sequence[str]) -> np.ndarray:
@@ -193,7 +151,7 @@ class FragmentFile:
         return self._barcode_index.get_indexer(pd.Index(np.asarray(barcodes, dtype=object)))
 
     def _barcode_table(self, columns: List[str]) -> pa.Table:
-        """The compact per-barcode table, read from the leading row groups only."""
+        """The per-barcode table, read from the leading row groups only."""
         row_groups, rows = [], 0
         while rows < self.n_barcodes:
             rows += self._metadata.row_group(len(row_groups)).num_rows
@@ -225,7 +183,7 @@ class FragmentFile:
             with at least one counted fragment are listed, in no particular
             order.
         """
-        if self.compact and chroms is None and mito_chroms is None:
+        if chroms is None and mito_chroms is None:
             t = self._barcode_table(["bc_name", "bc_n_unique", "bc_n_total"])
             return pd.DataFrame({
                 "barcode": t["bc_name"].to_numpy(zero_copy_only=False),
@@ -233,36 +191,30 @@ class FragmentFile:
                 "n_total": t["bc_n_total"].to_numpy().astype(np.int64),
             })
 
-        if self.compact:
-            pos = {c: i for i, c in enumerate(self.chroms)}
-            def values(names):
-                return ", ".join(str(pos[c]) for c in names if c in pos)
-            chrom_col, bc_col = "chrom_id", "barcode_id"
-        else:
-            def values(names):
-                return ", ".join("'" + str(c).replace("'", "''") + "'" for c in names)
-            chrom_col, bc_col = "chrom", "barcode"
+        pos = {c: i for i, c in enumerate(self.chroms)}
+
+        def values(names):
+            return ", ".join(str(pos[c]) for c in names if c in pos)
 
         where = ""
         if chroms is not None:
             in_list = values(chroms)
             if not in_list:
                 return _empty_counts(mito_chroms is not None)
-            where = f"WHERE {chrom_col} IN ({in_list})"
+            where = f"WHERE chrom_id IN ({in_list})"
         mito = ""
         if mito_chroms is not None:
             in_list = values(mito_chroms)
-            mito = (f", sum(CASE WHEN {chrom_col} IN ({in_list}) THEN count ELSE 0 END)::BIGINT AS n_mito"
+            mito = (f", sum(CASE WHEN chrom_id IN ({in_list}) THEN count ELSE 0 END)::BIGINT AS n_mito"
                     if in_list else ", 0::BIGINT AS n_mito")
 
         df = duckdb.connect().execute(f"""
-            SELECT {bc_col} AS barcode, count(*)::BIGINT AS n_unique,
+            SELECT barcode_id AS barcode, count(*)::BIGINT AS n_unique,
                    sum(count)::BIGINT AS n_total {mito}
             FROM read_parquet('{self.path}') {where}
-            GROUP BY {bc_col}
+            GROUP BY barcode_id
         """).fetchdf()
-        if self.compact:
-            df["barcode"] = self.barcodes[df["barcode"].to_numpy()]
+        df["barcode"] = self.barcodes[df["barcode"].to_numpy()]
         return df
 
     def _row_group_batches(self, row_groups_per_batch: int) -> Iterator[List[int]]:
@@ -303,7 +255,7 @@ class FragmentFile:
             One batch. Row order within a batch is not guaranteed.
         """
         columns = list(columns)
-        unknown = set(columns) - set(STANDARD_COLUMNS)
+        unknown = set(columns) - set(FRAGMENT_COLUMNS)
         if unknown:
             raise ValueError(f"Unknown fragment columns: {sorted(unknown)}")
         if cells is not None and "barcode" in columns:
@@ -315,89 +267,50 @@ class FragmentFile:
             first = ~pd.Index(cells).duplicated()
         need_chrom = "chrom" in columns or chroms is not None
         need_barcode = "barcode" in columns or cells is not None
-        logical = [c for c in STANDARD_COLUMNS
+        logical = [c for c in FRAGMENT_COLUMNS
                    if (c == "chrom" and need_chrom) or (c == "barcode" and need_barcode)
                    or (c in ("start", "end", "count") and c in columns)]
 
-        if self.compact:
-            read_cols = [_COMPACT_NAME.get(c, c) for c in logical]
-            chrom_lut = cell_lut = None
-            if need_chrom:
-                if chroms is None:
-                    chrom_lut = cp.arange(len(self.chroms), dtype=cp.int32)
-                else:
-                    pos = {c: i for i, c in enumerate(chroms)}
-                    chrom_lut = cp.asarray([pos.get(c, -1) for c in self.chroms], dtype=cp.int32)
-            if cells is not None:
-                positions = np.flatnonzero(first)
-                ids = self.barcode_ids(cells[first])
-                found = ids >= 0
-                cell_lut = cp.full(self.n_barcodes, -1, dtype=cp.int32)
-                cell_lut[cp.asarray(ids[found])] = cp.asarray(positions[found], dtype=cp.int32)
-
-            # Each batch is built in a function so its intermediates are freed
-            # before the next read, not held by the suspended generator.
-            def batch(rgs):
-                df = cudf.read_parquet(self.path, columns=read_cols, row_groups=rgs)
-                keep = None
-                out = {}
-                if need_chrom:
-                    chrom = chrom_lut[df["chrom_id"].values]
-                    if chroms is not None:
-                        keep = chrom >= 0
-                    if "chrom" in columns:
-                        out["chrom"] = chrom
-                for c in ("start", "end", "count"):
-                    if c in columns:
-                        out[c] = df[c].values
-                if cells is not None:
-                    cell = cell_lut[df["barcode_id"].values]
-                    keep = cell >= 0 if keep is None else keep & (cell >= 0)
-                    out["cell"] = cell
-                elif "barcode" in columns:
-                    out["barcode"] = df["barcode_id"].values
-                del df
-                if keep is not None:
-                    out = {k: v[keep] for k, v in out.items()}
-                return cudf.DataFrame(out)
-
-            for rgs in self._row_group_batches(row_groups_per_batch):
-                yield batch(rgs)
-            return
-
-        # Legacy layout: the same result through string merges.
-        chrom_table = cell_table = barcode_table = None
+        read_cols = [_STORED_NAME.get(c, c) for c in logical]
+        chrom_lut = cell_lut = None
         if need_chrom:
-            names = list(chroms) if chroms is not None else self.chroms
-            chrom_table = cudf.DataFrame({
-                "chrom": names, "_chrom": cp.arange(len(names), dtype=cp.int32),
-            })
+            if chroms is None:
+                chrom_lut = cp.arange(len(self.chroms), dtype=cp.int32)
+            else:
+                pos = {c: i for i, c in enumerate(chroms)}
+                chrom_lut = cp.asarray([pos.get(c, -1) for c in self.chroms], dtype=cp.int32)
         if cells is not None:
-            cell_table = cudf.DataFrame({
-                "barcode": cells[first],
-                "_cell": cp.asarray(np.flatnonzero(first), dtype=cp.int32),
-            })
-        elif "barcode" in columns:
-            barcode_table = cudf.DataFrame({
-                "barcode": self.barcodes,
-                "_barcode": cp.arange(len(self.barcodes), dtype=cp.uint32),
-            })
+            positions = np.flatnonzero(first)
+            ids = self.barcode_ids(cells[first])
+            found = ids >= 0
+            cell_lut = cp.full(self.n_barcodes, -1, dtype=cp.int32)
+            cell_lut[cp.asarray(ids[found])] = cp.asarray(positions[found], dtype=cp.int32)
 
-        names_out = {"_chrom": "chrom", "_cell": "cell", "_barcode": "barcode"}
-        keep_cols = ([] if "chrom" not in columns else ["_chrom"]) \
-            + [c for c in ("start", "end", "count") if c in columns] \
-            + (["_cell"] if cell_table is not None else ["_barcode"] if barcode_table is not None else [])
-
+        # Each batch is built in a function so its intermediates are freed
+        # before the next read, not held by the suspended generator.
         def batch(rgs):
-            df = cudf.read_parquet(self.path, columns=logical, row_groups=rgs)
-            # Cells first: it usually drops most rows before the chromosome join
-            if cell_table is not None:
-                df = df.merge(cell_table, on="barcode", how="inner")
-            elif barcode_table is not None:
-                df = df.merge(barcode_table, on="barcode", how="inner")
-            if chrom_table is not None:
-                df = df.merge(chrom_table, on="chrom", how="inner")
-            return df[keep_cols].rename(columns=names_out)
+            df = cudf.read_parquet(self.path, columns=read_cols, row_groups=rgs)
+            keep = None
+            out = {}
+            if need_chrom:
+                chrom = chrom_lut[df["chrom_id"].values]
+                if chroms is not None:
+                    keep = chrom >= 0
+                if "chrom" in columns:
+                    out["chrom"] = chrom
+            for c in ("start", "end", "count"):
+                if c in columns:
+                    out[c] = df[c].values
+            if cells is not None:
+                cell = cell_lut[df["barcode_id"].values]
+                keep = cell >= 0 if keep is None else keep & (cell >= 0)
+                out["cell"] = cell
+            elif "barcode" in columns:
+                out["barcode"] = df["barcode_id"].values
+            del df
+            if keep is not None:
+                out = {k: v[keep] for k, v in out.items()}
+            return cudf.DataFrame(out)
 
         for rgs in self._row_group_batches(row_groups_per_batch):
             yield batch(rgs)
@@ -408,23 +321,15 @@ class FragmentFile:
         low_memory: bool = True,
     ) -> cudf.DataFrame:
         """
-        Read the whole file into one GPU DataFrame with the standard columns,
+        Read the whole file into one GPU DataFrame with the named columns (``chrom``, ``start``, ``end``, ``barcode``, ``count``),
         ``chrom`` and ``barcode`` as categoricals (sorted categories).
 
-        For the compact layout the categoricals are built from the stored
-        integer ids, without materialising strings on the GPU.
+        The categoricals are built from the stored integer ids, without
+        materialising strings on the GPU.
         """
-        columns = list(columns) if columns is not None else list(STANDARD_COLUMNS)
-        if not self.compact:
-            with cudf.option_context("io.parquet.low_memory", low_memory):
-                df = cudf.read_parquet(self.path, columns=columns)
-            for c in ("chrom", "barcode"):
-                if c in df.columns:
-                    df[c] = df[c].astype("category")
-            return df
-
+        columns = list(columns) if columns is not None else list(FRAGMENT_COLUMNS)
         with cudf.option_context("io.parquet.low_memory", low_memory):
-            df = cudf.read_parquet(self.path, columns=[_COMPACT_NAME.get(c, c) for c in columns])
+            df = cudf.read_parquet(self.path, columns=[_STORED_NAME.get(c, c) for c in columns])
         out = {}
         for c in columns:
             if c == "chrom":
@@ -437,16 +342,11 @@ class FragmentFile:
 
     def register(self, con: duckdb.DuckDBPyConnection, name: str = "fragments") -> None:
         """
-        Create a DuckDB view ``name`` with the standard columns (``chrom``,
-        ``start``, ``end``, ``barcode``, ``count``), whatever the layout.
+        Create a DuckDB view ``name`` with the named columns (``chrom``, ``start``, ``end``, ``barcode``, ``count``).
 
-        For the compact layout the view joins the chromosome and barcode
-        tables, so its row order is not the file order.
+        The view joins the chromosome and barcode tables, so its row order is
+        not the file order.
         """
-        if not self.compact:
-            con.execute(f"CREATE OR REPLACE TEMP VIEW {name} AS SELECT chrom, start, \"end\", barcode, count "
-                        f"FROM read_parquet('{self.path}')")
-            return
         con.register(f"{name}_chroms", pa.table({
             "chrom_id": pa.array(np.arange(len(self.chroms)), pa.uint16()),
             "chrom": pa.array(self.chroms, pa.string()),
@@ -465,24 +365,20 @@ class FragmentFile:
 
     def iter_arrow(self, batch_size: int = 1_000_000) -> Iterator[pa.Table]:
         """
-        Stream the file on the CPU as Arrow tables with the standard columns
-        and types, in file order (compact ids decoded back to names).
+        Stream the file on the CPU as Arrow tables with the named columns (``chrom``, ``start``, ``end``, ``barcode``, ``count``),
+        in file order (ids decoded back to names).
         """
         pf = pq.ParquetFile(self.path)
-        if not self.compact:
-            for b in pf.iter_batches(batch_size=batch_size, columns=list(STANDARD_COLUMNS)):
-                yield pa.Table.from_batches([b]).cast(STANDARD_SCHEMA)
-            return
         chrom_names = pa.array(self.chroms, pa.string())
         barcode_names = pa.array(self.barcodes, pa.string())
-        for b in pf.iter_batches(batch_size=batch_size, columns=list(COMPACT_SCHEMA.names[:5])):
+        for b in pf.iter_batches(batch_size=batch_size, columns=list(FILE_SCHEMA.names[:5])):
             yield pa.table([
                 chrom_names.take(b.column("chrom_id")),
                 b.column("start"),
                 b.column("end"),
                 barcode_names.take(b.column("barcode_id")),
                 b.column("count"),
-            ], schema=STANDARD_SCHEMA)
+            ], schema=NAMED_SCHEMA)
 
 
 def _empty_counts(with_mito: bool) -> pd.DataFrame:
@@ -530,12 +426,12 @@ def write_fragments(
     barcode_stats: Optional[pd.DataFrame] = None,
 ) -> Path:
     """
-    Write fragments to a compact Parquet file.
+    Write fragments to a GATAC fragment Parquet file.
 
     Parameters
     ----------
     batches : callable
-        Returns a fresh iterator of Arrow tables with the standard columns,
+        Returns a fresh iterator of Arrow tables with the named columns (``chrom``, ``start``, ``end``, ``barcode``, ``count``),
         in the order to write. Called twice unless ``barcode_stats`` is given
         (once to count fragments per barcode).
     output_path : str or Path
@@ -580,7 +476,7 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
     n_given = len(chrom_list)
 
     writer = pq.ParquetWriter(
-        output_path, COMPACT_SCHEMA,
+        output_path, FILE_SCHEMA,
         use_dictionary=["chrom_id", "barcode_id", "count"],
         column_encoding={"start": "DELTA_BINARY_PACKED", "end": "DELTA_BINARY_PACKED",
                          "bc_name": "DELTA_BYTE_ARRAY", "bc_n_unique": "DELTA_BINARY_PACKED",
@@ -611,7 +507,7 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
                 pa.concat_arrays([names.slice(lo, hi - lo), pa.nulls(pad, pa.string())]),
                 pa.concat_arrays([n_unique.slice(lo, hi - lo), pa.nulls(pad, pa.uint32())]),
                 pa.concat_arrays([n_total.slice(lo, hi - lo), pa.nulls(pad, pa.uint32())]),
-            ], schema=COMPACT_SCHEMA), row_group_size=row_group_size)
+            ], schema=FILE_SCHEMA), row_group_size=row_group_size)
             n += k
         if n < n_bc:
             raise ValueError("The barcode statistics list barcodes that have no fragment")
@@ -623,7 +519,7 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
                 f"{chrom_list[n_given:][:5]}"
             )
         writer.add_key_value_metadata({
-            "gatac.format_version": COMPACT_VERSION,
+            "gatac.format_version": FORMAT_VERSION,
             "gatac.chroms": json.dumps(chrom_list),
             "gatac.n_barcodes": str(n_bc),
         })

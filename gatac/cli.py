@@ -460,13 +460,13 @@ def main():
     # Convert subcommand
     convert_parser = subparsers.add_parser(
         'convert',
-        help='Convert ATAC fragments TSV.GZ to Parquet (or repack a Parquet file)',
+        help='Convert ATAC fragments TSV.GZ to Parquet',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     convert_parser.add_argument(
         'input',
         nargs='+',
-        help='Input .tsv.gz or .parquet file(s), or glob pattern (e.g. "samples/*.tsv.gz")'
+        help='Input .tsv.gz file(s) or glob pattern (e.g. "samples/*.tsv.gz")'
     )
     convert_parser.add_argument(
         '-o', '--output',

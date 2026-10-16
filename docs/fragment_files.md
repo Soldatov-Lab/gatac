@@ -1,4 +1,4 @@
-# Anatomy of a GATAC Parquet file
+# Parquet fragment format
 
 GATAC reads fragments from Parquet files that `make_parquet` (or
 `gatac convert`) writes from a `fragments.tsv.gz`. This page describes how
@@ -10,13 +10,13 @@ these files store the fragments, and why.
 
 A `fragments.tsv.gz` repeats the chromosome and the barcode as text on every
 row. On a deep library that is hundreds of millions of copies of a few dozen
-chromosome names and a few hundred thousand barcodes. Kept as text in
-Parquet, every batch streamed to the GPU has to decode these strings and
-join them against the cells and chromosomes asked for, and that string work
-was most of the time of the fragment-streaming functions.
+chromosome names and a few hundred thousand barcodes. Kept as text, every
+batch streamed to the GPU would have to decode these strings and join them
+against the cells and chromosomes asked for, and that string work would take
+most of the time of the fragment-streaming functions.
 
-GATAC's *compact layout* stores each chromosome and barcode as an integer id,
-and stores the names once, inside the same file:
+GATAC stores each chromosome and barcode as an integer id instead, and stores
+the names once, inside the same file:
 
 ```{raw} html
 :file: _static/fragment_layout.svg
@@ -53,7 +53,7 @@ on the GPU:
 Measured on a 484M-fragment library (RTX 5070), against the same data with
 names in every row:
 
-| Function | Names in every row | Compact |
+| Function | Names in every row | Integer ids |
 |---|---|---|
 | `compute_metrics` | 51 s | 9 s |
 | `detect_doublets` | 56 s | 13 s |
@@ -64,7 +64,7 @@ The rest of `make_tile_matrix` is host-side matrix assembly. The whole-file
 read behind the gene matrices (`read_fragments_parquet`) builds its
 categoricals from the ids and needs about a quarter of the GPU memory.
 
-## Encoding and size
+## Encoding
 
 | Column | Type | Encoding |
 |---|---|---|
@@ -81,19 +81,14 @@ Pages are compressed with ZSTD and written as data page v1, which cuDF's
 chunked reader requires. Row groups hold 1,000,000 fragments
 (`row_group_size`), the unit GATAC streams in.
 
-On a 50M-fragment library:
+## Several libraries
 
-| File | Size |
-|---|---|
-| `fragments.tsv.gz` (gzip) | 557 MB |
-| Parquet from earlier GATAC versions (names, Snappy) | 541 MB |
-| Compact Parquet | 211 MB |
-
-## Cohorts: shared chromosome ids
-
-By default chromosome ids follow the order in which chromosomes first appear
-in the file. To give every library of a cohort the same ids, pass the same
-chromosome list to each conversion:
+Chromosome ids are per file, in order of first appearance by default. GATAC
+always resolves chromosomes by name through each file's own `gatac.chroms`,
+so libraries converted separately can have different ids and still give the
+same results. To give every library of a cohort the same ids anyway (handy
+when reading the files outside GATAC), pass the same chromosome list to each
+conversion:
 
 ```bash
 gatac convert "samples/*.tsv.gz" --output-dir parquets/ --chroms chroms.txt
@@ -105,23 +100,6 @@ ga.pp.make_parquet_batch(paths, output_dir="parquets/", chroms=["chr1", "chr2", 
 
 Chromosomes of the data missing from the list are appended after it, with a
 warning. Barcode ids are always per file.
-
-## Files from earlier GATAC versions
-
-Earlier versions wrote Parquet files with the names in every row (`chrom`,
-`start`, `end`, `barcode`, `count`). Every function still reads them and
-returns the same results, through the slower string joins. Repack them once
-to get the speed-up; `make_parquet` reads a Parquet file as well as a TSV:
-
-```bash
-gatac convert "parquets/*.parquet" --output-dir compact/ --chroms chroms.txt
-```
-
-```python
-ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet")
-```
-
-`filter_fragments` always writes the compact layout, whatever its input.
 
 ## Reading a file outside GATAC
 

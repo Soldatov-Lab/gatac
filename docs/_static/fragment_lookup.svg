@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 252" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-lookup-title">
-  <title id="cf-lookup-title">Selecting cells in a compact file is an integer lookup</title>
+  <title id="cf-lookup-title">Selecting cells in a GATAC Parquet file is an integer lookup</title>
   <style>
     .cf-text  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-base, sans-serif); font-size: 13px; }
     .cf-muted { fill: var(--pst-color-text-muted, #59636e); font-family: var(--pst-font-family-base, sans-serif); font-size: 11px; }

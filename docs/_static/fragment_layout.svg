@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 580" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-layout-title">
-  <title id="cf-layout-title">From fragments.tsv.gz to a compact GATAC Parquet file</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 556" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-layout-title">
+  <title id="cf-layout-title">From fragments.tsv.gz to a GATAC Parquet file</title>
   <style>
     .cf-text  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-base, sans-serif); font-size: 13px; }
     .cf-muted { fill: var(--pst-color-text-muted, #59636e); font-family: var(--pst-font-family-base, sans-serif); font-size: 11px; }
@@ -40,8 +40,8 @@
   <text x="392" y="174" class="cf-muted">names become integer ids; the names are stored once</text>
 
   <!-- the parquet file -->
-  <rect x="20" y="186" width="720" height="384" rx="8" class="cf-file"/>
-  <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">compact layout · ZSTD · ~2.6x smaller than the .tsv.gz</tspan></text>
+  <rect x="20" y="186" width="720" height="360" rx="8" class="cf-file"/>
+  <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">ZSTD · delta-encoded coordinates</tspan></text>
 
   <!-- row group 0 -->
   <rect x="36" y="218" width="688" height="196" rx="6" class="cf-box"/>
@@ -78,8 +78,7 @@
   <text x="48" y="448" class="cf-muted">row groups 1 … N · 1,000,000 fragments each · bc_* columns all null (almost no space)</text>
 
   <!-- footer -->
-  <rect x="36" y="474" width="688" height="84" rx="6" class="cf-foot"/>
+  <rect x="36" y="474" width="688" height="60" rx="6" class="cf-foot"/>
   <text x="48" y="495" class="cf-text cf-bold">footer (key-value metadata)</text>
-  <text y="519" class="cf-mono"><tspan x="48">gatac.format_version = 1</tspan><tspan x="320">gatac.n_barcodes = 3</tspan></text>
-  <text x="48" y="541" class="cf-mono">gatac.chroms = ["chr1", "chr2", …]</text>
+  <text x="48" y="519" class="cf-mono" style="font-size:10.5px">gatac.format_version = 1 · gatac.chroms = ["chr1", "chr2", …] · gatac.n_barcodes = 3</text>
 </svg>

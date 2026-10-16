@@ -21,7 +21,7 @@ GATAC uses [Apache Parquet](https://parquet.apache.org) as its staging format.
 Columnar layout and built-in compression let RAPIDS cuDF stream data directly
 into GPU memory with zero CPU round-trips — enabling aggregation over datasets
 that far exceed available GPU RAM. Chromosomes and barcodes are stored as
-integer ids, so files are about 2.6× smaller than the `fragments.tsv.gz`.
+integer ids, so the GPU never handles their names.
 
 +++
 ```{button-link} fragment_files.html

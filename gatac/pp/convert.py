@@ -10,9 +10,8 @@ from typing import Optional, Sequence
 
 import duckdb
 import pyarrow as pa
-import pyarrow.compute as pc
 
-from .fragments import STANDARD_SCHEMA, FragmentFile, write_fragments
+from .fragments import NAMED_SCHEMA, write_fragments
 
 logger = logging.getLogger(__name__)
 
@@ -26,28 +25,25 @@ def make_parquet(
     chroms: Optional[Sequence[str]] = None,
 ) -> Path:
     """
-    Convert ATAC fragments to GATAC Parquet, or repack a GATAC Parquet file.
+    Convert an ATAC fragments TSV.GZ file to GATAC Parquet.
 
-    Fragments are stored in the compact layout: chromosome and barcode ids,
-    with an in-file barcode table (full original names, fragment and read
-    counts per barcode); see :class:`gatac.pp.FragmentFile`. Files are
-    written with ZSTD and delta-encoded coordinates, keeping the input row
-    order, about 2.6x smaller than the fragments.tsv.gz. TSV input is parsed
-    by DuckDB and streamed to the Parquet writer, so files larger than RAM
-    are fine.
+    Chromosomes and barcodes are stored as integer ids, with an in-file
+    barcode table (full original names, fragment and read counts per
+    barcode); see :class:`gatac.pp.FragmentFile`. Files are written with
+    ZSTD and delta-encoded coordinates, keeping the input row order. The
+    TSV is parsed by DuckDB and streamed to the Parquet writer, so files
+    larger than RAM are fine.
 
     Parameters
     ----------
     input_path : str or Path
         A .tsv.gz / .bed.gz (or uncompressed) fragment file with columns
-        chrom, start, end, barcode, count, or an existing GATAC .parquet
-        fragment file to repack (e.g. a legacy file from an earlier GATAC
-        version).
+        chrom, start, end, barcode, count.
     output_path : str or Path, optional
         Path for output .parquet file.
         If None, uses input filename with .parquet extension.
     separator : str
-        Column separator of TSV input (default: tab)
+        Column separator (default: tab)
     barcode_prefix : str, optional
         Prefix to prepend to barcodes (e.g. "sample1#")
     row_group_size : int
@@ -58,8 +54,8 @@ def make_parquet(
         comfortably on a 12 GB GPU).
     chroms : list of str, optional
         Chromosome order for the ids. Pass the same list for every library
-        of a cohort so ids agree across files. Default: the ids of a compact
-        input file, else order of first appearance.
+        of a cohort so ids agree across files. Default: order of first
+        appearance.
 
     Returns
     -------
@@ -72,8 +68,6 @@ def make_parquet(
     >>> out = ga.pp.make_parquet("pbmc.tsv.gz")
     >>> # Or with a sample-specific barcode prefix
     >>> out = ga.pp.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1#")
-    >>> # Repack a Parquet file written by an earlier GATAC version
-    >>> out = ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet")
     """
     input_path = Path(input_path)
     if output_path is None:
@@ -85,57 +79,41 @@ def make_parquet(
 
     logger.info(f"Converting {input_path.name} to Parquet")
 
-    if input_path.suffix == '.parquet':
-        source = FragmentFile(input_path)
-
-        def batches():
-            for t in source.iter_arrow(row_group_size):
-                if barcode_prefix:
-                    t = t.set_column(3, 'barcode', pc.binary_join_element_wise(
-                        pa.scalar(barcode_prefix), t['barcode'], ''))
-                yield t
-
-        barcode_stats = source.barcode_counts()[['barcode', 'n_unique', 'n_total']]
-        if chroms is None and source.compact:
-            chroms = source.chroms  # keep the source's chromosome ids
-        if barcode_prefix:
-            barcode_stats['barcode'] = barcode_prefix + barcode_stats['barcode']
+    if barcode_prefix:
+        barcode_expr = f"'{barcode_prefix}' || column3"
     else:
-        if barcode_prefix:
-            barcode_expr = f"'{barcode_prefix}' || column3"
-        else:
-            barcode_expr = "column3"
-        query = f"""
-            SELECT
-                column0          AS chrom,
-                column1::UINTEGER AS start,
-                column2::UINTEGER AS "end",
-                {barcode_expr}   AS barcode,
-                column4::USMALLINT AS count
-            FROM read_csv(
-                '{input_path}',
-                delim='{separator}',
-                header=false,
-                comment='#',
-                ignore_errors=true
-            )
-            WHERE column0 IS NOT NULL AND column1 IS NOT NULL
-              AND column2 IS NOT NULL AND column3 IS NOT NULL
-        """
+        barcode_expr = "column3"
+    query = f"""
+        SELECT
+            column0          AS chrom,
+            column1::UINTEGER AS start,
+            column2::UINTEGER AS "end",
+            {barcode_expr}   AS barcode,
+            column4::USMALLINT AS count
+        FROM read_csv(
+            '{input_path}',
+            delim='{separator}',
+            header=false,
+            comment='#',
+            ignore_errors=true
+        )
+        WHERE column0 IS NOT NULL AND column1 IS NOT NULL
+          AND column2 IS NOT NULL AND column3 IS NOT NULL
+    """
 
-        def batches():
-            con = duckdb.connect()
-            try:
-                for b in con.execute(query).to_arrow_reader(row_group_size):
-                    yield pa.Table.from_batches([b]).cast(STANDARD_SCHEMA)
-            finally:
-                con.close()
+    def batches():
+        con = duckdb.connect()
+        try:
+            for b in con.execute(query).to_arrow_reader(row_group_size):
+                yield pa.Table.from_batches([b]).cast(NAMED_SCHEMA)
+        finally:
+            con.close()
 
-        with duckdb.connect() as con:
-            barcode_stats = con.execute(f"""
-                SELECT barcode, count(*)::BIGINT AS n_unique, sum(count)::BIGINT AS n_total
-                FROM ({query}) GROUP BY barcode
-            """).fetchdf()
+    with duckdb.connect() as con:
+        barcode_stats = con.execute(f"""
+            SELECT barcode, count(*)::BIGINT AS n_unique, sum(count)::BIGINT AS n_total
+            FROM ({query}) GROUP BY barcode
+        """).fetchdf()
 
     write_fragments(
         batches, output_path, chroms=chroms,

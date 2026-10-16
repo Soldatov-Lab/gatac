@@ -318,8 +318,10 @@ def create_gene_matrix_gpu(
             barcode_counts.columns = ['n_total', 'n_unique']
             barcode_counts = barcode_counts.reset_index()
             
+            # The counts' barcodes are categorical, and cuDF's isin of a string
+            # column against a categorical one matches nothing
             valid_bc = barcode_counts[barcode_counts['n_unique'] >= min_fragments_per_cell]['barcode']
-            cell_metadata = cell_metadata[cell_metadata['barcode'].isin(valid_bc)]
+            cell_metadata = cell_metadata[cell_metadata['barcode'].isin(valid_bc.astype(str))]
             cell_metadata = cell_metadata.merge(barcode_counts[['barcode', 'n_unique']], on='barcode', how='left')
 
         valid_barcodes = cell_metadata['barcode']

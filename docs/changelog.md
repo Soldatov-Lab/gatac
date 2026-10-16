@@ -102,6 +102,9 @@
 
 ### Fixed
 
+- `make_gene_matrix` with a `metrics` table that has no `n_unique` column
+  (e.g. only barcodes) kept no cells and failed with "blocks must be 2-D";
+  the listed cells are now kept, with their fragment counts read from the file.
 - Preranked GSEA no longer double-counts features that appear more than once
   within the same feature set; duplicates previously inflated both the size
   filter and the enrichment-score normalisation.

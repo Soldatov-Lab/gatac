@@ -20,7 +20,7 @@ chromosomes by integer lookups instead of string merges, which makes fragment
 streaming several times faster on deep libraries and the whole-file reads of
 the gene matrices need a fraction of the GPU memory. Files written by earlier
 GATAC versions (names in every row) are still read, more slowly;
-`make_parquet` repacks them. See [Fragment files](../fragment_files.md).
+`make_parquet` repacks them. See [Anatomy of a GATAC Parquet file](../fragment_files.md).
 
 ```{eval-rst}
 .. currentmodule:: gatac.pp

@@ -20,13 +20,14 @@ datasets.
 GATAC uses [Apache Parquet](https://parquet.apache.org) as its staging format.
 Columnar layout and built-in compression let RAPIDS cuDF stream data directly
 into GPU memory with zero CPU round-trips — enabling aggregation over datasets
-that far exceed available GPU RAM.
+that far exceed available GPU RAM. Chromosomes and barcodes are stored as
+integer ids, so files are about 2.6× smaller than the `fragments.tsv.gz`.
 
 +++
-```{button-link} installation.html
+```{button-link} fragment_files.html
 :color: primary
 :outline:
-Get started
+Inside the Parquet file
 ```
 :::
 
@@ -39,6 +40,11 @@ framework. It produces standard **AnnData** objects fully compatible with the
 **scverse** ecosystem.
 
 +++
+```{button-link} installation.html
+:color: primary
+:outline:
+Get started
+```
 ```{button-link} tutorials/index.html
 :color: success
 :outline:
@@ -61,7 +67,7 @@ View Tutorials
 Convert raw TSV.GZ fragment files to columnar Parquet for fast GPU streaming,
 with optional barcode prefixing for multi-sample projects.
 
-<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/preprocessing.html#fragment-i-o">→ API: pp</a>
+<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/preprocessing.html#fragment-i-o">→ API: pp</a> · <a href="fragment_files.html">→ File format</a>
 :::
 
 :::{grid-item-card} {fas}`filter` Quality & Filtering

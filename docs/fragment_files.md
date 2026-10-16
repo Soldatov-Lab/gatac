@@ -1,4 +1,4 @@
-# Fragment files
+# Anatomy of a GATAC Parquet file
 
 GATAC reads fragments from Parquet files that `make_parquet` (or
 `gatac convert`) writes from a `fragments.tsv.gz`. This page describes how

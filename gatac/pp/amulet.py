@@ -37,7 +37,7 @@ import scipy.stats as stats
 import statsmodels.api as sm
 
 from ._utils import cleanup_gpu_memory
-from .fragments import FragmentFile
+from ..io.fragments import FragmentFile
 from .genome import get_chrom_sizes
 
 logger = logging.getLogger(__name__)

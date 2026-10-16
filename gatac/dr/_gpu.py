@@ -1,8 +1,8 @@
 """
-Shared GPU sparse-matrix helpers for ``gatac.tl``.
+Shared GPU sparse-matrix helpers for ``gatac.dr``.
 
-These were originally private to :mod:`gatac.tl.spectral`; they are shared with
-:mod:`gatac.tl.lsi`, which needs the same primitives:
+These were originally private to :mod:`gatac.dr.spectral`; they are shared with
+:mod:`gatac.dr.lsi`, which needs the same primitives:
 
 * upload a sparse matrix to the device converting only the ``data`` array,
 * row-wise scaling and row-norm kernels that avoid materialising ``O(nnz)``
@@ -301,7 +301,7 @@ class ChunkedMatrix:
         diag_shift
             Per-row values subtracted from the diagonal, i.e. the operator
             becomes ``X (Xᵀ v) - diag_shift * v``. ``None`` leaves the plain
-            Gram product. :mod:`gatac.tl.spectral` passes the inverse degree
+            Gram product. :mod:`gatac.dr.spectral` passes the inverse degree
             vector here; LSI passes nothing.
         """
 

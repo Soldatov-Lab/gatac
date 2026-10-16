@@ -1,5 +1,5 @@
 """
-Graph clustering for :func:`gatac.tl.iterative_lsi`.
+Graph clustering for :func:`gatac.dr.iterative_lsi`.
 
 ArchR clusters cells between LSI rounds by handing the embedding to
 ``Seurat::FindNeighbors`` → ``Seurat::FindClusters``, then applying two
@@ -527,7 +527,7 @@ def snn_cluster(
 
     Examples
     --------
-    >>> from gatac.tl._clustering import snn_cluster
+    >>> from gatac.dr._clustering import snn_cluster
     >>> z = (emb - emb.mean(0)) / emb.std(0)
     >>> labels = snn_cluster(z, resolution=2.0, max_clusters=6)
     """

@@ -20,11 +20,10 @@ datasets.
 GATAC uses [Apache Parquet](https://parquet.apache.org) as its staging format.
 Columnar layout and built-in compression let RAPIDS cuDF stream data directly
 into GPU memory with zero CPU round-trips — enabling aggregation over datasets
-that far exceed available GPU RAM. Chromosomes and barcodes are stored as
-integer ids, so the GPU never handles their names.
+that far exceed available GPU RAM.
 
 +++
-```{button-link} fragment_files.html
+```{button-link} api/io.html#parquet-fragment-format
 :color: primary
 :outline:
 Inside the Parquet file
@@ -67,7 +66,7 @@ View Tutorials
 Convert raw TSV.GZ fragment files to columnar Parquet for fast GPU streaming,
 with optional barcode prefixing for multi-sample projects.
 
-<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/preprocessing.html#fragment-i-o">→ API: pp</a> · <a href="fragment_files.html">→ File format</a>
+<a href="cli/convert.html">→ CLI: convert</a> · <a href="api/io.html">→ API: io</a> · <a href="api/io.html#parquet-fragment-format">→ File format</a>
 :::
 
 :::{grid-item-card} {fas}`filter` Quality & Filtering
@@ -121,7 +120,7 @@ or many h5ad files using streaming aggregation.
 Embed cells for UMAP and clustering via spectral decomposition, ArchR-style
 (iterative) **LSI** with projection of new cells, or **LDA** topic modelling.
 
-<a href="api/tools.html#dimensionality-reduction">→ API: tl</a>
+<a href="api/dr.html">→ API: dr</a>
 :::
 
 :::{grid-item-card} {fas}`mountain` Peak Calling
@@ -130,7 +129,7 @@ Embed cells for UMAP and clustering via spectral decomposition, ArchR-style
 Call peaks per cell-type group, merge overlapping peaks across groups, and
 build a cell × peak count matrix.
 
-<a href="api/tools.html#peak-calling-marker-peaks">→ API: tl</a>
+<a href="api/peak.html">→ API: peak</a>
 :::
 
 :::{grid-item-card} {fas}`dna` Motif Analysis
@@ -139,7 +138,7 @@ build a cell × peak count matrix.
 Scan peaks for TF binding motifs (MEME format), run motif enrichment tests,
 and compute chromVAR deviation scores.
 
-<a href="api/tools.html#motif-analysis">→ API: tl</a>
+<a href="api/motif.html">→ API: motif</a>
 :::
 
 ::::

@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from ..pp.fragments import FragmentFile
+from ..io.fragments import FragmentFile
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -782,7 +782,7 @@ def footprint(
     Reproduces TOBIAS 0.17.5 ``ATACorrect`` followed by ``ScoreBigwig --score
     footprint`` with default parameters, for each group of cells, reading cut
     sites directly from the fragments parquet. Feed the result to
-    :func:`gatac.tl.bindetect` for differential TF binding.
+    :func:`gatac.tobias.bindetect` for differential TF binding.
 
     Parameters
     ----------
@@ -827,11 +827,11 @@ def footprint(
 
     Examples
     --------
-    >>> tracks = ga.tl.footprint(
+    >>> tracks = ga.tobias.footprint(
     ...     adata, "cell_type", "fragments.parquet", "GRCh38.fa",
     ...     groups=["CD14 Mono", "CD4 Memory"],
     ... )
-    >>> res = ga.tl.bindetect(tracks, "cisBP_human.meme", "GRCh38.fa")
+    >>> res = ga.tobias.bindetect(tracks, "cisBP_human.meme", "GRCh38.fa")
     """
     import time
 

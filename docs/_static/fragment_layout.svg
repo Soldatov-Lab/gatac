@@ -6,6 +6,7 @@
     .cf-mono  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-monospace, monospace); font-size: 12px; }
     .cf-null  { fill: var(--pst-color-text-muted, #59636e); font-family: var(--pst-font-family-monospace, monospace); font-size: 12px; font-style: italic; }
     .cf-bold  { font-weight: 600; }
+    .cf-delta { fill: #4c8bf5; font-weight: 600; }
     .cf-box   { fill: var(--pst-color-surface, #f6f8fa); stroke: var(--pst-color-border, #d0d7de); stroke-width: 1; }
     .cf-file  { fill: none; stroke: var(--pst-color-text-muted, #59636e); stroke-width: 1.2; }
     .cf-line  { stroke: var(--pst-color-text-muted, #59636e); stroke-width: 1.4; fill: none; }
@@ -41,37 +42,37 @@
 
   <!-- the parquet file -->
   <rect x="20" y="186" width="720" height="360" rx="8" class="cf-file"/>
-  <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">ZSTD · delta-encoded coordinates</tspan></text>
+  <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">ZSTD · coordinates stored as the change from the row above</tspan></text>
 
   <!-- row group 0 -->
   <rect x="36" y="218" width="688" height="196" rx="6" class="cf-box"/>
   <text x="48" y="236" class="cf-muted">row group 0 · 1,000,000 rows</text>
   <text x="48" y="256" class="cf-text cf-bold">fragments: one row per fragment</text>
-  <text x="432" y="256" class="cf-text cf-bold">barcode table: row i = barcode id i</text>
+  <text x="440" y="256" class="cf-text cf-bold">barcode table: row i = barcode id i</text>
 
   <!-- column strips: fragments -->
   <rect x="48"  y="264" width="70" height="142" rx="4" class="cf-id"/>
   <rect x="122" y="264" width="70" height="142" rx="4" class="cf-val"/>
   <rect x="196" y="264" width="70" height="142" rx="4" class="cf-val"/>
-  <rect x="270" y="264" width="80" height="142" rx="4" class="cf-id"/>
-  <rect x="354" y="264" width="58" height="142" rx="4" class="cf-val"/>
+  <rect x="270" y="264" width="72" height="142" rx="4" class="cf-id"/>
+  <rect x="346" y="264" width="74" height="142" rx="4" class="cf-val"/>
   <!-- column strips: barcode table -->
-  <rect x="432" y="264" width="106" height="142" rx="4" class="cf-bc"/>
-  <rect x="542" y="264" width="86"  height="142" rx="4" class="cf-bc"/>
-  <rect x="632" y="264" width="80"  height="142" rx="4" class="cf-bc"/>
+  <rect x="440" y="264" width="106" height="142" rx="4" class="cf-bc"/>
+  <rect x="550" y="264" width="82"  height="142" rx="4" class="cf-bc"/>
+  <rect x="636" y="264" width="76"  height="142" rx="4" class="cf-bc"/>
 
-  <!-- headers: name and type · encoding -->
-  <text y="281" class="cf-text cf-bold" style="font-size:11px"><tspan x="56">chrom_id</tspan><tspan x="130">start</tspan><tspan x="204">end</tspan><tspan x="278">barcode_id</tspan><tspan x="362">count</tspan><tspan x="440">bc_name</tspan><tspan x="550">bc_n_unique</tspan><tspan x="640">bc_n_total</tspan></text>
-  <text y="296" class="cf-muted" style="font-size:10px"><tspan x="56">dict</tspan><tspan x="130">delta</tspan><tspan x="204">delta</tspan><tspan x="278">dict</tspan><tspan x="362">dict</tspan><tspan x="440">delta strings</tspan><tspan x="550">delta</tspan><tspan x="640">delta</tspan></text>
-  <path d="M48,304 H412 M432,304 H712" class="cf-line" style="stroke-width:0.8"/>
+  <!-- headers: name · encoding · type -->
+  <text y="281" class="cf-text cf-bold" style="font-size:11px"><tspan x="56">chrom_id</tspan><tspan x="130">start</tspan><tspan x="204">end</tspan><tspan x="278">barcode_id</tspan><tspan x="354">count</tspan><tspan x="448">bc_name</tspan><tspan x="558">bc_n_unique</tspan><tspan x="644">bc_n_total</tspan></text>
+  <text y="296" class="cf-muted" style="font-size:10px"><tspan x="56">dict · uint16</tspan><tspan x="130">delta · uint32</tspan><tspan x="204">delta · uint32</tspan><tspan x="278">dict · uint32</tspan><tspan x="354">dict · uint16</tspan><tspan x="448">delta strings · string</tspan><tspan x="558">delta · uint32</tspan><tspan x="644">delta · uint32</tspan></text>
+  <path d="M48,304 H420 M440,304 H712" class="cf-line" style="stroke-width:0.8"/>
 
   <!-- values -->
-  <text y="324" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10001</tspan><tspan x="204">10200</tspan><tspan x="278">1</tspan><tspan x="362">2</tspan><tspan x="440">TTGCATGA-1</tspan><tspan x="550">41,203</tspan><tspan x="640">97,410</tspan></text>
-  <text y="344" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10035</tspan><tspan x="204">10180</tspan><tspan x="278">0</tspan><tspan x="362">1</tspan><tspan x="440">AAACGAAC-1</tspan><tspan x="550">38,950</tspan><tspan x="640">90,122</tspan></text>
-  <text y="364" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10102</tspan><tspan x="204">10388</tspan><tspan x="278">0</tspan><tspan x="362">1</tspan><tspan x="440">GCTTAGCA-1</tspan><tspan x="550">2,114</tspan><tspan x="640">4,871</tspan></text>
-  <text y="384" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10240</tspan><tspan x="204">10511</tspan><tspan x="278">2</tspan><tspan x="362">3</tspan></text>
-  <text y="384" class="cf-null"><tspan x="440">null</tspan><tspan x="550">null</tspan><tspan x="640">null</tspan></text>
-  <text y="400" class="cf-muted"><tspan x="80">⋮</tspan><tspan x="154">⋮</tspan><tspan x="228">⋮</tspan><tspan x="306">⋮</tspan><tspan x="380">⋮</tspan><tspan x="482">⋮</tspan><tspan x="582">⋮</tspan><tspan x="669">⋮</tspan></text>
+  <text y="324" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10001</tspan><tspan x="204">10200</tspan><tspan x="278">1</tspan><tspan x="354">2</tspan><tspan x="448">TTGCATGA-1</tspan><tspan x="558">41,203</tspan><tspan x="644">97,410</tspan></text>
+  <text y="344" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+34</tspan><tspan x="204" class="cf-delta">−20</tspan><tspan x="278">0</tspan><tspan x="354">1</tspan><tspan x="448">AAACGAAC-1</tspan><tspan x="558">38,950</tspan><tspan x="644">90,122</tspan></text>
+  <text y="364" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+67</tspan><tspan x="204" class="cf-delta">+208</tspan><tspan x="278">0</tspan><tspan x="354">1</tspan><tspan x="448">GCTTAGCA-1</tspan><tspan x="558">2,114</tspan><tspan x="644">4,871</tspan></text>
+  <text y="384" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+138</tspan><tspan x="204" class="cf-delta">+123</tspan><tspan x="278">2</tspan><tspan x="354">3</tspan></text>
+  <text y="384" class="cf-null"><tspan x="448">null</tspan><tspan x="558">null</tspan><tspan x="644">null</tspan></text>
+  <text y="400" class="cf-muted"><tspan x="80">⋮</tspan><tspan x="154">⋮</tspan><tspan x="228">⋮</tspan><tspan x="303">⋮</tspan><tspan x="380">⋮</tspan><tspan x="490">⋮</tspan><tspan x="588">⋮</tspan><tspan x="671">⋮</tspan></text>
 
   <!-- later row groups -->
   <rect x="36" y="424" width="688" height="40" rx="6" class="cf-box"/>

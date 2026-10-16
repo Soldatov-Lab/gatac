@@ -1,12 +1,33 @@
-# Parquet fragment format
+# Fragment I/O — `gatac.io`
+
+The `gatac.io` namespace converts raw fragment TSV.GZ files to GATAC's Parquet
+fragment format, reads them back, and converts them back to TSV. Every GATAC function that reads fragments
+goes through `FragmentFile`; the format itself is described
+[below](#parquet-fragment-format).
+
+```{eval-rst}
+.. currentmodule:: gatac.io
+
+.. autosummary::
+   :toctree: generated/
+   :nosignatures:
+
+   make_parquet
+   make_parquet_batch
+   to_tsv
+   FragmentFile
+   read_fragments_parquet
+```
+
+---
+
+## Parquet fragment format
 
 GATAC reads fragments from Parquet files that `make_parquet` (or
 `gatac convert`) writes from a `fragments.tsv.gz`. This page describes how
 these files store the fragments, and why.
 
----
-
-## File layout
+### File layout
 
 A `fragments.tsv.gz` repeats the chromosome and the barcode as text on every
 row. On a deep library that is hundreds of millions of copies of a few dozen
@@ -19,7 +40,7 @@ GATAC stores each chromosome and barcode as an integer id instead, and stores
 the names once, inside the same file:
 
 ```{raw} html
-:file: _static/fragment_layout.svg
+:file: ../_static/fragment_layout.svg
 ```
 
 - **Fragment columns.** `chrom_id`, `start`, `end`, `barcode_id`, `count`,
@@ -57,16 +78,16 @@ asked for chromosomes or cells by name maps them through that file's own
 ids in two libraries and the results do not depend on it.
 ```
 
-## How GATAC reads the file
+### How GATAC reads the file
 
 Every GATAC function that reads fragments goes through
-{class}`gatac.pp.FragmentFile`. To select cells, it turns the cells you ask
+{class}`gatac.io.FragmentFile`. To select cells, it turns the cells you ask
 for into a lookup table indexed by barcode id, once per call, and each batch
 on the GPU is then a gather into that table; no string column is ever built
 on the GPU:
 
 ```{raw} html
-:file: _static/fragment_lookup.svg
+:file: ../_static/fragment_lookup.svg
 ```
 
 Measured on a 484M-fragment library (RTX 5070), against the same data with
@@ -76,23 +97,18 @@ names in every row:
 |---|---|---|
 | `compute_metrics` | 51 s | 9 s |
 | `detect_doublets` | 56 s | 13 s |
-| `make_peak_matrix` | 14 s | 6 s |
+| `peak.make_matrix` | 14 s | 6 s |
 | `make_tile_matrix` | 49 s | 30 s |
 
 The rest of `make_tile_matrix` is host-side matrix assembly. The whole-file
 read behind the gene matrices (`read_fragments_parquet`) builds its
 categoricals from the ids and needs about a quarter of the GPU memory.
 
-## Encoding
+### Encoding
 
-| Column | Type | Encoding |
-|---|---|---|
-| `chrom_id` | uint16 | dictionary |
-| `start`, `end` | uint32 | delta (`DELTA_BINARY_PACKED`) |
-| `barcode_id` | uint32 | dictionary |
-| `count` | uint16 | dictionary |
-| `bc_name` | string | delta strings (`DELTA_BYTE_ARRAY`) |
-| `bc_n_unique`, `bc_n_total` | uint32 | delta |
+Each column in the [schematic](#file-layout) gives its encoding and type:
+*dict* is Parquet dictionary encoding, *delta* is `DELTA_BINARY_PACKED`, and
+*delta strings* is `DELTA_BYTE_ARRAY`.
 
 Fragments are sorted by position in a `fragments.tsv.gz`, so consecutive
 `start` and `end` values differ by little and delta-encode to a few bits.
@@ -100,9 +116,9 @@ Pages are compressed with ZSTD and written as data page v1, which cuDF's
 chunked reader requires. Row groups hold 1,000,000 fragments
 (`row_group_size`), the unit GATAC streams in.
 
-## Reading a file outside GATAC
+### Reading a file outside GATAC
 
-{class}`gatac.pp.FragmentFile` gives the fragments back with names. As a
+{class}`gatac.io.FragmentFile` gives the fragments back with names. As a
 DuckDB view with the usual columns:
 
 ```python
@@ -110,12 +126,16 @@ import duckdb
 import gatac as ga
 
 con = duckdb.connect()
-ga.pp.FragmentFile("pbmc.parquet").register(con)  # view "fragments"
+ga.io.FragmentFile("pbmc.parquet").register(con)  # view "fragments"
 con.sql("SELECT barcode, count(*) AS n FROM fragments GROUP BY barcode")
 ```
 
 `FragmentFile(path).iter_arrow()` streams Arrow tables with the same
-columns. Without GATAC, any Parquet reader gets the ids and the tables:
+columns, and {func}`gatac.io.to_tsv` writes the fragments back to a
+`fragments.tsv.gz` in file order, BGZF-compressed so `tabix` can index it.
+Barcodes keep any prefix added at conversion.
+
+Without GATAC, any Parquet reader gets the ids and the tables:
 
 ```python
 import json

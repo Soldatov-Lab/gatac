@@ -62,7 +62,7 @@ class MiniBatchLDA:
     Examples
     --------
     >>> import gatac as ga
-    >>> model = ga.tl.MiniBatchLDA(n_topics=20, n_epochs=10, verbose=True)
+    >>> model = ga.dr.MiniBatchLDA(n_topics=20, n_epochs=10, verbose=True)
     >>> model.fit_transform(peak_adata.X, binarize=True)
     >>> # Inspect the most-weighted peaks per topic
     >>> top = model.top_peaks(peak_adata.var_names, n_top=20)
@@ -457,7 +457,7 @@ def lda(
     seed : int, optional (default: 0)
         Random seed for reproducibility.
     **kwargs
-        Additional keyword arguments passed to :class:`~fastools.tl.lda.MiniBatchLDA`.
+        Additional keyword arguments passed to :class:`~fastools.dr.lda.MiniBatchLDA`.
 
     Returns
     -------
@@ -470,7 +470,7 @@ def lda(
     Examples
     --------
     >>> import gatac as ga
-    >>> model = ga.tl.lda(adata, n_topics=20, n_epochs=10)
+    >>> model = ga.dr.lda(adata, n_topics=20, n_epochs=10)
     >>> # Cell × topic proportions are stored in adata.obsm["X_lda"]
     >>> adata.obsm["X_lda"].shape
     (n_cells, 20)

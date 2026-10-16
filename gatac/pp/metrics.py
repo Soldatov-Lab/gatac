@@ -17,7 +17,7 @@ import cupyx
 import numpy as np
 
 from ._utils import cleanup_gpu_memory
-from .fragments import FragmentFile
+from ..io.fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
 

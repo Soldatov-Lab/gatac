@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from .fragments import FragmentFile
+from ..io.fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
 

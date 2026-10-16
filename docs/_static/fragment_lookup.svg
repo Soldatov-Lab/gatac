@@ -1,5 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 252" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-lookup-title">
-  <title id="cf-lookup-title">Selecting cells in a GATAC Parquet file is an integer lookup</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 364" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-lookup-title">
+  <title id="cf-lookup-title">Selecting cells in a batch: a string merge on names versus an integer gather on ids</title>
   <style>
     .cf-text  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-base, sans-serif); font-size: 13px; }
     .cf-muted { fill: var(--pst-color-text-muted, #59636e); font-family: var(--pst-font-family-base, sans-serif); font-size: 11px; }
@@ -12,6 +12,9 @@
     .cf-id    { fill: #73b301; fill-opacity: 0.14; stroke: #73b301; stroke-width: 1.2; }
     .cf-bc    { fill: #e0a020; fill-opacity: 0.16; stroke: #e0a020; stroke-width: 1.2; }
     .cf-lut   { fill: #9b6bd3; fill-opacity: 0.14; stroke: #9b6bd3; stroke-width: 1.2; }
+    .cf-track { fill: var(--pst-color-border, #d0d7de); fill-opacity: 0.5; }
+    .cf-slow  { fill: #e0a020; }
+    .cf-fast  { fill: #73b301; }
   </style>
   <defs>
     <marker id="cf-arrow-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -19,45 +22,67 @@
     </marker>
   </defs>
 
-  <!-- inputs -->
-  <rect x="20" y="24" width="210" height="58" rx="6" class="cf-box"/>
-  <text x="32" y="44" class="cf-muted">cells you ask for</text>
-  <text x="32" y="68" class="cf-mono">TTGCATGA-1, GCTTAGCA-1</text>
+  <!-- ============ names in every row ============ -->
+  <text x="20" y="18" class="cf-text"><tspan class="cf-bold">Names in every row</tspan><tspan class="cf-muted" dx="8">each batch, on the GPU</tspan></text>
 
-  <rect x="20" y="104" width="210" height="112" rx="6" class="cf-bc"/>
-  <text x="32" y="124" class="cf-muted">barcode table in the file (bc_name)</text>
-  <text y="150" class="cf-mono"><tspan x="32" class="cf-null">0</tspan><tspan x="52">TTGCATGA-1</tspan></text>
-  <text y="174" class="cf-mono"><tspan x="32" class="cf-null">1</tspan><tspan x="52">AAACGAAC-1</tspan></text>
-  <text y="198" class="cf-mono"><tspan x="32" class="cf-null">2</tspan><tspan x="52">GCTTAGCA-1</tspan></text>
+  <rect x="20" y="30" width="150" height="124" rx="4" class="cf-bc"/>
+  <text x="32" y="48" class="cf-text cf-bold" style="font-size:11px">barcode</text>
+  <text x="32" y="62" class="cf-muted" style="font-size:10px">string</text>
+  <path d="M20,70 H170" class="cf-line" style="stroke-width:0.8"/>
+  <text x="32" class="cf-mono"><tspan x="32" y="90">AAACGAAC-1</tspan><tspan x="32" y="108">TTGCATGA-1</tspan><tspan x="32" y="126">TTGCATGA-1</tspan><tspan x="32" y="144">GCTTAGCA-1</tspan></text>
 
-  <!-- lookup table -->
-  <path d="M230,56 C252,56 248,104 268,104" class="cf-line" marker-end="url(#cf-arrow-b)"/>
-  <path d="M230,160 C252,160 248,150 268,150" class="cf-line" marker-end="url(#cf-arrow-b)"/>
-  <rect x="270" y="64" width="150" height="152" rx="6" class="cf-lut"/>
-  <text x="282" y="84" class="cf-text cf-bold">lookup table</text>
-  <text x="282" y="100" class="cf-muted">built once, on the CPU</text>
-  <text x="282" y="150" class="cf-mono">id 0 → cell 0</text>
-  <text x="282" y="174" class="cf-mono">id 1 → <tspan class="cf-null">−1</tspan></text>
-  <text x="282" y="198" class="cf-mono">id 2 → cell 1</text>
+  <path d="M170,92 H194" class="cf-line" marker-end="url(#cf-arrow-b)"/>
+  <rect x="196" y="30" width="200" height="124" rx="6" class="cf-box"/>
+  <text x="208" y="50" class="cf-text cf-bold">string merge</text>
+  <text x="208" y="68" class="cf-muted">with the cells you ask for</text>
+  <text class="cf-mono"><tspan x="208" y="90">TTGCATGA-1 → cell 0</tspan><tspan x="208" y="108">GCTTAGCA-1 → cell 1</tspan></text>
+  <text class="cf-muted"><tspan x="208" y="130">decodes, hashes and compares</tspan><tspan x="208" y="144">text, for every fragment</tspan></text>
 
-  <!-- per-batch columns -->
-  <text x="450" y="18" class="cf-muted">each batch, on the GPU</text>
-  <path d="M420,124 C440,124 440,40 485,40 H595 V60" class="cf-line" style="stroke-dasharray:4 3" marker-end="url(#cf-arrow-b)"/>
-
-  <rect x="450" y="64" width="84" height="152" rx="4" class="cf-id"/>
-  <rect x="553" y="64" width="84" height="152" rx="4" class="cf-box"/>
-  <rect x="656" y="64" width="84" height="152" rx="4" class="cf-box"/>
-  <text y="84" class="cf-text cf-bold" style="font-size:11px"><tspan x="460">barcode_id</tspan><tspan x="563">cell</tspan><tspan x="666">kept</tspan></text>
-  <text y="100" class="cf-muted" style="font-size:10px"><tspan x="460">as stored</tspan><tspan x="563">lut[id]</tspan><tspan x="666">cell ≥ 0</tspan></text>
-  <path d="M450,108 H534 M553,108 H637 M656,108 H740" class="cf-line" style="stroke-width:0.8"/>
+  <path d="M396,92 H420" class="cf-line" marker-end="url(#cf-arrow-b)"/>
+  <rect x="422" y="30" width="100" height="124" rx="4" class="cf-box"/>
+  <text x="434" y="48" class="cf-text cf-bold" style="font-size:11px">cell</text>
+  <text x="434" y="62" class="cf-muted" style="font-size:10px">kept if found</text>
+  <path d="M422,70 H522" class="cf-line" style="stroke-width:0.8"/>
   <g text-anchor="middle">
-    <text y="130" class="cf-mono"><tspan x="492">1</tspan><tspan x="595" class="cf-null">−1</tspan><tspan x="698" class="cf-null">—</tspan></text>
-    <text y="154" class="cf-mono"><tspan x="492">0</tspan><tspan x="595">0</tspan><tspan x="698">0</tspan></text>
-    <text y="178" class="cf-mono"><tspan x="492">0</tspan><tspan x="595">0</tspan><tspan x="698">0</tspan></text>
-    <text y="202" class="cf-mono"><tspan x="492">2</tspan><tspan x="595">1</tspan><tspan x="698">1</tspan></text>
+    <text x="472" y="90" class="cf-null">—</text>
+    <text class="cf-mono"><tspan x="472" y="108">0</tspan><tspan x="472" y="126">0</tspan><tspan x="472" y="144">1</tspan></text>
   </g>
-  <path d="M534,154 H551" class="cf-line" marker-end="url(#cf-arrow-b)"/>
-  <path d="M637,154 H654" class="cf-line" marker-end="url(#cf-arrow-b)"/>
 
-  <text x="20" y="242" class="cf-muted">Chromosomes take the same path: a small lookup table maps chrom_id to the chromosomes requested.</text>
+  <!-- ============ integer ids ============ -->
+  <text x="20" y="194" class="cf-text"><tspan class="cf-bold">Integer ids (GATAC)</tspan><tspan class="cf-muted" dx="8">each batch, on the GPU</tspan></text>
+
+  <rect x="20" y="206" width="150" height="124" rx="4" class="cf-id"/>
+  <text x="32" y="224" class="cf-text cf-bold" style="font-size:11px">barcode_id</text>
+  <text x="32" y="238" class="cf-muted" style="font-size:10px">uint32</text>
+  <path d="M20,246 H170" class="cf-line" style="stroke-width:0.8"/>
+  <text class="cf-mono"><tspan x="32" y="266">1</tspan><tspan x="32" y="284">0</tspan><tspan x="32" y="302">0</tspan><tspan x="32" y="320">2</tspan></text>
+
+  <path d="M170,268 H194" class="cf-line" marker-end="url(#cf-arrow-b)"/>
+  <rect x="196" y="206" width="200" height="124" rx="6" class="cf-lut"/>
+  <text x="208" y="226" class="cf-text cf-bold">gather lut[barcode_id]</text>
+  <text x="208" y="244" class="cf-muted">lut built once, on the CPU</text>
+  <text class="cf-mono"><tspan x="208" y="266">id 0 → cell 0</tspan><tspan x="208" y="284">id 1 → <tspan class="cf-null">−1</tspan></tspan><tspan x="208" y="302">id 2 → cell 1</tspan></text>
+  <text x="208" y="320" class="cf-muted">one integer read per fragment</text>
+
+  <path d="M396,268 H420" class="cf-line" marker-end="url(#cf-arrow-b)"/>
+  <rect x="422" y="206" width="100" height="124" rx="4" class="cf-box"/>
+  <text x="434" y="224" class="cf-text cf-bold" style="font-size:11px">cell</text>
+  <text x="434" y="238" class="cf-muted" style="font-size:10px">kept if ≥ 0</text>
+  <path d="M422,246 H522" class="cf-line" style="stroke-width:0.8"/>
+  <g text-anchor="middle">
+    <text x="472" y="266" class="cf-null">—</text>
+    <text class="cf-mono"><tspan x="472" y="284">0</tspan><tspan x="472" y="302">0</tspan><tspan x="472" y="320">1</tspan></text>
+  </g>
+
+  <!-- ============ timing ============ -->
+  <text x="560" y="48" class="cf-muted">compute_metrics</text>
+  <text x="560" y="62" class="cf-muted">484M fragments, RTX 5070</text>
+  <text x="560" y="96" class="cf-text cf-bold" style="font-size:22px">51 s</text>
+  <rect x="560" y="106" width="180" height="10" rx="3" class="cf-slow"/>
+
+  <text x="560" y="272" class="cf-text cf-bold" style="font-size:22px">9 s</text>
+  <rect x="560" y="282" width="180" height="10" rx="3" class="cf-track"/>
+  <rect x="560" y="282" width="32" height="10" rx="3" class="cf-fast"/>
+
+  <text x="20" y="358" class="cf-muted">Chromosomes take the same path: a small lookup table maps chrom_id to the chromosomes requested.</text>
 </svg>

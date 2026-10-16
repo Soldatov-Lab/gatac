@@ -25,7 +25,7 @@ import pyarrow.parquet as pq  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
 import gatac as ga  # noqa: E402
-from gatac.pp.fragments import FragmentFile  # noqa: E402
+from gatac.io.fragments import FragmentFile  # noqa: E402
 
 CHROM_SIZES = {"chr1": 3_000_000, "chr2": 2_500_000, "chr3": 2_000_000, "chrX": 1_500_000}
 
@@ -59,7 +59,7 @@ def data(tmp_path_factory):
     with gzip.open(tsv, "wt") as fh:
         fh.write("# header comment\n")
         df.to_csv(fh, sep="\t", header=False, index=False)
-    path = ga.pp.make_parquet(tsv, d / "frags.parquet", barcode_prefix="S1_", row_group_size=9_000)
+    path = ga.io.make_parquet(tsv, d / "frags.parquet", barcode_prefix="S1_", row_group_size=9_000)
     df["barcode"] = "S1_" + df["barcode"]
     gtf = d / "genes.gtf"
     rows = []
@@ -160,20 +160,33 @@ def test_rejects_other_parquet(data, tmp_path):
 def test_batch_prefixes_and_no_partial_file(data, tmp_path):
     tsv_b = tmp_path / "other.tsv.gz"
     shutil.copy(data["tsv"], tsv_b)
-    outs = ga.pp.make_parquet_batch([data["tsv"], tsv_b], output_dir=tmp_path / "out",
+    outs = ga.io.make_parquet_batch([data["tsv"], tsv_b], output_dir=tmp_path / "out",
                                     barcode_prefix=["A_", "B_"], workers=2)
     for out, prefix in zip(outs, ["A_", "B_"]):
         assert all(b.startswith(prefix) for b in FragmentFile(out).barcode_counts()["barcode"])
     bad = pd.DataFrame({"barcode": ["not-in-file"], "n_unique": [1], "n_total": [1]})
     target = tmp_path / "bad.parquet"
     with pytest.raises(ValueError):
-        ga.pp.fragments.write_fragments(lambda: FragmentFile(data["path"]).iter_arrow(), target,
+        ga.io.fragments.write_fragments(lambda: FragmentFile(data["path"]).iter_arrow(), target,
                                         barcode_stats=bad)
     assert not target.exists() and not list(tmp_path.glob("bad.parquet*"))
 
 
+
+def test_to_tsv_round_trip(data, tmp_path):
+    cols = list(data["df"].columns)
+    gz = ga.io.to_tsv(data["path"], tmp_path / "frags.tsv.gz")
+    plain = FragmentFile(data["path"]).to_tsv(tmp_path / "frags.tsv")
+    for out in (gz, plain):
+        got = pd.read_csv(out, sep="\t", header=None, names=cols)
+        pd.testing.assert_frame_equal(got, data["df"], check_dtype=False)
+    raw = gz.read_bytes()
+    assert gzip.decompress(raw) == plain.read_bytes()
+    assert raw[12:14] == b"BC" and raw.endswith(bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000"))
+    assert ga.io.make_parquet(gz, tmp_path / "again.parquet").exists()
+
 def test_read_fragments_parquet_categoricals(data):
-    got = ga.pp.read_fragments_parquet(data["path"]).to_pandas()
+    got = ga.io.read_fragments_parquet(data["path"]).to_pandas()
     assert got["chrom"].dtype == "category" and got["barcode"].dtype == "category"
     df = data["df"]
     assert list(got["chrom"].cat.categories) == sorted(df["chrom"].unique())
@@ -253,7 +266,7 @@ def _cells_adata(data):
 
 def test_peaks_run(data):
     adata = _cells_adata(data)
-    called = ga.tl.call_peaks(adata, "group", data["path"], genome=CHROM_SIZES,
+    called = ga.peak.call(adata, "group", data["path"], genome=CHROM_SIZES,
                               verbose=False, inplace=False)
     assert sum(len(p) for p in called.values()) > 0
 
@@ -263,13 +276,13 @@ def test_peaks_run(data):
     # counting_strategy="fragment" is not exercised: it fails on cupy's
     # array-valued `repeats`.
     for strategy in ("paired-insertion", "insertion"):
-        res = ga.tl.make_peak_matrix(adata, data["path"], peak_file=peak_file, use_rep=None,
+        res = ga.peak.make_matrix(adata, data["path"], peak_file=peak_file, use_rep=None,
                                      genome=CHROM_SIZES, counting_strategy=strategy, verbose=False)
         assert res.X.nnz > 0
 
 
 def test_footprint_cuts(data):
-    from gatac.tl.footprint import _load_cuts
+    from gatac.tobias.footprint import _load_cuts
     adata = _cells_adata(data)
     groups = dict(zip(adata.obs_names, (adata.obs["group"] == "a").astype(int)))
     sizes = {c: CHROM_SIZES[c] for c in ("chr1", "chr2")}

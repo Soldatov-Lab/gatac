@@ -1,9 +1,9 @@
-"""GPU site bookkeeping of tl.bindetect against its sequential references."""
+"""GPU site bookkeeping of tobias.bindetect against its sequential references."""
 import cupy as cp
 import numpy as np
 import scipy.stats
 
-from gatac.tl.bindetect import (
+from gatac.tobias.bindetect import (
     _count_kernel, _count_overlaps, _launch, _resolve_kernel, _resolve_overlaps, _sample_changes,
     _sample_changes_exact_null, _segments, _stable_order, _strkey_kernel,
 )

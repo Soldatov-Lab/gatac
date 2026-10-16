@@ -21,7 +21,7 @@ from cupyx.scipy.ndimage import maximum_filter1d
 from cupyx.scipy.special import pdtr, pdtrc
 from numba import njit, prange
 
-from ..pp.fragments import FragmentFile
+from ..io.fragments import FragmentFile
 from ..pp.genome import get_chrom_sizes
 from ..pp.gene import optimize_sparse_matrix_dtype
 
@@ -626,7 +626,7 @@ def _read_fragments_to_chrom_groups(
 # =============================================================================
 
 
-def call_peaks(
+def call(
     adata: "AnnData",
     groupby: str,
     parquet_path: Union[str, Path],
@@ -706,7 +706,7 @@ def call_peaks(
     >>> # Load tiled AnnData with cluster assignments
     >>> adata = sc.read_h5ad("tiled_matrix.h5ad")
     >>> # Call peaks per cluster (default settings for ATAC-seq)
-    >>> gatac.tl.call_peaks(
+    >>> gatac.peak.call(
     ...     adata,
     ...     groupby="leiden",
     ...     parquet_path="/path/to/fragments.parquet",
@@ -1035,7 +1035,7 @@ def _find_overlapping_groups_with_chroms_numba(
     return group_ids, current_group + 1
 
 
-def merge_peaks(
+def merge(
     peaks: Union[dict[str, pd.DataFrame], "AnnData"],
     chrom_sizes: Optional[Union[str, dict[str, int]]] = None,
     half_width: int = 250,
@@ -1045,7 +1045,7 @@ def merge_peaks(
 ) -> Optional[pd.DataFrame]:
     """Merge peaks from different groups into fixed-width, non-overlapping peaks.
 
-    This mirrors the behavior of SnapATAC2's ``merge_peaks``.
+    This mirrors the behavior of SnapATAC2's ``merge``.
 
     The algorithm expands each peak summit by ``half_width`` on both sides,
     sorts peaks by genomic position, groups overlapping or adjacent intervals,
@@ -1085,9 +1085,9 @@ def merge_peaks(
     --------
     >>> import gatac as ga
     >>> # Operate in-place on an AnnData: stores results in adata.uns["peaks"]
-    >>> ga.tl.merge_peaks(adata, use_rep="gmacs", key_added="peaks")
+    >>> ga.peak.merge(adata, use_rep="gmacs", key_added="peaks")
     >>> # Or pass a dict of per-group peak DataFrames:
-    >>> peaks_df = ga.tl.merge_peaks(
+    >>> peaks_df = ga.peak.merge(
     ...     adata.uns["gmacs"],
     ...     chrom_sizes="hg38",
     ...     half_width=250,
@@ -1441,7 +1441,7 @@ def _count_fragments_in_peaks_gpu(
     # For paired-insertion, deduplicate (frag_idx, peak_idx) pairs
     # (Note: my optimized logic for paired-insertion already handles same-peak case, 
     # but a fragment could potentially overlap two peaks if they were contiguous.
-    # However, merge_peaks ensures they are non-overlapping with a gap of at least 1.)
+    # However, merge ensures they are non-overlapping with a gap of at least 1.)
     if counting_strategy == "paired-insertion":
         all_overlaps = all_overlaps.drop_duplicates(subset=['frag_idx', 'peak_idx'])
     
@@ -1548,7 +1548,7 @@ def _read_and_count_fragments_batched(
     return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
 
-def make_peak_matrix(
+def make_matrix(
     adata: "AnnData",
     parquet_path: Union[str, Path, list[Union[str, Path]]],
     *,
@@ -1619,23 +1619,23 @@ def make_peak_matrix(
     --------
     >>> import gatac
     >>> # After calling peaks and merging
-    >>> gatac.tl.merge_peaks(adata, use_rep="gmacs", key_added="peaks")
+    >>> gatac.peak.merge(adata, use_rep="gmacs", key_added="peaks")
     >>> # Create peak matrix from a single file
-    >>> peak_mat = gatac.tl.make_peak_matrix(
+    >>> peak_mat = gatac.peak.make_matrix(
     ...     adata,
     ...     parquet_path="/path/to/fragments.parquet",
     ...     use_rep="peaks",
     ...     inplace=False,
     ... )
     >>> # Create peak matrix from multiple files
-    >>> peak_mat = gatac.tl.make_peak_matrix(
+    >>> peak_mat = gatac.peak.make_matrix(
     ...     adata,
     ...     parquet_path=["/path/to/sample1.parquet", "/path/to/sample2.parquet"],
     ...     use_rep="peaks",
     ...     inplace=False,
     ... )
     >>> # Create peak matrix from directory (uses source_file obs)
-    >>> peak_mat = gatac.tl.make_peak_matrix(
+    >>> peak_mat = gatac.peak.make_matrix(
     ...     adata,
     ...     parquet_path="/path/to/parquet_dir/",
     ...     use_rep="peaks",

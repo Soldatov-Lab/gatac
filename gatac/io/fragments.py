@@ -1,6 +1,6 @@
 """
 GATAC fragment Parquet files: the layout, the reader, and the streaming
-writer behind :func:`gatac.pp.make_parquet`.
+writer behind :func:`gatac.io.make_parquet`.
 
 Chromosomes and barcodes are integer ids, and the lookup tables travel inside
 the same file::
@@ -25,6 +25,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import struct
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional, Sequence, Union
 
@@ -35,6 +38,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
@@ -66,7 +70,7 @@ _STORED_NAME = {"chrom": "chrom_id", "barcode": "barcode_id"}
 
 class FragmentFile:
     """
-    A GATAC fragment Parquet file, as written by :func:`gatac.pp.make_parquet`.
+    A GATAC fragment Parquet file, as written by :func:`gatac.io.make_parquet`.
 
     Every GATAC function that reads fragments goes through this class. It
     streams chromosomes and barcodes as integer ids and decodes them to
@@ -75,7 +79,7 @@ class FragmentFile:
     Parameters
     ----------
     path : str or Path
-        Fragment Parquet file written by :func:`gatac.pp.make_parquet`.
+        Fragment Parquet file written by :func:`gatac.io.make_parquet`.
 
     Attributes
     ----------
@@ -89,7 +93,7 @@ class FragmentFile:
     Examples
     --------
     >>> import gatac as ga
-    >>> ff = ga.pp.FragmentFile("pbmc.parquet")
+    >>> ff = ga.io.FragmentFile("pbmc.parquet")
     >>> counts = ff.barcode_counts()          # barcode, n_unique, n_total
     >>> for batch in ff.iter_batches(["chrom", "start", "end"],
     ...                              chroms=["chr1", "chr2"],
@@ -105,7 +109,7 @@ class FragmentFile:
         if b"gatac.format_version" not in kv:
             raise ValueError(
                 f"{self.path.name} is not a GATAC fragment file; convert the "
-                "fragments.tsv.gz with gatac.pp.make_parquet"
+                "fragments.tsv.gz with gatac.io.make_parquet"
             )
         version = kv[b"gatac.format_version"].decode()
         if version != FORMAT_VERSION:
@@ -379,6 +383,139 @@ class FragmentFile:
                 barcode_names.take(b.column("barcode_id")),
                 b.column("count"),
             ], schema=NAMED_SCHEMA)
+
+    def to_tsv(self, output_path: Union[str, Path], compresslevel: int = 6) -> Path:
+        """
+        Write the fragments back to a fragments TSV, in file order.
+
+        Rows are ``chrom, start, end, barcode, count`` with the stored barcode
+        names, including any ``barcode_prefix`` given to
+        :func:`gatac.io.make_parquet`. A path ending in ``.gz`` is written as
+        BGZF, the blocked gzip of ``bgzip``: any gzip reader opens it, and
+        ``tabix -p bed`` indexes it when the fragments are sorted by position,
+        as in a Cell Ranger file. Any other path is written uncompressed.
+
+        Parameters
+        ----------
+        output_path : str or Path
+            Output ``.tsv.gz`` (BGZF) or ``.tsv`` file.
+        compresslevel : int
+            zlib compression level of the BGZF blocks (default 6).
+
+        Returns
+        -------
+        Path
+            Path to the written file.
+
+        Examples
+        --------
+        >>> import gatac as ga
+        >>> ga.io.FragmentFile("pbmc.parquet").to_tsv("pbmc.tsv.gz")
+        """
+        output_path = Path(output_path)
+        if output_path.resolve() == self.path.resolve():
+            raise ValueError(f"output_path must differ from the input: {output_path}")
+        options = pa_csv.WriteOptions(include_header=False, delimiter="\t", quoting_style="none")
+        out = (_BgzfWriter(output_path, compresslevel) if output_path.suffix == ".gz"
+               else open(output_path, "wb"))
+        with out:
+            for table in self.iter_arrow():
+                sink = pa.BufferOutputStream()
+                pa_csv.write_csv(table, sink, options)
+                out.write(sink.getvalue())
+        return output_path
+
+
+FRAGMENT_DTYPES = {
+    'chrom': 'category',
+    'start': 'uint32',
+    'end': 'uint32',
+    'barcode': 'category',
+    'count': 'uint16'
+}
+
+
+def read_fragments_parquet(
+    input_path: str | Path,
+    low_memory: bool = True,
+    columns: Optional[List[str]] = None,
+) -> cudf.DataFrame:
+    """
+    Read ATAC fragments from Parquet file optimized for GPU memory.
+
+    Returns the columns of FRAGMENT_DTYPES:
+    ['chrom', 'start', 'end', 'barcode', 'count'], with ``chrom`` and
+    ``barcode`` as categoricals built from the stored integer ids (see
+    :class:`gatac.io.FragmentFile`).
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> df = ga.io.read_fragments_parquet("pbmc.parquet")
+    >>> df.columns.tolist()
+    ['chrom', 'start', 'end', 'barcode', 'count']
+    """
+
+    if columns is None:
+        columns = list(FRAGMENT_DTYPES.keys())
+
+    df = FragmentFile(input_path).read_categorical(columns, low_memory=low_memory)
+
+    # Ensure dtypes match our expectation to save memory
+    for col, dtype in FRAGMENT_DTYPES.items():
+        if col in df.columns and df[col].dtype != dtype:
+            df[col] = df[col].astype(dtype)
+
+    return df
+
+
+# Uncompressed bytes per BGZF block, as in htslib: the compressed block must
+# fit the 16-bit BSIZE field even when the data does not compress.
+_BGZF_BLOCK = 0xFF00
+_BGZF_EOF = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
+
+
+class _BgzfWriter:
+    """Write BGZF: gzip members of at most 64 KiB, compressed on a thread pool."""
+
+    def __init__(self, path: Path, compresslevel: int = 6):
+        self._fh = open(path, "wb")
+        self._level = compresslevel
+        self._pending = b""
+        self._pool = ThreadPoolExecutor(min(8, os.cpu_count() or 1))
+
+    def _block(self, data) -> bytes:
+        c = zlib.compressobj(self._level, zlib.DEFLATED, -15)
+        cdata = c.compress(data) + c.flush()
+        # gzip header with the BGZF extra field: "BC", BSIZE = block size - 1
+        header = struct.pack("<4BI2BH2BHH", 0x1F, 0x8B, 8, 4, 0, 0, 0xFF, 6,
+                             ord("B"), ord("C"), 2, len(cdata) + 25)
+        return header + cdata + struct.pack("<II", zlib.crc32(data), len(data))
+
+    def write(self, data) -> None:
+        data = memoryview(self._pending + memoryview(data).tobytes())
+        full = len(data) - len(data) % _BGZF_BLOCK
+        chunks = [data[i:i + _BGZF_BLOCK] for i in range(0, full, _BGZF_BLOCK)]
+        for block in self._pool.map(self._block, chunks):
+            self._fh.write(block)
+        self._pending = data[full:].tobytes()
+
+    def close(self, complete: bool = True) -> None:
+        try:
+            if complete:
+                if self._pending:
+                    self._fh.write(self._block(self._pending))
+                self._fh.write(_BGZF_EOF)
+        finally:
+            self._pool.shutdown()
+            self._fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # No EOF marker after an error, so the file reads as truncated
+        self.close(complete=exc_type is None)
 
 
 def _empty_counts(with_mito: bool) -> pd.DataFrame:

@@ -1,5 +1,5 @@
 """
-GPU differential TF binding: TOBIAS BINDetect on :class:`~gatac.tl.footprint.FootprintTracks`.
+GPU differential TF binding: TOBIAS BINDetect on :class:`~gatac.tobias.footprint.FootprintTracks`.
 
 Reimplements TOBIAS 0.17.5 ``BINDetect`` with default parameters. Every step
 gives the same numbers as TOBIAS given the same footprint scores:
@@ -799,9 +799,9 @@ def bindetect_sites(
 
     Examples
     --------
-    >>> sites = ga.tl.bindetect_sites(tracks, "cisBP_human.meme")
+    >>> sites = ga.tobias.bindetect_sites(tracks, "cisBP_human.meme")
     >>> for tracks in per_patient_tracks:
-    ...     res = ga.tl.bindetect(tracks, sites=sites)
+    ...     res = ga.tobias.bindetect(tracks, sites=sites)
     """
     T = {}
     t0 = time.perf_counter()
@@ -1107,11 +1107,11 @@ def bindetect(
     Parameters
     ----------
     tracks : FootprintTracks
-        Output of :func:`gatac.tl.footprint`.
+        Output of :func:`gatac.tobias.footprint`.
     motifs : str, Path or list of DNAMotif, optional
         MEME file (read like TOBIAS, including ``nsites``) or GATAC motifs
-        (e.g. a subset from :func:`gatac.tl.read_motifs`). Pass the MEME path to
-        reproduce TOBIAS exactly: :class:`~gatac.tl.DNAMotif` stores clipped,
+        (e.g. a subset from :func:`gatac.motif.read`). Pass the MEME path to
+        reproduce TOBIAS exactly: :class:`~gatac.motif.DNAMotif` stores clipped,
         renormalised probabilities and no ``nsites`` (20 is assumed). Not
         needed with ``sites``.
     genome_fasta : str or Path, optional
@@ -1148,9 +1148,9 @@ def bindetect(
 
     Examples
     --------
-    >>> tracks = ga.tl.footprint(adata, "cell_type", "fragments.parquet", "GRCh38.fa",
+    >>> tracks = ga.tobias.footprint(adata, "cell_type", "fragments.parquet", "GRCh38.fa",
     ...                          groups=["CD14 Mono", "CD4 Memory"])
-    >>> res = ga.tl.bindetect(tracks, "cisBP_human.meme")
+    >>> res = ga.tobias.bindetect(tracks, "cisBP_human.meme")
     >>> res.results.sort_values("CD14 Mono_CD4 Memory_change").head()
     """
     import scipy.stats

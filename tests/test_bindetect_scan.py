@@ -1,9 +1,9 @@
-"""GPU motif scan of tl.bindetect against MOODS itself (the scanner TOBIAS uses)."""
+"""GPU motif scan of tobias.bindetect against MOODS itself (the scanner TOBIAS uses)."""
 import numpy as np
 import pytest
 
-from gatac.tl.bindetect import _moods_order, _scan, _short_run_hits, _thresholds
-from gatac.tl.footprint import _merge
+from gatac.tobias.bindetect import _moods_order, _scan, _short_run_hits, _thresholds
+from gatac.tobias.footprint import _merge
 
 MOODS = pytest.importorskip("MOODS.scan")
 

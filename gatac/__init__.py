@@ -2,8 +2,13 @@
 GATAC - GPU-accelerated ATAC-seq processing toolkit.
 
 Public API:
+    - io: Fragment files (reading, writing, conversion)
     - pp: Preprocessing functions
-    - tl: Tools (analysis functions)
+    - dr: Dimensionality reduction
+    - peak: Peak calling and marker peaks
+    - motif: Motif enrichment and chromVAR
+    - tobias: TOBIAS footprinting and differential TF binding
+    - pl: Plotting
 """
 
 import logging
@@ -15,18 +20,22 @@ import sys
 if not sys.stderr.isatty():
     os.environ.setdefault("TQDM_DISABLE", "1")
 
+from . import io
 from . import pp
-from . import tl
+from . import dr
+from . import peak
+from . import motif
+from . import tobias
 from . import pl
 
 __version__ = "0.1.0"
-__all__ = ["pp", "tl", "pl", "set_verbosity"]
+__all__ = ["io", "pp", "dr", "peak", "motif", "tobias", "pl", "set_verbosity"]
 
 # ---------------------------------------------------------------------------
 # Package-level logging
 # ---------------------------------------------------------------------------
 # Attach a single StreamHandler to the "gatac" root logger so that
-# INFO messages from all submodules (gatac.tl.spectral, etc.) are visible
+# INFO messages from all submodules (gatac.dr.spectral, etc.) are visible
 # when the library is imported interactively or in a script.
 # Users can silence output with gatac.set_verbosity("WARNING") or by
 # configuring their own handlers via the standard logging API.

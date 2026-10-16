@@ -22,7 +22,7 @@ def bindetect_volcano(res, group1=None, group2=None, label_top=5, ax=None):
     Parameters
     ----------
     res : BINDetectResult
-        Output of :func:`gatac.tl.bindetect`.
+        Output of :func:`gatac.tobias.bindetect`.
     group1, group2 : str, optional
         The comparison to plot (default: the first comparison of ``res``).
     label_top : int, default 5
@@ -36,7 +36,7 @@ def bindetect_volcano(res, group1=None, group2=None, label_top=5, ax=None):
 
     Examples
     --------
-    >>> res = ga.tl.bindetect(tracks, "cisBP_human.meme")
+    >>> res = ga.tobias.bindetect(tracks, "cisBP_human.meme")
     >>> ga.pl.bindetect_volcano(res, "CD14 Mono", "CD4 Memory")
     """
     if group1 is None or group2 is None:
@@ -78,9 +78,9 @@ def footprint_aggregate(tracks, res, motif, groups=None, flank=60, bound_in=None
     Parameters
     ----------
     tracks : FootprintTracks
-        Output of :func:`gatac.tl.footprint`; ``track`` must have been kept.
+        Output of :func:`gatac.tobias.footprint`; ``track`` must have been kept.
     res : BINDetectResult
-        Output of :func:`gatac.tl.bindetect` with ``return_sites=True``.
+        Output of :func:`gatac.tobias.bindetect` with ``return_sites=True``.
     motif : str
         Motif ``output_prefix``, ``motif_id`` or ``name``.
     groups : list of str, optional

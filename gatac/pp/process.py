@@ -20,56 +20,10 @@ from tqdm import tqdm
 
 from .genome import HG38, HG19, MM10, MM39  # For type checking if needed in other modules, but actually not used here.
 # Actually, let's just remove the .tile and .gene imports.
-from .fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
 
 # Predefined dtypes to minimize memory footprint
-FRAGMENT_DTYPES = {
-    'chrom': 'category',
-    'start': 'uint32',
-    'end': 'uint32',
-    'barcode': 'category',
-    'count': 'uint16'
-}
-
-def read_fragments_parquet(
-    input_path: str | Path,
-    low_memory: bool = True,
-    columns: Optional[List[str]] = None,
-) -> cudf.DataFrame:
-    """
-    Read ATAC fragments from Parquet file optimized for GPU memory.
-
-    Returns the columns of FRAGMENT_DTYPES:
-    ['chrom', 'start', 'end', 'barcode', 'count'], with ``chrom`` and
-    ``barcode`` as categoricals built from the stored integer ids (see
-    :class:`gatac.pp.FragmentFile`).
-
-    Examples
-    --------
-    >>> import gatac as ga
-    >>> df = ga.pp.read_fragments_parquet("pbmc.parquet")
-    >>> df.columns.tolist()
-    ['chrom', 'start', 'end', 'barcode', 'count']
-    """
-
-    if columns is None:
-        columns = list(FRAGMENT_DTYPES.keys())
-
-    df = FragmentFile(input_path).read_categorical(columns, low_memory=low_memory)
-
-    # Ensure dtypes match our expectation to save memory
-    for col, dtype in FRAGMENT_DTYPES.items():
-        if col in df.columns and df[col].dtype != dtype:
-            df[col] = df[col].astype(dtype)
-
-    return df
-
-
-
-
-
 def combine(
     input_paths: list[str | Path],
     output_path: str | Path,

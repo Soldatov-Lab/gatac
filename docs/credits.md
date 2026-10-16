@@ -31,8 +31,8 @@ source code is bundled with or linked into GATAC.
 
 ### TOBIAS
 
-GATAC's footprinting (`gatac.tl.footprint`) and differential binding
-(`gatac.tl.bindetect`) are a **port** of
+GATAC's footprinting (`gatac.tobias.footprint`) and differential binding
+(`gatac.tobias.bindetect`) are a **port** of
 [**TOBIAS**](https://github.com/loosolab/TOBIAS) 0.17.5 (`ATACorrect`,
 `ScoreBigwig`, `BINDetect`) of Bentsen M. et al., *Nature Communications*,
 2020. The algorithms are translated line for line and executed on the GPU;
@@ -49,7 +49,7 @@ Biopython License), and site scanning follows MOODS's summation order.
 
 ### MINPACK (via SciPy)
 
-`gatac/tl/_minpack_relu.cu` is a CUDA adaptation of SciPy's C translation of
+`gatac/tobias/_minpack_relu.cu` is a CUDA adaptation of SciPy's C translation of
 MINPACK's `lmdif` (used by `scipy.optimize.curve_fit`), specialised to the
 two-parameter ReLU fits of TOBIAS ATACorrect. SciPy is distributed under the
 BSD 3-Clause License. This product includes software developed by the

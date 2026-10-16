@@ -60,7 +60,7 @@ def test_spmv_matches_cusparse_and_repeats_bitwise():
     import cupy as cp
     import cupyx.scipy.sparse as cusp
 
-    from gatac.tl.lsi import _spmm, _spmv
+    from gatac.dr.lsi import _spmm, _spmv
 
     X = cusp.csr_matrix(_synthetic(400, 1500).astype(np.float32))
     cp.random.seed(0)
@@ -94,7 +94,7 @@ def test_lsi_is_bitwise_reproducible():
             cp.random.seed(i + 17)
             cp.random.random(53)
         a = _adata(X)
-        ga.tl.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
+        ga.dr.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
         runs.append((a.obsm["X_lsi"], a.uns["lsi"]["singular_values"]))
 
     for emb, sv in runs[1:]:
@@ -102,7 +102,7 @@ def test_lsi_is_bitwise_reproducible():
         assert np.array_equal(sv, runs[0][1])
 
     a = _adata(X)
-    ga.tl.lsi(a, 10, random_state=4, outlier_quantiles=(0.02, 0.98))
+    ga.dr.lsi(a, 10, random_state=4, outlier_quantiles=(0.02, 0.98))
     # a different seed must actually be a different draw, or the seed is a lie
     assert not np.array_equal(a.obsm["X_lsi"], runs[0][0])
 
@@ -114,7 +114,7 @@ def test_iterative_lsi_is_bitwise_reproducible():
     out = []
     for _ in range(2):
         a = _adata(X)
-        ga.tl.iterative_lsi(
+        ga.dr.iterative_lsi(
             a, 10, iterations=2, n_features=800, total_features=3000,
             cluster_params={"k": 15, "max_clusters": 4}, random_state=1)
         out.append((
@@ -135,7 +135,7 @@ def test_lsi_reproducible_across_processes():
         from test_lsi_determinism import _adata, _synthetic
         import gatac as ga
         a = _adata(_synthetic())
-        ga.tl.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
+        ga.dr.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
         sys.stdout.buffer.write(a.obsm["X_lsi"].tobytes())
     """).format(tests=__file__.rsplit("/", 1)[0])
     outs = [subprocess.run([sys.executable, "-c", script], check=True,
@@ -144,7 +144,7 @@ def test_lsi_reproducible_across_processes():
 
     import gatac as ga
     a = _adata(_synthetic())
-    ga.tl.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
+    ga.dr.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
     assert a.obsm["X_lsi"].tobytes() == outs[0]
 
 
@@ -154,9 +154,9 @@ def test_deterministic_false_still_runs_and_agrees_numerically():
 
     X = _synthetic()
     a = _adata(X)
-    ga.tl.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
+    ga.dr.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
     b = _adata(X)
-    ga.tl.lsi(b, 10, random_state=3, outlier_quantiles=(0.02, 0.98),
+    ga.dr.lsi(b, 10, random_state=3, outlier_quantiles=(0.02, 0.98),
               deterministic=False)
     r = np.array([abs(np.corrcoef(a.obsm["X_lsi"][:, i], b.obsm["X_lsi"][:, i])[0, 1])
                   for i in range(10)])

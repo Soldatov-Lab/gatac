@@ -192,7 +192,7 @@ def compute_peak_bias(
     Examples
     --------
     >>> import gatac as ga
-    >>> ga.tl.compute_peak_bias(peak_adata, "genome.fa")
+    >>> ga.motif.compute_peak_bias(peak_adata, "genome.fa")
     >>> peak_adata.var["gc_content"]  # GC content per peak
     """
     logger.info(f"Computing peak biases from {genome_fasta}...")
@@ -415,11 +415,11 @@ def sample_bg_peaks(
     --------
     >>> import gatac as ga
     >>> # Option A: precompute biases separately
-    >>> ga.tl.compute_peak_bias(peak_adata, "genome.fa")
-    >>> ga.tl.sample_bg_peaks(peak_adata, method="knn")
+    >>> ga.motif.compute_peak_bias(peak_adata, "genome.fa")
+    >>> ga.motif.sample_bg_peaks(peak_adata, method="knn")
     >>>
     >>> # Option B: let sample_bg_peaks compute gc_content on the fly
-    >>> ga.tl.sample_bg_peaks(peak_adata, method="knn", genome_fasta="genome.fa")
+    >>> ga.motif.sample_bg_peaks(peak_adata, method="knn", genome_fasta="genome.fa")
     >>> peak_adata.varm["bg_peaks"]  # Background indices
     """
     # Compute reads per peak (log10 transformed)
@@ -434,7 +434,7 @@ def sample_bg_peaks(
         if genome_fasta is None:
             raise ValueError(
                 "'gc_content' is not in adata.var and no genome_fasta was provided. "
-                "Either run ga.tl.compute_peak_bias(adata, genome_fasta) first, "
+                "Either run ga.motif.compute_peak_bias(adata, genome_fasta) first, "
                 "or pass genome_fasta to sample_bg_peaks()."
             )
         logger.info("'gc_content' not found in adata.var — computing automatically...")
@@ -494,7 +494,7 @@ def sample_bg_peaks(
 # =============================================================================
 
 
-def scan_motifs(
+def scan(
     adata: AnnData,
     motifs: list[DNAMotif],
     genome_fasta: Union[str, Path],
@@ -511,7 +511,7 @@ def scan_motifs(
     Scan peaks for motif matches and create a sparse motif match matrix.
     
     This function wraps the existing GPU motif scanning infrastructure from
-    `gatac.tl.motif` and produces a boolean matrix indicating which peaks
+    `gatac.motif.motif` and produces a boolean matrix indicating which peaks
     contain each motif.
     
     Parameters
@@ -520,7 +520,7 @@ def scan_motifs(
         AnnData object with peak matrix. Peak names in `adata.var_names` should be
         in "chr:start-end" format.
     motifs : list[DNAMotif]
-        List of motifs to scan (from `read_motifs` or `parse_meme`)
+        List of motifs to scan (from `read` or `parse_meme`)
     genome_fasta : str or Path
         Path to genome FASTA file (supports .fa, .fasta, .fa.gz, .fasta.gz)
     pvalue : float, default 5e-5
@@ -558,13 +558,13 @@ def scan_motifs(
     Examples
     --------
     >>> import gatac as ga
-    >>> motifs = ga.tl.read_motifs("motifs.meme")
+    >>> motifs = ga.motif.read("motifs.meme")
     >>> 
     >>> # For GATAC-generated peaks (0-based BED format)
-    >>> ga.tl.scan_motifs(peak_adata, motifs, "genome.fa")
+    >>> ga.motif.scan(peak_adata, motifs, "genome.fa")
     >>> 
     >>> # For R/chromVAR peaks (1-based GenomicRanges format)
-    >>> ga.tl.scan_motifs(
+    >>> ga.motif.scan(
     ...     peak_adata, motifs, "genome.fa",
     ...     coordinate_system="1-based"
     ... )
@@ -863,7 +863,7 @@ def compute_deviations(
     expectation. Requires prior setup:
 
     1. `sample_bg_peaks()` to generate `adata.varm["bg_peaks"]`
-    2. `scan_motifs()` to generate `adata.varm["motif_match"]`
+    2. `scan()` to generate `adata.varm["motif_match"]`
 
     The algorithm:
     - For each cell, computes observed motif accessibility
@@ -876,8 +876,8 @@ def compute_deviations(
     adata : AnnData
         AnnData object with peak matrix (cells × peaks). Must have:
         - `adata.varm["bg_peaks"]`: Background peak indices from `sample_bg_peaks()`
-        - `adata.varm["motif_match"]`: Motif match matrix from `scan_motifs()`
-        - `adata.uns["motif_name"]`: Motif names from `scan_motifs()`
+        - `adata.varm["motif_match"]`: Motif match matrix from `scan()`
+        - `adata.uns["motif_name"]`: Motif names from `scan()`
     batch_size : int, default 5000
         Number of cells to process at once. Reduce if GPU memory is limited.
     motif_batch_size : int, default -1
@@ -899,18 +899,18 @@ def compute_deviations(
     >>> import gatac as ga
     >>>
     >>> # 1. Create peak matrix
-    >>> peak_adata = ga.tl.make_peak_matrix(tile_adata, parquet_path)
+    >>> peak_adata = ga.peak.make_matrix(tile_adata, parquet_path)
     >>>
     >>> # 2. Compute biases and sample background
-    >>> ga.tl.compute_peak_bias(peak_adata, "genome.fa")
-    >>> ga.tl.sample_bg_peaks(peak_adata)
+    >>> ga.motif.compute_peak_bias(peak_adata, "genome.fa")
+    >>> ga.motif.sample_bg_peaks(peak_adata)
     >>>
     >>> # 3. Scan motifs
-    >>> motifs = ga.tl.read_motifs("motifs.meme")
-    >>> ga.tl.scan_motifs(peak_adata, motifs, "genome.fa")
+    >>> motifs = ga.motif.read("motifs.meme")
+    >>> ga.motif.scan(peak_adata, motifs, "genome.fa")
     >>>
     >>> # 4. Compute deviations (stored in peak_adata.obsm["chromvar"])
-    >>> ga.tl.compute_deviations(peak_adata)
+    >>> ga.motif.compute_deviations(peak_adata)
     >>> peak_adata.obsm["chromvar"]  # DataFrame (cells × motifs)
     """
     # Validate inputs
@@ -923,13 +923,13 @@ def compute_deviations(
     if "motif_match" not in adata.varm:
         raise ValueError(
             "Cannot find 'motif_match' in adata.varm. "
-            "Please run scan_motifs() first."
+            "Please run scan() first."
         )
     
     if "motif_name" not in adata.uns:
         raise ValueError(
             "Cannot find 'motif_name' in adata.uns. "
-            "Please run scan_motifs() first."
+            "Please run scan() first."
         )
     
     logger.info("Computing chromVAR deviations on GPU...")
@@ -1129,7 +1129,7 @@ def chromvar(
 
     1. `compute_peak_bias` — GC content from genome FASTA
     2. `sample_bg_peaks` — background peak sampling
-    3. `read_motifs` + `scan_motifs` — motif matching
+    3. `read` + `scan` — motif matching
     4. `compute_deviations` — TF deviation scores
 
     Parameters
@@ -1170,14 +1170,14 @@ def chromvar(
     Examples
     --------
     >>> import gatac as ga
-    >>> ga.tl.chromvar(
+    >>> ga.motif.chromvar(
     ...     peak_adata,
     ...     "../resources/GRCh38.p13.genome.fa",
     ...     "../resources/cisBP_human.meme",
     ... )
     >>> peak_adata.obsm["chromvar"]  # DataFrame (cells × motifs)
     """
-    from .motif import read_motifs
+    from .motif import read
 
     logger.info("=== chromVAR pipeline ===")
 
@@ -1188,8 +1188,8 @@ def chromvar(
     sample_bg_peaks(adata, method=method, n_iterations=n_iterations)
 
     logger.info("Step 3/4: Reading motifs and scanning peaks...")
-    motifs = read_motifs(motifs_path)
-    scan_motifs(
+    motifs = read(motifs_path)
+    scan(
         adata,
         motifs,
         genome_fasta,

@@ -22,8 +22,9 @@ def motif_enrichment(enrichment, top_motifs=10, max_cols=4, palette=None):
     Returns
     -------
     fig : matplotlib.figure.Figure
+        The figure.
     axs : numpy.ndarray of matplotlib.axes.Axes
-        The figure and array of axes containing the bar plots.
+        The axes, one bar plot per peak set.
 
     Examples
     --------

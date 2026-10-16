@@ -7,6 +7,7 @@ Public API:
     - dr: Dimensionality reduction
     - peak: Peak calling and marker peaks
     - motif: Motif enrichment and chromVAR
+    - pl: Plotting
 """
 
 import logging

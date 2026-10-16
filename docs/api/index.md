@@ -1,7 +1,8 @@
 # API Reference
 
 GATAC's Python API is organized into namespaces that mirror the workflow:
-fragment files, preprocessing, then one namespace per mode of analysis.
+fragment files, preprocessing, then one namespace per mode of analysis, and
+plotting.
 
 ```{toctree}
 :maxdepth: 2
@@ -12,6 +13,7 @@ preprocessing
 dr
 peak
 motif
+plotting
 ```
 
 ::::{grid} 1 1 3 3
@@ -56,6 +58,14 @@ Peak calling, merging, the cell × peak matrix, and marker peaks.
 :shadow: none
 
 Motif enrichment, GSEA on motif rankings, and chromVAR.
+:::
+
+:::{grid-item-card} {fas}`chart-bar` Plotting — `gatac.pl`
+:link: plotting
+:link-type: doc
+:shadow: none
+
+Fragment size distribution, QC metrics, and motif enrichment plots.
 :::
 
 ::::

@@ -4,19 +4,16 @@
 
 ### Added
 
-- Compact fragment layout, now the only one `make_parquet` / `gatac convert`
-  write: chromosome and barcode ids with the barcode table (original names,
-  fragment and read counts) inside the file. All fragment readers go through
-  the new `pp.FragmentFile` and join cells and chromosomes by integer lookups.
+- Parquet fragment format written by `make_parquet` / `gatac convert`:
+  chromosome and barcode ids with the barcode table (original names, fragment
+  and read counts) inside the file, ZSTD and delta-encoded coordinates. All
+  fragment readers go through the new `pp.FragmentFile` and join cells and
+  chromosomes by integer lookups.
   On a 484M-fragment library (RTX 5070): `compute_metrics` 51 s -> 9 s,
   `detect_doublets` 56 s -> 13 s, `make_peak_matrix` 14 s -> 6 s,
   `make_tile_matrix` 49 s -> 30 s (the rest is host-side matrix assembly). The
   whole-file read of `read_fragments_parquet` (gene matrices) needs about a
-  quarter of the GPU memory. Files are written with ZSTD and delta-encoded
-  coordinates: about 2.6x smaller than the `fragments.tsv.gz` and 2.5x smaller
-  than the former Snappy files. Parquet files from earlier versions (names in
-  every row) are still read, and `make_parquet` repacks them; `filter_fragments`
-  always writes the compact layout.
+  quarter of the GPU memory.
 - `make_parquet_batch` accepts one barcode prefix per input file.
 - GPU-accelerated TSS enrichment scoring with streaming Parquet support.
 - Tile matrix builder with SnapATAC2-compatible `"unique"` count strategy.

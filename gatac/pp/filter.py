@@ -34,9 +34,8 @@ def filter_fragments(
     Filter ATAC fragment parquet file(s) based on cell quality metrics.
 
     Counts fragments per cell with DuckDB and streams the filtered fragments
-    to the output, so memory stays bounded on large files. The output is a
-    compact fragment file (also for legacy input). Supports both single and
-    multiple input files.
+    to the output, so memory stays bounded on large files. Supports both
+    single and multiple input files.
 
     Parameters
     ----------
@@ -206,8 +205,8 @@ def _filter_single_file_streaming(
     """
     Filter a single parquet file using streaming writes.
 
-    The output is a compact fragment file whose per-barcode table is
-    recomputed on the kept fragments; a compact input keeps its chromosome ids.
+    The output's per-barcode table is recomputed on the kept fragments, and
+    it keeps the input's chromosome ids.
 
     Parameters
     ----------
@@ -270,7 +269,7 @@ def _filter_single_file_streaming(
             totals['out'] += t.num_rows
             yield t
 
-    write_fragments(batches, output_path, chroms=fragments.chroms if fragments.compact else None)
+    write_fragments(batches, output_path, chroms=fragments.chroms)
 
     logger.info(f"Filtered {totals['in']:,} -> {totals['out']:,} fragments "
                 f"({100 * totals['out'] / totals['in']:.1f}% retained)")

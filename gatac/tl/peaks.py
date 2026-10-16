@@ -576,7 +576,7 @@ def _read_fragments_to_chrom_groups(
     Parameters
     ----------
     parquet_path : Path or FragmentFile
-        Fragment parquet file (either layout). Pass a FragmentFile to reuse
+        Fragment parquet file. Pass a FragmentFile to reuse
         its barcode table across calls.
     barcodes : set
         Set of barcodes to extract
@@ -1478,7 +1478,7 @@ def _read_and_count_fragments_batched(
     Parameters
     ----------
     parquet_path : Path
-        Path to the fragment parquet file (either layout)
+        Path to the fragment parquet file
     barcodes : set
         Set of barcodes to include
     peaks_gpu : cudf.DataFrame

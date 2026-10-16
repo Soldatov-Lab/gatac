@@ -7,6 +7,7 @@ Public API:
     - dr: Dimensionality reduction
     - peak: Peak calling and marker peaks
     - motif: Motif enrichment and chromVAR
+    - tobias: TOBIAS footprinting and differential TF binding
     - pl: Plotting
 """
 
@@ -24,10 +25,11 @@ from . import pp
 from . import dr
 from . import peak
 from . import motif
+from . import tobias
 from . import pl
 
 __version__ = "0.1.0"
-__all__ = ["io", "pp", "dr", "peak", "motif", "pl", "set_verbosity"]
+__all__ = ["io", "pp", "dr", "peak", "motif", "tobias", "pl", "set_verbosity"]
 
 # ---------------------------------------------------------------------------
 # Package-level logging

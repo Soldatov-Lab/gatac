@@ -291,3 +291,22 @@ def test_peaks_run(data):
         res = ga.peak.make_matrix(adata, data["path"], peak_file=peak_file, use_rep=None,
                                      genome=CHROM_SIZES, counting_strategy=strategy, verbose=False)
         assert res.X.nnz > 0
+
+
+def test_footprint_cuts(data):
+    from gatac.tobias.footprint import _load_cuts
+    adata = _cells_adata(data)
+    groups = dict(zip(adata.obs_names, (adata.obs["group"] == "a").astype(int)))
+    sizes = {c: CHROM_SIZES[c] for c in ("chr1", "chr2")}
+    got = _load_cuts(data["path"], groups, sizes, 50, True)
+    df = data["df"]
+    df = df[df["barcode"].isin(groups) & df["chrom"].isin(sizes)].assign(g=lambda d: d["barcode"].map(groups))
+    df = df.drop_duplicates(["g", "chrom", "start", "end"])
+    length = df["chrom"].map(sizes)
+    s, e = df["start"], df["end"]
+    df = df[(s - 4 >= 0) & (e + 4 - 50 >= 0) & (e + 4 <= length) & (s - 4 + 50 <= length)]
+    for g in set(groups.values()):
+        for c in sizes:
+            sub = df[(df["g"] == g) & (df["chrom"] == c)]
+            assert np.array_equal(got[g][c][0], np.sort(sub["start"].to_numpy()))
+            assert np.array_equal(got[g][c][1], np.sort(sub["end"].to_numpy() - 1))

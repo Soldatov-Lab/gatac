@@ -13,6 +13,7 @@ preprocessing
 dr
 peak
 motif
+tobias
 plotting
 ```
 
@@ -58,6 +59,14 @@ Peak calling, merging, the cell × peak matrix, and marker peaks.
 :shadow: none
 
 Motif enrichment, GSEA on motif rankings, and chromVAR.
+:::
+
+:::{grid-item-card} {fas}`shoe-prints` Footprinting — `gatac.tobias`
+:link: tobias
+:link-type: doc
+:shadow: none
+
+TOBIAS on the GPU: bias-corrected footprints and differential TF binding.
 :::
 
 :::{grid-item-card} {fas}`chart-bar` Plotting — `gatac.pl`

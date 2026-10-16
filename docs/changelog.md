@@ -4,6 +4,10 @@
 
 ### Added
 
+- TOBIAS footprinting on the GPU in `gatac.tobias`: `footprint` (Tn5 bias
+  correction and footprint scores per pseudobulk, from the fragments parquet),
+  `bindetect` and `bindetect_sites` (differential TF binding), and the
+  `pl.bindetect_volcano` / `pl.footprint_aggregate` plots.
 - Parquet fragment format written by `make_parquet` / `gatac convert`:
   chromosome and barcode ids with the barcode table (original names, fragment
   and read counts) inside the file, ZSTD and delta-encoded coordinates. All

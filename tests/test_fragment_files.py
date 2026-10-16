@@ -185,6 +185,18 @@ def test_to_tsv_round_trip(data, tmp_path):
     assert raw[12:14] == b"BC" and raw.endswith(bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000"))
     assert ga.io.make_parquet(gz, tmp_path / "again.parquet").exists()
 
+
+def test_to_tsv_keeps_existing_output(data, tmp_path):
+    # The default output of to_tsv is usually the original fragments file
+    original = tmp_path / "frags.tsv.gz"
+    original.write_bytes(b"original")
+    with pytest.raises(FileExistsError):
+        ga.io.to_tsv(data["path"], original)
+    assert original.read_bytes() == b"original"
+    ga.io.to_tsv(data["path"], original, overwrite=True)
+    assert len(pd.read_csv(original, sep="\t", header=None)) == len(data["df"])
+    assert list(tmp_path.glob("*.tmp")) == []
+
 def test_read_fragments_parquet_categoricals(data):
     got = ga.io.read_fragments_parquet(data["path"]).to_pandas()
     assert got["chrom"].dtype == "category" and got["barcode"].dtype == "category"

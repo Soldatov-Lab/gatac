@@ -670,7 +670,7 @@ def scale_dims(
     algorithm rather than of this port: z-scoring across dimensions **mixes the
     columns**, so the scaled embedding is not invariant to the arbitrary sign
     of an SVD component. Measured on the 4,437-cell PBMC oracle at iteration 1,
-    where GATAC and ArchR agree on every determined component to |r| = 1.000000
+    where GATAC and ArchR agree on every determined component to ``|r| = 1.000000``
     (29 of 30; the 30th sits inside a flat trailing spectrum and is not
     determined by either): 11 of those components come back with opposite
     signs, and the mean per-cell distance between the two scaled embeddings is

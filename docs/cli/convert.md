@@ -34,6 +34,7 @@ gatac convert <input> [--output OUTPUT] [--output-dir DIR]
 | `--output-dir` | same dir as input | Directory for output files in batch mode |
 | `-j`, `--workers` | CPU count | Worker processes for parallel batch conversion |
 | `--barcode-prefix` | — | String prepended to every barcode (e.g., `"Sample1_"`); TSV inputs only |
+| `--overwrite` | off | Replace existing TSV outputs; `.parquet` inputs only |
 
 `--row-group-size` and `--separator` are available from Python
 (`make_parquet(row_group_size=..., separator=...)`).
@@ -77,6 +78,11 @@ columns, in the order of the original file, and barcode names as stored
 (including any `--barcode-prefix`). A `.tsv.gz` output is BGZF-compressed,
 so `tabix -p bed` can index it; a `.tsv` output is plain text.
 
+The default output, `<input>.tsv.gz`, is usually the original fragments
+file the Parquet was made from, so an existing output is never replaced
+without `--overwrite` (`overwrite=True` in Python). The file is written next
+to the target and renamed once complete.
+
 ---
 
 ## Examples
@@ -111,9 +117,9 @@ gatac convert "samples/*.tsv.gz" --output-dir out/ -j 8
 ### Back to TSV
 
 ```bash
-gatac convert pbmc_fragments.parquet
-# → pbmc_fragments.tsv.gz (BGZF)
-tabix -p bed pbmc_fragments.tsv.gz
+gatac convert pbmc_fragments.parquet --output pbmc_roundtrip.tsv.gz
+# → pbmc_roundtrip.tsv.gz (BGZF)
+tabix -p bed pbmc_roundtrip.tsv.gz
 ```
 
 ---
@@ -134,5 +140,5 @@ ga.io.make_parquet_batch(
 )
 
 # Back to TSV
-ga.io.to_tsv("pbmc_fragments.parquet")
+ga.io.to_tsv("pbmc_fragments.parquet", "pbmc_roundtrip.tsv.gz")
 ```

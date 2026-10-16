@@ -899,7 +899,7 @@ def make_tile_matrix(
     )
 
     # ------------------------------------------------------------------ #
-    # 3. Fragment file (standard or compact layout)                        #
+    # 3. Fragment file (compact or legacy layout)                          #
     # ------------------------------------------------------------------ #
     fragments = FragmentFile(input_path)
 

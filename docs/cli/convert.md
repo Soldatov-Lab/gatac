@@ -3,7 +3,8 @@
 Convert raw ATAC-seq fragment files from TSV.GZ to Parquet format, or repack
 an existing GATAC Parquet file.  Uses DuckDB for parallel decompression and
 Parquet row-group sizing tuned for efficient GPU streaming.  Files are written
-with ZSTD and delta-encoded coordinates.
+in the compact layout (below) with ZSTD and delta-encoded coordinates, about
+2.6x smaller than the input `fragments.tsv.gz`.
 
 ---
 
@@ -12,7 +13,7 @@ with ZSTD and delta-encoded coordinates.
 ```
 gatac convert <input> [--output OUTPUT] [--output-dir DIR]
               [-j WORKERS] [--barcode-prefix PREFIX]
-              [--layout {standard,compact}] [--chroms FILE]
+              [--chroms FILE]
 ```
 
 ---
@@ -33,8 +34,7 @@ gatac convert <input> [--output OUTPUT] [--output-dir DIR]
 | `--output-dir` | same dir as input | Directory for output files in batch mode |
 | `-j`, `--workers` | CPU count | Worker processes for parallel batch conversion |
 | `--barcode-prefix` | — | String prepended to every barcode (e.g., `"Sample1_"`) |
-| `--layout` | `standard` | `standard` (names in every row) or `compact` (integer ids plus an in-file barcode table) |
-| `--chroms` | — | Compact layout: file listing the chromosome order for the ids; use the same file for every library of a cohort |
+| `--chroms` | — | File listing the chromosome order for the ids; use the same file for every library of a cohort |
 
 `--row-group-size` and `--separator` are available from Python
 (`make_parquet(row_group_size=..., separator=...)`).
@@ -54,22 +54,23 @@ Compressed with gzip (`.tsv.gz`) or uncompressed (`.tsv`) are both supported.
 
 ---
 
-## Layouts
+## Output layout
 
-| Layout | Columns |
-|--------|---------|
-| `standard` | `chrom`, `start`, `end`, `barcode`, `count` |
-| `compact` | `chrom_id`, `start`, `end`, `barcode_id`, `count`, plus the per-barcode table `bc_name`, `bc_n_unique`, `bc_n_total` |
+Columns: `chrom_id`, `start`, `end`, `barcode_id`, `count`, plus the
+per-barcode table `bc_name`, `bc_n_unique`, `bc_n_total`.
 
-In the compact layout, row *i* of the `bc_*` columns describes barcode id *i*
-(its full original name, number of fragments and read count); they are null
-after the last barcode. Barcode ids are ordered by decreasing fragment count.
-Chromosome names are stored in the file footer (`gatac.chroms`). All GATAC
-functions read both layouts and return the same results; compact files stream
-several times faster on the GPU because cells and chromosomes are joined by
-integer lookups. To read a compact file outside GATAC, use
+Row *i* of the `bc_*` columns describes barcode id *i* (its full original
+name, number of fragments and read count); they are null after the last
+barcode. Barcode ids are ordered by decreasing fragment count. Chromosome
+names are stored in the file footer (`gatac.chroms`). GATAC joins cells and
+chromosomes by integer lookups, so these files stream several times faster on
+the GPU than names in every row. To read a file outside GATAC, use
 `gatac.pp.FragmentFile` (e.g. `FragmentFile(path).register(duckdb_con)` gives
-a DuckDB view with the standard columns).
+a DuckDB view with `chrom`, `start`, `end`, `barcode`, `count`).
+
+Parquet files written by earlier GATAC versions (names in every row) are
+still read by every function; repack them with `gatac convert` to get the
+speed-up. See [Fragment files](../fragment_files.md) for how the layout works.
 
 ---
 
@@ -102,12 +103,11 @@ gatac convert "data/*/fragments.tsv.gz" \
 gatac convert "samples/*.tsv.gz" --output-dir out/ -j 8
 ```
 
-### Compact layout, or repack existing Parquet files
+### Repack Parquet files from an earlier GATAC version
 
 ```bash
-gatac convert pbmc_fragments.tsv.gz --layout compact
 # Repack a cohort with shared chromosome ids
-gatac convert "parquets/*.parquet" --output-dir compact/ --layout compact --chroms chroms.txt
+gatac convert "parquets/*.parquet" --output-dir compact/ --chroms chroms.txt
 ```
 
 ---
@@ -120,9 +120,8 @@ import gatac as ga
 # Single file
 ga.pp.make_parquet("pbmc_fragments.tsv.gz", barcode_prefix="PBMC_")
 
-# Compact layout, or repack an existing Parquet file
-ga.pp.make_parquet("pbmc_fragments.tsv.gz", layout="compact")
-ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet", layout="compact")
+# Repack a Parquet file from an earlier GATAC version
+ga.pp.make_parquet("pbmc.parquet", "pbmc_compact.parquet")
 
 # Batch
 ga.pp.make_parquet_batch(

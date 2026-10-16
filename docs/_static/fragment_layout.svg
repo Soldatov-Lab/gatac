@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 556" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-layout-title">
+  <title id="cf-layout-title">From fragments.tsv.gz to a compact GATAC Parquet file</title>
+  <style>
+    .cf-text  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-base, sans-serif); font-size: 13px; }
+    .cf-muted { fill: var(--pst-color-text-muted, #59636e); font-family: var(--pst-font-family-base, sans-serif); font-size: 11px; }
+    .cf-mono  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-monospace, monospace); font-size: 12px; }
+    .cf-null  { fill: var(--pst-color-text-muted, #59636e); font-family: var(--pst-font-family-monospace, monospace); font-size: 12px; font-style: italic; }
+    .cf-bold  { font-weight: 600; }
+    .cf-box   { fill: var(--pst-color-surface, #f6f8fa); stroke: var(--pst-color-border, #d0d7de); stroke-width: 1; }
+    .cf-file  { fill: none; stroke: var(--pst-color-text-muted, #59636e); stroke-width: 1.2; }
+    .cf-line  { stroke: var(--pst-color-text-muted, #59636e); stroke-width: 1.4; fill: none; }
+    .cf-head  { fill: var(--pst-color-text-muted, #59636e); }
+    .cf-id    { fill: #73b301; fill-opacity: 0.14; stroke: #73b301; stroke-width: 1.2; }
+    .cf-val   { fill: #4c8bf5; fill-opacity: 0.14; stroke: #4c8bf5; stroke-width: 1.2; }
+    .cf-bc    { fill: #e0a020; fill-opacity: 0.16; stroke: #e0a020; stroke-width: 1.2; }
+    .cf-foot  { fill: #9b6bd3; fill-opacity: 0.14; stroke: #9b6bd3; stroke-width: 1.2; }
+  </style>
+  <defs>
+    <marker id="cf-arrow-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="cf-head"/>
+    </marker>
+  </defs>
+
+  <!-- fragments.tsv.gz -->
+  <text x="20" y="20" class="cf-text"><tspan class="cf-bold">fragments.tsv.gz</tspan><tspan class="cf-muted" dx="8">names in every row</tspan></text>
+  <rect x="20" y="30" width="720" height="106" rx="6" class="cf-box"/>
+  <text y="52" class="cf-muted"><tspan x="40">chrom</tspan><tspan x="110">start</tspan><tspan x="190">end</tspan><tspan x="270">barcode</tspan><tspan x="380">count</tspan></text>
+  <text y="72" class="cf-mono"><tspan x="40">chr1</tspan><tspan x="110">10001</tspan><tspan x="190">10200</tspan><tspan x="270">AAACGAAC-1</tspan><tspan x="380">2</tspan></text>
+  <text y="90" class="cf-mono"><tspan x="40">chr1</tspan><tspan x="110">10035</tspan><tspan x="190">10180</tspan><tspan x="270">TTGCATGA-1</tspan><tspan x="380">1</tspan></text>
+  <text y="108" class="cf-mono"><tspan x="40">chr1</tspan><tspan x="110">10102</tspan><tspan x="190">10388</tspan><tspan x="270">TTGCATGA-1</tspan><tspan x="380">1</tspan></text>
+  <text y="126" class="cf-mono"><tspan x="40">chr1</tspan><tspan x="110">10240</tspan><tspan x="190">10511</tspan><tspan x="270">GCTTAGCA-1</tspan><tspan x="380">3</tspan></text>
+  <text x="470" y="72" class="cf-muted">Every row repeats the chromosome and the</text>
+  <text x="470" y="88" class="cf-muted">barcode as text: on the GPU, each batch has</text>
+  <text x="470" y="104" class="cf-muted">to decode these strings and join them by a</text>
+  <text x="470" y="120" class="cf-muted">string merge to find cells and chromosomes.</text>
+
+  <!-- conversion arrow -->
+  <path d="M380,140 V180" class="cf-line" marker-end="url(#cf-arrow-a)"/>
+  <text x="392" y="158" class="cf-text cf-bold">make_parquet · gatac convert</text>
+  <text x="392" y="174" class="cf-muted">names become integer ids; the names are stored once</text>
+
+  <!-- the parquet file -->
+  <rect x="20" y="186" width="720" height="360" rx="8" class="cf-file"/>
+  <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">compact layout · ZSTD · ~2.6x smaller than the .tsv.gz</tspan></text>
+
+  <!-- row group 0 -->
+  <rect x="36" y="218" width="688" height="196" rx="6" class="cf-box"/>
+  <text x="48" y="236" class="cf-muted">row group 0 · 1,000,000 rows</text>
+  <text x="48" y="256" class="cf-text cf-bold">fragments: one row per fragment</text>
+  <text x="432" y="256" class="cf-text cf-bold">barcode table: row i = barcode id i</text>
+
+  <!-- column strips: fragments -->
+  <rect x="48"  y="264" width="70" height="142" rx="4" class="cf-id"/>
+  <rect x="122" y="264" width="70" height="142" rx="4" class="cf-val"/>
+  <rect x="196" y="264" width="70" height="142" rx="4" class="cf-val"/>
+  <rect x="270" y="264" width="80" height="142" rx="4" class="cf-id"/>
+  <rect x="354" y="264" width="58" height="142" rx="4" class="cf-val"/>
+  <!-- column strips: barcode table -->
+  <rect x="432" y="264" width="106" height="142" rx="4" class="cf-bc"/>
+  <rect x="542" y="264" width="86"  height="142" rx="4" class="cf-bc"/>
+  <rect x="632" y="264" width="80"  height="142" rx="4" class="cf-bc"/>
+
+  <!-- headers: name and type · encoding -->
+  <text y="281" class="cf-text cf-bold" style="font-size:11px"><tspan x="56">chrom_id</tspan><tspan x="130">start</tspan><tspan x="204">end</tspan><tspan x="278">barcode_id</tspan><tspan x="362">count</tspan><tspan x="440">bc_name</tspan><tspan x="550">bc_n_unique</tspan><tspan x="640">bc_n_total</tspan></text>
+  <text y="296" class="cf-muted" style="font-size:10px"><tspan x="56">dict</tspan><tspan x="130">delta</tspan><tspan x="204">delta</tspan><tspan x="278">dict</tspan><tspan x="362">dict</tspan><tspan x="440">delta strings</tspan><tspan x="550">delta</tspan><tspan x="640">delta</tspan></text>
+  <path d="M48,304 H412 M432,304 H712" class="cf-line" style="stroke-width:0.8"/>
+
+  <!-- values -->
+  <text y="324" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10001</tspan><tspan x="204">10200</tspan><tspan x="278">1</tspan><tspan x="362">2</tspan><tspan x="440">TTGCATGA-1</tspan><tspan x="550">41,203</tspan><tspan x="640">97,410</tspan></text>
+  <text y="344" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10035</tspan><tspan x="204">10180</tspan><tspan x="278">0</tspan><tspan x="362">1</tspan><tspan x="440">AAACGAAC-1</tspan><tspan x="550">38,950</tspan><tspan x="640">90,122</tspan></text>
+  <text y="364" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10102</tspan><tspan x="204">10388</tspan><tspan x="278">0</tspan><tspan x="362">1</tspan><tspan x="440">GCTTAGCA-1</tspan><tspan x="550">2,114</tspan><tspan x="640">4,871</tspan></text>
+  <text y="384" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10240</tspan><tspan x="204">10511</tspan><tspan x="278">2</tspan><tspan x="362">3</tspan></text>
+  <text y="384" class="cf-null"><tspan x="440">null</tspan><tspan x="550">null</tspan><tspan x="640">null</tspan></text>
+  <text y="400" class="cf-muted"><tspan x="80">⋮</tspan><tspan x="154">⋮</tspan><tspan x="228">⋮</tspan><tspan x="306">⋮</tspan><tspan x="380">⋮</tspan><tspan x="482">⋮</tspan><tspan x="582">⋮</tspan><tspan x="669">⋮</tspan></text>
+
+  <!-- later row groups -->
+  <rect x="36" y="424" width="688" height="40" rx="6" class="cf-box"/>
+  <text x="48" y="448" class="cf-muted">row groups 1 … N · 1,000,000 fragments each · bc_* columns all null (a null run costs almost nothing)</text>
+
+  <!-- footer -->
+  <rect x="36" y="474" width="688" height="60" rx="6" class="cf-foot"/>
+  <text x="48" y="495" class="cf-text cf-bold">footer (key-value metadata)</text>
+  <text x="48" y="519" class="cf-mono" style="font-size:11.5px">gatac.format = compact · gatac.format_version = 1 · gatac.chroms = ["chr1", "chr2", …] · gatac.n_barcodes = 3</text>
+</svg>

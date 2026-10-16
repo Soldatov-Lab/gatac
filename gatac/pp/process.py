@@ -41,7 +41,7 @@ def read_fragments_parquet(
     """
     Read ATAC fragments from Parquet file optimized for GPU memory.
 
-    Works with both fragment layouts (see :class:`gatac.pp.FragmentFile`).
+    Works with compact and legacy fragment files (see :class:`gatac.pp.FragmentFile`).
     Returns the columns of FRAGMENT_DTYPES:
     ['chrom', 'start', 'end', 'barcode', 'count'], with ``chrom`` and
     ``barcode`` as categoricals. For the compact layout the categoricals are

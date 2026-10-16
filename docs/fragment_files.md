@@ -85,14 +85,9 @@ categoricals from the ids and needs about a quarter of the GPU memory.
 
 ## Encoding
 
-| Column | Type | Encoding |
-|---|---|---|
-| `chrom_id` | uint16 | dictionary |
-| `start`, `end` | uint32 | delta (`DELTA_BINARY_PACKED`) |
-| `barcode_id` | uint32 | dictionary |
-| `count` | uint16 | dictionary |
-| `bc_name` | string | delta strings (`DELTA_BYTE_ARRAY`) |
-| `bc_n_unique`, `bc_n_total` | uint32 | delta |
+Each column in the [schematic](#file-layout) gives its encoding and type:
+*dict* is Parquet dictionary encoding, *delta* is `DELTA_BINARY_PACKED`, and
+*delta strings* is `DELTA_BYTE_ARRAY`.
 
 Fragments are sorted by position in a `fragments.tsv.gz`, so consecutive
 `start` and `end` values differ by little and delta-encode to a few bits.

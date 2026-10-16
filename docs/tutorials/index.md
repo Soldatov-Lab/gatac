@@ -9,6 +9,7 @@
 ../notebooks/03_motif_enrichment
 ../notebooks/04_chromvar
 ../notebooks/05_gsea
+../notebooks/06_footprinting
 ```
 
 ---
@@ -32,8 +33,9 @@ and inspect the features carried forward into downstream analysis.
 :link: ../notebooks/02_embedding_peak_calling
 :link-type: doc
 
-Build a low-dimensional embedding, identify cell groups, call peaks by
-cluster, and assemble a peak matrix for follow-up analyses.
+Build a low-dimensional embedding, identify cell groups and annotate their
+cell types from gene activity, call peaks by cluster, and assemble a peak
+matrix for follow-up analyses.
 :::
 
 :::{grid-item-card} Motif Enrichment
@@ -61,6 +63,15 @@ transcription factor activity across cells and clusters.
 
 Rank marker peaks, derive motif-linked gene sets, and run enrichment analysis
 to summarize regulatory programs by cluster.
+:::
+
+:::{grid-item-card} TF Footprinting
+:shadow: none
+:link: ../notebooks/06_footprinting
+:link-type: doc
+
+Correct Tn5 bias and score footprints per cell type, then test transcription
+factor binding between cell types with the GPU port of TOBIAS.
 :::
 
 ::::

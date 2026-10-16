@@ -6,7 +6,7 @@ these files store the fragments, and why.
 
 ---
 
-## From names to ids
+## File layout
 
 A `fragments.tsv.gz` repeats the chromosome and the barcode as text on every
 row. On a deep library that is hundreds of millions of copies of a few dozen
@@ -38,6 +38,17 @@ the names once, inside the same file:
 The barcode table also gives the fragment counts per barcode without
 reading the fragments (`FragmentFile.barcode_counts()`).
 
+The file is about 2.6× smaller than the `fragments.tsv.gz` it comes from:
+
+| File, 50M-fragment library | Size |
+|---|---|
+| `fragments.tsv.gz` (gzip) | 557 MB |
+| GATAC Parquet | 211 MB |
+
+The names are stored once, ids and counts are dictionary-encoded, and the
+sorted coordinates delta-encode to a few bits before ZSTD compression (see
+[Encoding](#encoding)).
+
 ```{note}
 Ids are per file: chromosomes are numbered in the order they first appear in
 the `fragments.tsv.gz`, barcodes by decreasing fragment count. A function
@@ -46,7 +57,7 @@ asked for chromosomes or cells by name maps them through that file's own
 ids in two libraries and the results do not depend on it.
 ```
 
-## Reading by integer lookups
+## How GATAC reads the file
 
 Every GATAC function that reads fragments goes through
 {class}`gatac.pp.FragmentFile`. To select cells, it turns the cells you ask

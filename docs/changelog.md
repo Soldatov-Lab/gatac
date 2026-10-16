@@ -112,6 +112,13 @@
   log2FCs are no longer stored, and the null is sampled in smaller chunks.
   On 34M sites and 5 groups the call adds 3.6 GB instead of 10.4 GB. Results
   are unchanged.
+- `tobias.footprint` peaks at 9.3 GB of host memory instead of 19.9 GB
+  genome-wide on 5 pseudobulks, with identical tracks. Reading the cut sites
+  deduplicated fragments with a polars `unique` over all rows (13 GB of hash
+  tables for a 1.2 GB table), and polars' allocator kept ~5 GB resident
+  afterwards; fragments are now split by group and chromosome on the GPU and
+  deduplicated per part by a sort, and the tracks are copied straight into
+  their output arrays.
 - Large host-to-device copies in `bindetect` and `bindetect_sites` go in
   64 MB chunks: with the WSL2 CUDA driver, each copy of about 1 GB or more left
   a host buffer of its size allocated for the rest of the process.

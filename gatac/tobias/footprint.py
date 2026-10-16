@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, Iterable, Optional, Sequence, Union
 import cupy as cp
 import numpy as np
 import pandas as pd
-import polars as pl
 
 from ..io.fragments import FragmentFile
 
@@ -226,28 +225,41 @@ def _load_cuts(parquet_path, barcode_groups: dict[str, int], chrom_sizes: dict[s
     (chrom, start, end) per group, like a duplicate-free pseudobulk BAM.
     """
     chroms = list(chrom_sizes)
+    n_chroms = len(chroms)
     group_of = cp.asarray(np.array(list(barcode_groups.values()), np.int32))
-    parts = []
+    # Each batch is split on the device by (group, chromosome) and only start and end come to the
+    # host, as views per part. No polars here: its allocator kept ~4x the table resident after
+    # the frames were freed.
+    pieces: dict[tuple[int, int], list] = {}
     for b in FragmentFile(parquet_path).iter_batches(
         ["chrom", "start", "end"], chroms=chroms, cells=list(barcode_groups),
     ):
-        parts.append(pl.DataFrame({
-            "g": group_of[b["cell"].values].get(),
-            "chrom": b["chrom"].values.get(),
-            "start": b["start"].values.get(),
-            "end": b["end"].values.get(),
-        }))
-        del b
-    df = pl.concat(parts) if parts else pl.DataFrame(
-        schema={"g": pl.Int32, "chrom": pl.Int32, "start": pl.UInt32, "end": pl.UInt32})
-    if deduplicate:
-        df = df.unique()
+        key = group_of[b["cell"].values].astype(cp.int64) * n_chroms + b["chrom"].values.astype(cp.int64)
+        o = cp.argsort(key)
+        key = key[o]
+        st, en = b["start"].values[o].get(), b["end"].values[o].get()
+        del b, o
+        ks, first = cp.unique(key, return_index=True)
+        bounds = np.append(first.get(), len(key))
+        for k, lo, hi in zip(ks.get().tolist(), bounds[:-1], bounds[1:]):
+            pieces.setdefault(divmod(k, n_chroms), []).append((st[lo:hi], en[lo:hi]))
+        del key, ks, first
     cuts: dict[int, dict[str, tuple]] = {g: {} for g in set(barcode_groups.values())}
-    for (g, ci), sub in df.partition_by(["g", "chrom"], as_dict=True).items():
+    for (g, ci) in sorted(pieces):
+        parts = pieces.pop((g, ci))
         c = chroms[ci]
         length = chrom_sizes[c]
-        s = sub["start"].to_numpy().astype(np.int64)
-        e = sub["end"].to_numpy().astype(np.int64)
+        s = np.concatenate([x for x, _ in parts])
+        e = np.concatenate([y for _, y in parts])
+        del parts
+        if deduplicate:
+            # one copy of each (start, end) of the group on this chromosome, by a sort of the
+            # packed uint64 keys (a hash-based unique took ~10x the table's memory)
+            key = np.unique((s.astype(np.uint64) << np.uint64(32)) | e.astype(np.uint64))
+            s, e = (key >> np.uint64(32)).astype(np.int64), (key & np.uint64(0xFFFFFFFF)).astype(np.int64)
+            del key
+        else:
+            s, e = s.astype(np.int64), e.astype(np.int64)
         if read_length is None:
             ok = (s >= 0) & (e <= length)
         else:
@@ -923,12 +935,12 @@ def footprint(
             for s in st:
                 fit_stats[g] += st[s]
             for k in keep_tracks:
-                values[k][name][sl_c] = cp.asnumpy(tr[k].astype(cp.float32))
+                tr[k].astype(cp.float32).get(out=values[k][name][sl_c])    # no host temporary
             dense = cp.zeros(sizes[c], dtype=cp.float32)
             dense[gpos] = tr["corrected"].astype(cp.float32)
             del tr
             if len(fp_lay.intervals[c]):
-                values["footprint"][name][sl_f] = cp.asnumpy(_footprints_chrom(fp_lay.intervals[c], dense))
+                _footprints_chrom(fp_lay.intervals[c], dense).get(out=values["footprint"][name][sl_f])
             del dense
         del seq_d, gpos
         cp.get_default_memory_pool().free_all_blocks()

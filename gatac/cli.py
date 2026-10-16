@@ -53,10 +53,6 @@ def convert_command(args):
         logging.error("No input files found")
         sys.exit(1)
 
-    chroms = None
-    if args.chroms:
-        chroms = Path(args.chroms).read_text().split()
-
     if len(input_paths) == 1:
         if args.output_dir:
             output_path = Path(args.output_dir) / input_paths[0].with_suffix('').with_suffix('.parquet').name
@@ -66,7 +62,6 @@ def convert_command(args):
             input_paths[0],
             output_path,
             barcode_prefix=args.barcode_prefix,
-            chroms=chroms,
         )
     else:
         if args.output:
@@ -77,7 +72,6 @@ def convert_command(args):
             output_dir=args.output_dir,
             workers=args.workers,
             barcode_prefix=args.barcode_prefix,
-            chroms=chroms,
         )
 
 
@@ -485,11 +479,6 @@ def main():
     convert_parser.add_argument(
         '--barcode-prefix',
         help='Prefix to add to barcodes'
-    )
-    convert_parser.add_argument(
-        '--chroms',
-        help='Text file listing the chromosome order for the ids '
-             '(whitespace-separated); use the same file for every library of a cohort'
     )
     convert_parser.set_defaults(func=convert_command)
 

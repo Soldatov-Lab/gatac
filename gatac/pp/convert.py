@@ -22,7 +22,6 @@ def make_parquet(
     separator: str = '\t',
     barcode_prefix: Optional[str] = None,
     row_group_size: int = 1_000_000,
-    chroms: Optional[Sequence[str]] = None,
 ) -> Path:
     """
     Convert an ATAC fragments TSV.GZ file to GATAC Parquet.
@@ -52,10 +51,6 @@ def make_parquet(
         via cudf.read_parquet(row_groups=...).  The default is tuned for
         the gatac batch size of 64 row groups (~64 M rows/batch fits
         comfortably on a 12 GB GPU).
-    chroms : list of str, optional
-        Chromosome order for the ids. Pass the same list for every library
-        of a cohort so ids agree across files. Default: order of first
-        appearance.
 
     Returns
     -------
@@ -116,7 +111,7 @@ def make_parquet(
         """).fetchdf()
 
     write_fragments(
-        batches, output_path, chroms=chroms,
+        batches, output_path,
         row_group_size=row_group_size, barcode_stats=barcode_stats,
     )
 
@@ -131,7 +126,6 @@ def make_parquet_batch(
     separator: str = '\t',
     barcode_prefix: Optional[str | Sequence[str]] = None,
     row_group_size: int = 1_000_000,
-    chroms: Optional[Sequence[str]] = None,
 ) -> list[Path]:
     """
     Convert multiple ATAC fragment TSV.GZ files to Parquet in parallel.
@@ -156,8 +150,6 @@ def make_parquet_batch(
         per input file.
     row_group_size : int
         Row-group size forwarded to :func:`make_parquet`.
-    chroms : list of str, optional
-        Chromosome order forwarded to :func:`make_parquet`.
 
     Returns
     -------
@@ -222,7 +214,6 @@ def make_parquet_batch(
                 separator,
                 prefix,
                 row_group_size,
-                chroms,
             ): i
             for i, (inp, out, prefix) in enumerate(zip(input_paths, output_paths, prefixes))
         }

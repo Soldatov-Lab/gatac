@@ -12,7 +12,6 @@ coordinates, with chromosomes and barcodes stored as integer ids (below).
 ```
 gatac convert <input> [--output OUTPUT] [--output-dir DIR]
               [-j WORKERS] [--barcode-prefix PREFIX]
-              [--chroms FILE]
 ```
 
 ---
@@ -33,7 +32,6 @@ gatac convert <input> [--output OUTPUT] [--output-dir DIR]
 | `--output-dir` | same dir as input | Directory for output files in batch mode |
 | `-j`, `--workers` | CPU count | Worker processes for parallel batch conversion |
 | `--barcode-prefix` | — | String prepended to every barcode (e.g., `"Sample1_"`) |
-| `--chroms` | — | File listing the chromosome order for the ids; use the same file for every library of a cohort |
 
 `--row-group-size` and `--separator` are available from Python
 (`make_parquet(row_group_size=..., separator=...)`).
@@ -97,12 +95,6 @@ gatac convert "data/*/fragments.tsv.gz" \
 
 ```bash
 gatac convert "samples/*.tsv.gz" --output-dir out/ -j 8
-```
-
-### Shared chromosome ids for a cohort
-
-```bash
-gatac convert "samples/*.tsv.gz" --output-dir parquets/ --chroms chroms.txt
 ```
 
 ---

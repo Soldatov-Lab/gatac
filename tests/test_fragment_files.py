@@ -266,7 +266,7 @@ def _cells_adata(data):
 
 def test_peaks_run(data):
     adata = _cells_adata(data)
-    called = ga.tl.call_peaks(adata, "group", data["path"], genome=CHROM_SIZES,
+    called = ga.peak.call(adata, "group", data["path"], genome=CHROM_SIZES,
                               verbose=False, inplace=False)
     assert sum(len(p) for p in called.values()) > 0
 
@@ -276,6 +276,6 @@ def test_peaks_run(data):
     # counting_strategy="fragment" is not exercised: it fails on cupy's
     # array-valued `repeats`.
     for strategy in ("paired-insertion", "insertion"):
-        res = ga.tl.make_peak_matrix(adata, data["path"], peak_file=peak_file, use_rep=None,
+        res = ga.peak.make_matrix(adata, data["path"], peak_file=peak_file, use_rep=None,
                                      genome=CHROM_SIZES, counting_strategy=strategy, verbose=False)
         assert res.X.nnz > 0

@@ -97,7 +97,7 @@ names in every row:
 |---|---|---|
 | `compute_metrics` | 51 s | 9 s |
 | `detect_doublets` | 56 s | 13 s |
-| `make_peak_matrix` | 14 s | 6 s |
+| `peak.make_matrix` | 14 s | 6 s |
 | `make_tile_matrix` | 49 s | 30 s |
 
 The rest of `make_tile_matrix` is host-side matrix assembly. The whole-file

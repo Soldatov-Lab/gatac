@@ -3,7 +3,7 @@ GPU-accelerated motif enrichment analysis for ATAC-seq data.
 
 This module provides GPU-accelerated motif scanning using CuPy for vectorized
 PWM scoring across sequences. It implements functionality similar to SnapATAC2's
-motif_enrichment but with CUDA acceleration.
+enrichment but with CUDA acceleration.
 """
 
 from __future__ import annotations
@@ -248,7 +248,7 @@ class DNAMotif:
     Examples
     --------
     >>> import numpy as np
-    >>> from gatac.tl import DNAMotif
+    >>> from gatac.motif import DNAMotif
     >>> pwm = np.array([
     ...     [0.10, 0.10, 0.70, 0.10],   # strong G
     ...     [0.70, 0.10, 0.10, 0.10],   # strong A
@@ -403,7 +403,7 @@ class DNAMotif:
 # =============================================================================
 
 
-def read_motifs(filename: Union[str, Path], unique: bool = True) -> list[DNAMotif]:
+def read(filename: Union[str, Path], unique: bool = True) -> list[DNAMotif]:
     """
     Read motifs from a MEME format file.
 
@@ -424,7 +424,7 @@ def read_motifs(filename: Union[str, Path], unique: bool = True) -> list[DNAMoti
     Examples
     --------
     >>> import gatac as ga
-    >>> motifs = ga.tl.read_motifs("cisBP_human.meme", unique=True)
+    >>> motifs = ga.motif.read("cisBP_human.meme", unique=True)
     >>> print(f"Loaded {len(motifs)} motifs")
     >>> motifs[0].id, motifs[0].name
     """
@@ -468,7 +468,7 @@ def parse_meme(content: str) -> list[DNAMotif]:
     Examples
     --------
     >>> from pathlib import Path
-    >>> from gatac.tl import parse_meme
+    >>> from gatac.motif.motif import parse_meme
     >>> content = Path("cisBP_human.meme").read_text()
     >>> motifs = parse_meme(content)
     """
@@ -1172,13 +1172,13 @@ def sample_gc_matched_background(
 
     Examples
     --------
-    >>> matched_bg = ga.tl.sample_gc_matched_background(
+    >>> matched_bg = ga.motif.sample_gc_matched_background(
     ...     da_peaks,
     ...     genome_fasta="genome.fa",
     ...     background_pool=all_peaks,
     ... )
-    >>> matched_bg_by_group = ga.tl.sample_gc_matched_background(
-    ...     marker_peaks,
+    >>> matched_bg_by_group = ga.motif.sample_gc_matched_background(
+    ...     markers,
     ...     genome_fasta="genome.fa",
     ...     background_pool=list(peak_adata.var_names),
     ...     replace=False,
@@ -1245,7 +1245,7 @@ def sample_gc_matched_background(
 # =============================================================================
 
 
-def motif_enrichment(
+def enrichment(
     motifs: list[DNAMotif],
     regions: dict[str, list[str]],
     genome_fasta: Union[str, Path],
@@ -1311,21 +1311,21 @@ def motif_enrichment(
     Examples
     --------
     >>> import gatac
-    >>> motifs = gatac.tl.read_motifs("motifs.meme")
+    >>> motifs = gatac.motif.read("motifs.meme")
     >>> regions = {
     ...     "cluster1": ["chr1:1000-1500", "chr1:5000-5500"],
     ...     "cluster2": ["chr2:2000-2500"],
     ... }
-    >>> results = gatac.tl.motif_enrichment(
+    >>> results = gatac.motif.enrichment(
     ...     motifs, regions, "genome.fa"
     ... )
     >>> results["cluster1"]  # DataFrame with enrichment results
-    >>> matched_bg = gatac.tl.sample_gc_matched_background(
+    >>> matched_bg = gatac.motif.sample_gc_matched_background(
     ...     regions,
     ...     genome_fasta="genome.fa",
     ...     background_pool=all_peaks,
     ... )
-    >>> results = gatac.tl.motif_enrichment(
+    >>> results = gatac.motif.enrichment(
     ...     motifs,
     ...     regions,
     ...     "genome.fa",
@@ -1513,7 +1513,7 @@ def motif_enrichment(
 # =============================================================================
 
 
-def gsea_motif_enrichment(
+def gsea(
     adata,
     rankings: "Union[pd.DataFrame, dict[str, pd.DataFrame]]",
     logfc_col: str = "log2fc",
@@ -1537,14 +1537,14 @@ def gsea_motif_enrichment(
     ATAC-seq data where no individual peak may reach significance.
 
     Motif gene sets are built from the binary peak×motif matrix stored at
-    ``adata.varm[motif_key]`` (populated by :func:`gatac.tl.scan_motifs`).
+    ``adata.varm[motif_key]`` (populated by :func:`gatac.motif.scan`).
 
     Parameters
     ----------
     adata : AnnData
         Peak-level AnnData object with ``varm[motif_key]`` (sparse bool
         matrix of shape n_peaks × n_motifs) and ``uns["motif_name"]``
-        (list of motif names). Populated by ``ga.tl.scan_motifs``.
+        (list of motif names). Populated by ``ga.motif.scan``.
     rankings : pd.DataFrame or dict[str, pd.DataFrame]
         Per-peak ranking table(s).
 
@@ -1616,14 +1616,14 @@ def gsea_motif_enrichment(
 
     >>> # rankings is a DataFrame with peaks as index and a 'log2fc' column
     >>> ranked = pd.DataFrame({"log2fc": logfc_values}, index=peak_names)
-    >>> result = ga.tl.gsea_motif_enrichment(peak_adata, ranked)
+    >>> result = ga.motif.gsea(peak_adata, ranked)
 
     >>> # Multiple groups at once
     >>> group_rankings = {
     ...     "CD4_Memory": pd.DataFrame({"log2fc": logfc_cd4}, index=peak_names),
     ...     "NK":         pd.DataFrame({"log2fc": logfc_nk},  index=peak_names),
     ... }
-    >>> results = ga.tl.gsea_motif_enrichment(peak_adata, group_rankings)
+    >>> results = ga.motif.gsea(peak_adata, group_rankings)
     >>> results["NK"].head()
     """
     import pandas as pd
@@ -1638,7 +1638,7 @@ def gsea_motif_enrichment(
                 "Install it with: pip install gseapy"
             ) from exc
     elif backend == "gpu":
-        from gatac.tl.gsea import prerank_gpu
+        from gatac.motif._gsea import prerank_gpu
     else:
         raise ValueError(f"Unknown backend: {backend!r}. Use 'gpu' or 'gseapy'.")
 
@@ -1648,7 +1648,7 @@ def gsea_motif_enrichment(
     if motif_key not in adata.varm:
         raise KeyError(
             f"'{motif_key}' not found in adata.varm. "
-            "Run ga.tl.scan_motifs first to populate the motif match matrix."
+            "Run ga.motif.scan first to populate the motif match matrix."
         )
 
     motif_match = adata.varm[motif_key]   # peaks × motifs  (sparse bool)
@@ -1913,7 +1913,7 @@ def _fit_logistic_batch(
     )
 
 
-def motif_presence_matrix(
+def presence_matrix(
     motifs: list[DNAMotif],
     regions: list[str],
     genome_fasta: Union[str, Path],
@@ -1930,7 +1930,7 @@ def motif_presence_matrix(
 ) -> dict:
     """Which regions each motif hits, plus their dinucleotide composition.
 
-    This is the expensive half of :func:`motif_enrichment_regression` and it
+    This is the expensive half of :func:`enrichment_regression` and it
     does not depend on the score vector: the same regions, motifs, threshold
     and strand setting give the same answer whatever is being regressed. Call
     it once, keep the result, and hand it back through that function's
@@ -1954,7 +1954,7 @@ def motif_presence_matrix(
 
     See Also
     --------
-    motif_enrichment_regression : consumes this through ``precomputed_hits``.
+    enrichment_regression : consumes this through ``precomputed_hits``.
     """
     from tqdm.auto import tqdm
 
@@ -2032,7 +2032,7 @@ def _validated_hits(hits, motifs, regions, pvalue, check_rc, bg_probs,
     except (KeyError, TypeError) as error:
         raise ValueError(
             "precomputed_hits must be a mapping with 'presence', 'regions' and "
-            "'motif_ids', as returned by motif_presence_matrix"
+            "'motif_ids', as returned by presence_matrix"
         ) from error
 
     problems = []
@@ -2079,7 +2079,7 @@ def _validated_hits(hits, motifs, regions, pvalue, check_rc, bg_probs,
     return presence, dinuc, resolved
 
 
-def motif_enrichment_regression(
+def enrichment_regression(
     motifs: list[DNAMotif],
     regions: list[str],
     scores: np.ndarray,
@@ -2114,7 +2114,7 @@ def motif_enrichment_regression(
     The reported statistic is :math:`b_s`, one number per motif. Positive means
     the motif is more likely in regions with a higher score.
 
-    Why use this over :func:`motif_enrichment`
+    Why use this over :func:`enrichment`
     ------------------------------------------
     * **No background pool.** Nothing has to be sampled or matched, so the result
       does not depend on how a pool was drawn.
@@ -2160,7 +2160,7 @@ def motif_enrichment_regression(
         Scan both strands.
     bg_probs : {"auto", "subject", "even"} or tuple, default (0.25, 0.25, 0.25, 0.25)
         Background base frequencies for the log-odds conversion, as in
-        :func:`motif_enrichment`. Note ``"auto"`` requires holding all sequences
+        :func:`enrichment`. Note ``"auto"`` requires holding all sequences
         in memory at once.
     motif_batch_size : int, default 16
         Motifs scanned together on the GPU.
@@ -2179,7 +2179,7 @@ def motif_enrichment_regression(
     tol : float, default 1e-8
         Convergence tolerance on the maximum coefficient step.
     precomputed_hits : dict, optional
-        A scan from :func:`motif_presence_matrix` over these same regions and
+        A scan from :func:`presence_matrix` over these same regions and
         motifs, which skips the sequence fetch and the PWM scan entirely.
         Scanning is most of the cost and does not depend on ``scores``, so a
         sweep over many score vectors -- components of a decomposition, several
@@ -2203,13 +2203,13 @@ def motif_enrichment_regression(
 
     See Also
     --------
-    motif_enrichment : matched-background-pool enrichment test.
+    enrichment : matched-background-pool enrichment test.
 
     Examples
     --------
     >>> import gatac
-    >>> motifs = gatac.tl.read_motifs("motifs.meme")
-    >>> res = gatac.tl.motif_enrichment_regression(
+    >>> motifs = gatac.motif.read("motifs.meme")
+    >>> res = gatac.motif.enrichment_regression(
     ...     motifs,
     ...     regions=de["peak"].tolist(),
     ...     scores=de["stat"].to_numpy(),
@@ -2276,7 +2276,7 @@ def motif_enrichment_regression(
             dinuc = None if dinuc is None else dinuc[kept_idx]
         presence = np.ascontiguousarray(presence, dtype=bool)
     else:
-        scan = motif_presence_matrix(
+        scan = presence_matrix(
             motifs, kept_regions, genome_fasta, pvalue=pvalue,
             check_rc=check_rc, bg_probs=bg_probs,
             motif_batch_size=motif_batch_size,

@@ -10,7 +10,7 @@ def motif_enrichment(enrichment, top_motifs=10, max_cols=4, palette=None):
     ----------
     enrichment : dict[str, pandas.DataFrame]
         Mapping from a peak-set name (e.g. a cluster label) to a DataFrame
-        returned by :func:`gatac.tl.motif_enrichment`. Each DataFrame must
+        returned by :func:`gatac.motif.enrichment`. Each DataFrame must
         contain ``name`` and ``adjusted p-value`` columns.
     top_motifs : int, default 10
         Number of top motifs to display per peak set.
@@ -28,8 +28,8 @@ def motif_enrichment(enrichment, top_motifs=10, max_cols=4, palette=None):
     Examples
     --------
     >>> import gatac as ga
-    >>> motifs = ga.tl.read_motifs("cisBP_human.meme")
-    >>> enrichment = ga.tl.motif_enrichment(
+    >>> motifs = ga.motif.read("cisBP_human.meme")
+    >>> enrichment = ga.motif.enrichment(
     ...     motifs,
     ...     {"CD8": cd8_peaks, "CD4": cd4_peaks},
     ...     genome_fasta="GRCh38.fa",

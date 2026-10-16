@@ -607,7 +607,7 @@ def _svd(
     With *deterministic* (the default) and a resident float32 CSR matrix the
     same algorithm is run through :func:`_svd_deterministic`, which is bitwise
     reproducible for a given ``random_state``. ``svds`` itself is not, at any
-    seed. A streamed :class:`~gatac.tl._gpu.ChunkedMatrix` operator cannot take
+    seed. A streamed :class:`~gatac.dr._gpu.ChunkedMatrix` operator cannot take
     that path — the transpose it needs is exactly what does not fit — so it
     falls back to ``svds`` with the global RNG scoped to ``random_state``,
     which controls the start vector but not cuSPARSE.
@@ -1578,7 +1578,7 @@ def lsi(
 
     A port of ``ArchR:::.computeLSI``, and the same computation Signac performs
     with ``RunTFIDF`` + ``RunSVD``. For the iterative feature-selection variant
-    (``ArchR::addIterativeLSI``) see :func:`gatac.tl.iterative_lsi`.
+    (``ArchR::addIterativeLSI``) see :func:`gatac.dr.iterative_lsi`.
 
     Parameters
     ----------
@@ -1684,7 +1684,7 @@ def lsi(
     Notes
     -----
     Cells with no signal in the selected features raise rather than producing
-    a degenerate row, matching :func:`gatac.tl.spectral`. Held-out depth
+    a degenerate row, matching :func:`gatac.dr.spectral`. Held-out depth
     outliers are projected back in, so the embedding always has one row per
     cell in the original order.
 
@@ -1692,14 +1692,14 @@ def lsi(
     --------
     >>> import gatac as ga
     >>> ga.pp.select_features(adata, n_features=50_000)
-    >>> ga.tl.lsi(adata, n_comps=30)
+    >>> ga.dr.lsi(adata, n_comps=30)
     >>> adata.obsm["X_lsi"].shape
     (n_cells, 30)
 
     For exact ArchR ``.computeLSI`` parity, including its depth-outlier
     hold-out:
 
-    >>> ga.tl.lsi(adata, n_comps=30, method=1, outlier_quantiles=(0.02, 0.98))
+    >>> ga.dr.lsi(adata, n_comps=30, method=1, outlier_quantiles=(0.02, 0.98))
     """
     method_id = _resolve_method(method)
     feat_mask = _resolve_features(adata, features)
@@ -1904,7 +1904,7 @@ def iterative_lsi(
         Overrides for the built-in clusterer, e.g.
         ``{"resolution": 2.0, "max_clusters": 6, "k": 20, "flavor": "leiden"}``.
         Defaults are ArchR's iterative-LSI ``clusterParams``. Every keyword of
-        :func:`~gatac.tl._clustering.snn_cluster` is accepted, ``quantize`` and
+        :func:`~gatac.dr._clustering.snn_cluster` is accepted, ``quantize`` and
         ``max_resolution_retries`` included; the values actually used are
         recorded in ``uns["iterative_lsi"]["params"]`` under a ``cluster_``
         prefix.
@@ -1960,7 +1960,7 @@ def iterative_lsi(
     Examples
     --------
     >>> import gatac as ga
-    >>> ga.tl.iterative_lsi(adata, n_comps=30, n_features=25_000)
+    >>> ga.dr.iterative_lsi(adata, n_comps=30, n_features=25_000)
     >>> adata.obsm["X_iterative_lsi"].shape
     (n_cells, 30)
     """

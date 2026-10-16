@@ -23,7 +23,7 @@ def _background(adata, **kwargs):
     adata = adata.copy()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)   # empty bias bins
-        ga.tl.sample_bg_peaks(adata, method="chromvar", n_iterations=20, **kwargs)
+        ga.motif.sample_bg_peaks(adata, method="chromvar", n_iterations=20, **kwargs)
     return adata.varm["bg_peaks"]
 
 

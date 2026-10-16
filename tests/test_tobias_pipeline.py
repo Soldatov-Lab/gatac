@@ -74,6 +74,45 @@ def inputs(tmp_path_factory):
     return dict(tracks=tracks, meme=meme)
 
 
+@pytest.mark.parametrize("deduplicate", [True, False])
+@pytest.mark.parametrize("read_length", [None, 50])
+def test_load_cuts_matches_polars_unique(tmp_path, deduplicate, read_length):
+    # Reference: the former implementation (pl.DataFrame.unique over all rows, then partition)
+    import polars as pl
+    from gatac.tobias.footprint import _load_cuts
+    rng = np.random.default_rng(3)
+    n = 30_000
+    chrom = rng.choice(list(CHROMS), n)
+    start = rng.integers(0, 300_000, n)
+    start[rng.random(n) < 0.3] = 150_000                      # many shared coordinates
+    end = start + rng.integers(20, 600, n)
+    end[chrom == "chr2"] = np.minimum(end[chrom == "chr2"], CHROMS["chr2"])
+    bcs = np.array([f"c{i:02d}-1" for i in range(20)])
+    df = pd.DataFrame({"chrom": chrom, "start": start, "end": end,
+                       "barcode": bcs[rng.integers(0, 20, n)], "count": 1})
+    df = df.sort_values(["chrom", "start", "end"]).drop_duplicates(["chrom", "start", "end", "barcode"])
+    tsv = tmp_path / "f.tsv.gz"
+    with gzip.open(tsv, "wt") as fh:
+        df.to_csv(fh, sep="\t", header=False, index=False)
+    parquet = ga.io.make_parquet(tsv, tmp_path / "f.parquet")
+    groups = {b: i % 3 for i, b in enumerate(bcs[:18])}       # two barcodes in no group
+    got = _load_cuts(parquet, groups, CHROMS, read_length, deduplicate)
+
+    ref = pl.from_pandas(df[df["barcode"].isin(groups)].assign(g=lambda d: d["barcode"].map(groups)))
+    ref = ref.select("g", "chrom", "start", "end")
+    if deduplicate:
+        ref = ref.unique()
+    for g in range(3):
+        for c, length in CHROMS.items():
+            sub = ref.filter((pl.col("g") == g) & (pl.col("chrom") == c))
+            s, e = sub["start"].to_numpy().astype(np.int64), sub["end"].to_numpy().astype(np.int64)
+            ok = ((s >= 0) & (e <= length) if read_length is None else
+                  (s - 4 >= 0) & (e + 4 - read_length >= 0) & (e + 4 <= length) & (s - 4 + read_length <= length))
+            fwd, rev = got[g][c]
+            assert np.array_equal(fwd, np.sort(s[ok])) and np.array_equal(rev, np.sort(e[ok] - 1))
+            assert fwd.dtype == np.int64 and rev.dtype == np.int64
+
+
 def test_bindetect_site_table_and_log2fc(inputs):
     res = ga.tobias.bindetect(inputs["tracks"], inputs["meme"], verbose=False)
     assert res.comparisons == [("a", "b")]

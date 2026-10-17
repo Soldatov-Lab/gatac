@@ -171,5 +171,43 @@ def _relink_notebooks(app, doctree):
             node["reftarget"] = "notebooks/" + target[len(_NOTEBOOKS):]
 
 
+# myst-nb renders every stdout/stderr chunk of a cell as its own block, so a
+# cell that logs line by line shows a stack of boxes. nb_merge_streams only
+# joins chunks of the same stream, and moves stdout after stderr; instead
+# join each run of consecutive stream chunks, in order, into one stdout block.
+def _merge_stream_outputs(app, doctree):
+    from docutils import nodes
+
+    def is_stream(node):
+        return isinstance(node, nodes.literal_block) and (
+            "stream" in node["classes"] or "stderr" in node["classes"]
+        )
+
+    for container in doctree.findall(nodes.container):
+        if "cell_output" not in container["classes"]:
+            continue
+        children, run = [], []
+        for child in [*container.children, None]:
+            if child is not None and is_stream(child):
+                run.append(child)
+                continue
+            if run:
+                text = "".join(node.astext() for node in run)
+                block = run[0]
+                block["classes"] = [
+                    "stream" if c == "stderr" else c for c in block["classes"]
+                ]
+                block.rawsource = text
+                block.children = []
+                block += nodes.Text(text)
+                children.append(block)
+                run = []
+            if child is not None:
+                children.append(child)
+        container.children = []
+        container.extend(children)
+
+
 def setup(app):
     app.connect("doctree-read", _relink_notebooks)
+    app.connect("doctree-read", _merge_stream_outputs)

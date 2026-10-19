@@ -253,8 +253,8 @@ def create_gene_matrix_gpu(
     filter_query : str, optional
         Additional query string for filtering cells.
     cell_batch_size : int
-        Number of cells to process per batch (default: 500). Lower values
-        reduce GPU memory usage but may be slower.
+        Unused; kept for backwards compatibility (all cells are processed
+        together, one chromosome at a time).
 
     Returns
     -------
@@ -329,21 +329,24 @@ def create_gene_matrix_gpu(
     # Filter fragments to valid barcodes and chromosomes  
     # Use categories to avoid ValueError in cudf
     barcode_cats = fragments_df['barcode'].dtype.categories.to_arrow().to_pylist()
-    fetch_bc = [b for b in valid_barcodes.to_arrow().to_pylist() if b in barcode_cats]
+    barcode_cat_pos = {b: i for i, b in enumerate(barcode_cats)}
+    fetch_bc = [b for b in valid_barcodes.to_arrow().to_pylist() if b in barcode_cat_pos]
     fragments_df = fragments_df[fragments_df['barcode'].isin(fetch_bc)]
-    
+
     chrom_cats = fragments_df['chrom'].dtype.categories.to_arrow().to_pylist()
     fetch_chroms = [c for c in valid_chroms if c in chrom_cats]
     fragments_df = fragments_df[fragments_df['chrom'].isin(fetch_chroms)]
-    
+
     # Get unique barcodes and create mapping
     unique_barcodes = fragments_df['barcode'].unique().reset_index(drop=True)
     n_cells = len(unique_barcodes)
     logger.debug(f"Retained {n_cells} cells")
-    
-    # Create barcode to global index mapping (on CPU for memory efficiency)
+
+    # Cell index of each fragment, through the categorical codes of its barcode
     barcode_list = unique_barcodes.to_arrow().to_pylist()
-    barcode_to_global_idx = {bc: i for i, bc in enumerate(barcode_list)}
+    code_to_cell = np.full(len(barcode_cats), -1, dtype=np.int32)
+    code_to_cell[[barcode_cat_pos[b] for b in barcode_list]] = np.arange(n_cells, dtype=np.int32)
+    frag_cells = cp.asarray(code_to_cell)[fragments_df['barcode'].cat.codes.values]
 
     # Filter and prepare gene data
     gene_df = gene_df[gene_df['chrom'].isin(valid_chroms)]
@@ -369,7 +372,10 @@ def create_gene_matrix_gpu(
         unique_features, on='id', how='left'
     )
     
-    logger.debug(f"Computing matrix: {n_cells} cells × {n_final_features} features (batch size: {cell_batch_size})")
+    logger.debug(f"Computing matrix: {n_cells} cells × {n_final_features} features")
+
+    gene_to_feature = cp.empty(len(gene_df), dtype=cp.int32)
+    gene_to_feature[gene_to_final['gene_idx'].values] = gene_to_final['final_feature_idx'].values
 
     # Prepare chromosome-level gene data (sorted by start for searchsorted)
     chrom_gene_data = {}
@@ -382,116 +388,55 @@ def create_gene_matrix_gpu(
                 'indices': chrom_genes['gene_idx'].values,
             }
 
-    # Process cells in batches to reduce memory
-    n_batches = (n_cells + cell_batch_size - 1) // cell_batch_size
-    all_batch_matrices = []
-    max_count_overall = 0
-    
-    for batch_idx in range(n_batches):
-        batch_start = batch_idx * cell_batch_size
-        batch_end = min((batch_idx + 1) * cell_batch_size, n_cells)
-        batch_barcodes = barcode_list[batch_start:batch_end]
-        batch_size = len(batch_barcodes)
-        
-        logger.debug(f"Processing batch {batch_idx + 1}/{n_batches} ({batch_size} cells)")
-        
-        # Filter fragments for this batch
-        batch_barcodes_gpu = cudf.Series(batch_barcodes)
-        # Safe isin for categorical barcode
-        fetch_batch_bc = [b for b in batch_barcodes if b in barcode_cats]
-        batch_frags = fragments_df[fragments_df['barcode'].isin(fetch_batch_bc)]
-        
-        if len(batch_frags) == 0:
-            # Empty batch - create zero matrix
-            all_batch_matrices.append(sp.csr_matrix((batch_size, n_final_genes), dtype=np.uint8))
+    # One pass per chromosome over all cells. Transcripts are reduced to
+    # their feature by MAX (SnapATAC2's gene aggregation; a no-op when 'id'
+    # is the transcript), within each chromosome and then across them, for
+    # features with transcripts on several.
+    chrom_feature_counts = []
+    for chrom in valid_chroms:
+        if chrom not in chrom_gene_data or chrom not in chrom_cats:
             continue
-        
-        # Create local barcode to batch index mapping
-        batch_barcode_to_idx = cudf.DataFrame({
-            'barcode': batch_barcodes_gpu,
-            'cell_idx': cp.arange(batch_size, dtype=cp.int32)
-        })
-        batch_frags = batch_frags.merge(batch_barcode_to_idx, on='barcode', how='left')
-        
-        # Process each chromosome
-        batch_transcript_counts = []
-        
-        for chrom in valid_chroms:
-            if chrom not in chrom_gene_data or chrom not in chrom_cats:
-                continue
-                
-            chrom_frags = batch_frags[batch_frags['chrom'] == chrom]
-            if len(chrom_frags) == 0:
-                continue
-            
-            gene_data = chrom_gene_data[chrom]
-            
-            # Find overlapping genes
-            transcript_counts = _find_fragment_gene_overlaps_streaming(
-                chrom_frags['start'].values,
-                chrom_frags['end'].values,
-                chrom_frags['cell_idx'].values,
-                gene_data['starts'],
-                gene_data['ends'],
-                gene_data['indices'],
-                chunk_size=200_000,  # Smaller chunks for memory efficiency
-            )
-            
-            if len(transcript_counts) > 0:
-                batch_transcript_counts.append(transcript_counts)
-            
-            del chrom_frags
-            cp._default_memory_pool.free_all_blocks()
-        
-        # Build batch matrix
-        if len(batch_transcript_counts) > 0:
-            # Concatenate all chromosome results
-            all_counts = cudf.concat(batch_transcript_counts, ignore_index=True)
-            del batch_transcript_counts
-            
-            # Aggregate by (cell_idx, gene_idx) first
-            all_counts = all_counts.groupby(['cell_idx', 'gene_idx'])['count'].sum().reset_index()
-            
-            # Map gene_idx to final_feature_idx
-            all_counts = all_counts.merge(gene_to_final, on='gene_idx', how='left')
-            
-            # MAX aggregation: for each (cell, feature_id), take max count across transcripts
-            # This handles transcripts -> gene aggregation if id_type was 'gene'
-            # because 'id' would be the gene_id for multiple transcripts.
-            # If id_type was 'transcript', 'id' is unique to each transcript, so max is just the value.
-            feature_counts = all_counts.groupby(['cell_idx', 'final_feature_idx'])['count'].max().reset_index()
-            del all_counts
-            
-            # Track max for dtype selection
-            batch_max = int(feature_counts['count'].max())
-            max_count_overall = max(max_count_overall, batch_max)
-            
-            # Build sparse matrix for this batch (on CPU)
-            feature_counts_pd = feature_counts.to_pandas()
-            del feature_counts
-            cp._default_memory_pool.free_all_blocks()
-            
-            batch_matrix = sp.coo_matrix(
-                (feature_counts_pd['count'].values.astype(np.int32),
-                 (feature_counts_pd['cell_idx'].values, feature_counts_pd['final_feature_idx'].values)),
-                shape=(batch_size, n_final_features),
-                dtype=np.int32
-            ).tocsr()
-            del feature_counts_pd
-        else:
-            batch_matrix = sp.csr_matrix((batch_size, n_final_features), dtype=np.int32)
-        
-        all_batch_matrices.append(batch_matrix)
-        
-        # Clean up batch data
-        del batch_frags, batch_barcode_to_idx, batch_barcodes_gpu
-        cp._default_memory_pool.free_all_blocks()
+        in_chrom = (fragments_df['chrom'] == chrom).values
+        if not in_chrom.any():
+            continue
+        gene_data = chrom_gene_data[chrom]
+        transcript_counts = _find_fragment_gene_overlaps_streaming(
+            fragments_df['start'].values[in_chrom],
+            fragments_df['end'].values[in_chrom],
+            frag_cells[in_chrom],
+            gene_data['starts'],
+            gene_data['ends'],
+            gene_data['indices'],
+            chunk_size=200_000,  # Smaller chunks for memory efficiency
+        )
+        if len(transcript_counts) == 0:
+            continue
+        transcript_counts['final_feature_idx'] = gene_to_feature[transcript_counts['gene_idx'].values]
+        chrom_feature_counts.append(
+            transcript_counts.groupby(['cell_idx', 'final_feature_idx'])['count'].max().reset_index()
+        )
+        del transcript_counts
 
-    # Stack all batch matrices
-    logger.debug("Combining batch matrices...")
-    matrix = sp.vstack(all_batch_matrices, format='csr')
-    del all_batch_matrices
-    
+    # CSR from the (cell, feature) pairs sorted on the GPU
+    if chrom_feature_counts:
+        feature_counts = cudf.concat(chrom_feature_counts, ignore_index=True)
+        del chrom_feature_counts
+        feature_counts = (feature_counts.groupby(['cell_idx', 'final_feature_idx'])['count'].max()
+                          .reset_index().sort_values(['cell_idx', 'final_feature_idx']))
+        max_count_overall = int(feature_counts['count'].max())
+        cells = feature_counts['cell_idx'].values
+        indptr = cp.searchsorted(cells, cp.arange(n_cells + 1, dtype=cells.dtype))
+        matrix = sp.csr_matrix(
+            (feature_counts['count'].values.astype(cp.int32).get(),
+             feature_counts['final_feature_idx'].values.get(),
+             indptr.get()),
+            shape=(n_cells, n_final_features),
+        )
+        del feature_counts, cells, indptr
+    else:
+        max_count_overall = 0
+        matrix = sp.csr_matrix((n_cells, n_final_features), dtype=np.int32)
+
     # Optimize dtype based on actual max value
     if max_count_overall > 0:
         matrix_dtype = optimize_sparse_matrix_dtype(max_count_overall)
@@ -535,8 +480,9 @@ def _find_fragment_gene_overlaps_streaming(
     
     For each insertion (start and end-1), finds overlapping gene regions using
     searchsorted to find an anchor point, then looks backward through a window
-    of candidate genes and validates overlaps.
-    
+    of candidate genes and validates overlaps. A fragment counts once for a
+    gene that both of its insertions fall in.
+
     Returns aggregated (cell_idx, gene_idx, count) DataFrame.
     """
     n_fragments = len(frag_starts)
@@ -548,27 +494,24 @@ def _find_fragment_gene_overlaps_streaming(
                                'count': cp.array([], dtype=cp.int32)})
     
     all_pairs_cells = []
-    all_pairs_frags = []
     all_pairs_genes = []
-    
+
     # Small window - SnapATAC2 uses 100
     max_check = 100
     offsets = cp.arange(max_check, dtype=cp.int32)
-    
+
     for chunk_start in range(0, n_fragments, chunk_size):
         chunk_end = min(chunk_start + chunk_size, n_fragments)
-        
+
         starts = frag_starts[chunk_start:chunk_end]
         ends = frag_ends[chunk_start:chunk_end] - 1  # Convert to insertion position
         cells = cell_indices[chunk_start:chunk_end]
-        frag_idxs = cp.arange(chunk_start, chunk_end, dtype=cp.int32)
-        
+        n_frag = len(starts)
+
         # Both insertions
         positions = cp.concatenate([starts, ends])
         pos_cells = cp.concatenate([cells, cells])
-        pos_frags = cp.concatenate([frag_idxs, frag_idxs])
-        n_pos = len(positions)
-        
+
         # searchsorted on gene_starts: index of first gene with start > position
         right_idx = cp.searchsorted(gene_starts, positions, side='right')
         
@@ -585,38 +528,35 @@ def _find_fragment_gene_overlaps_streaming(
         
         # Overlap: gene_start <= pos (guaranteed by searchsorted) AND gene_end > pos
         overlaps = valid & (cand_ends > positions[:, None])
-        
+        # A gene the end insertion falls in also holds the start insertion
+        # exactly when it starts at or before it (start <= end - 1 < gene_end,
+        # and such a gene is in the start's window too): count the fragment
+        # once, from its start
+        overlaps[n_frag:] &= ((gene_starts[cand_idx_safe[n_frag:]] > starts[:, None])
+                              | (ends < starts)[:, None])
+
         # Extract overlapping pairs
         row_idx, col_idx = cp.where(overlaps)
         if len(row_idx) > 0:
             all_pairs_cells.append(pos_cells[row_idx])
-            all_pairs_frags.append(pos_frags[row_idx])
             all_pairs_genes.append(gene_indices[cand_idx_safe[row_idx, col_idx]])
-        
-        del positions, pos_cells, pos_frags, right_idx, cand_idx, cand_idx_safe, cand_ends, overlaps
-        cp._default_memory_pool.free_all_blocks()
-    
+
+        del positions, pos_cells, right_idx, cand_idx, cand_idx_safe, cand_ends, overlaps
+
     if len(all_pairs_cells) == 0:
         return cudf.DataFrame({'cell_idx': cp.array([], dtype=cp.int32),
                                'gene_idx': cp.array([], dtype=cp.int32),
                                'count': cp.array([], dtype=cp.int32)})
-    
-    # Combine and deduplicate all pairs, then count
+
+    # Count per (cell, gene); each (fragment, gene) pair is already listed once
     pairs_df = cudf.DataFrame({
         'cell_idx': cp.concatenate(all_pairs_cells),
-        'frag_idx': cp.concatenate(all_pairs_frags),
         'gene_idx': cp.concatenate(all_pairs_genes),
     })
-    
-    # Deduplicate: each (fragment, gene) pair counts as 1
-    pairs_df = pairs_df.drop_duplicates()
-    
-    # Count per (cell, gene)
     counts = pairs_df.groupby(['cell_idx', 'gene_idx']).size().reset_index(name='count')
-    
-    del all_pairs_cells, all_pairs_frags, all_pairs_genes, pairs_df
-    cp._default_memory_pool.free_all_blocks()
-    
+
+    del all_pairs_cells, all_pairs_genes, pairs_df
+
     return counts
 
 
@@ -720,8 +660,8 @@ def make_gene_matrix(
     low_memory : bool
         Use low memory mode for Parquet reading (default: False)
     cell_batch_size : int
-        Number of cells to process per batch (default: 500). Lower values
-        reduce GPU memory usage but may be slower.
+        Unused; kept for backwards compatibility (all cells are processed
+        together, one chromosome at a time).
     gene_name_key : str
         Key for gene name in GTF attributes (default: "gene_name").
     gene_id_key : str

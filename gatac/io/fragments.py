@@ -636,9 +636,11 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
         output_path, FILE_SCHEMA,
         use_dictionary=["chrom_id", "barcode_id", "count"],
         column_encoding={"start": "DELTA_BINARY_PACKED", "end": "DELTA_BINARY_PACKED",
-                         "bc_name": "DELTA_BYTE_ARRAY", "bc_n_unique": "DELTA_BINARY_PACKED",
+                         "bc_name": "DELTA_LENGTH_BYTE_ARRAY", "bc_n_unique": "DELTA_BINARY_PACKED",
                          "bc_n_total": "DELTA_BINARY_PACKED"},
-        # Data page v1: cuDF's chunked (low_memory) reader fails on v2 data pages
+        # Data page v1: cuDF's chunked (low_memory) reader fails on v2 data pages.
+        # bc_name is not DELTA_BYTE_ARRAY: with the page index, cuDF (26.02)
+        # reads those strings back as NUL bytes.
         compression="zstd",
         write_page_index=True,
         dictionary_pagesize_limit=64 << 20,

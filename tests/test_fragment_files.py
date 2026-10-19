@@ -104,6 +104,11 @@ def test_file_layout(data):
     assert set(rows[:-1]) == {9_000}
     keys = set(pq.ParquetFile(data["path"]).metadata.metadata)
     assert {b"gatac.format_version", b"gatac.chroms", b"gatac.n_barcodes"} <= keys
+    # cuDF reads the barcode table too (it reads DELTA_BYTE_ARRAY strings
+    # written with a page index back as NUL bytes)
+    import cudf
+    names = cudf.read_parquet(data["path"], columns=["bc_name"])["bc_name"].dropna()
+    assert names.to_arrow().to_pylist() == list(ff.barcodes)
 
 
 @pytest.mark.parametrize("chroms", [None, ["chr2", "chrM"]])

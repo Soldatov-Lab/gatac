@@ -104,6 +104,10 @@
   on resolvable p-values.
 - `gs_batch_size` for `motif.gsea` now defaults to 128 (was 4),
   since the scoring block no longer scales with the ranked-list length.
+- `make_gene_matrix` processes all cells together, one chromosome at a time,
+  instead of once per batch of cells and chromosome; the matrix is unchanged
+  and `cell_batch_size` is ignored. PBMC 5k (14,225 cells x 61,806 genes):
+  34.5 s -> 22.6 s.
 
 ### Fixed
 

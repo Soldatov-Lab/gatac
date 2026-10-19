@@ -20,7 +20,9 @@
   `detect_doublets` 56 s -> 13 s, `peak.make_matrix` 14 s -> 6 s,
   `make_tile_matrix` 49 s -> 30 s (the rest is host-side matrix assembly). The
   whole-file read of `read_fragments_parquet` (gene matrices) needs about a
-  quarter of the GPU memory.
+  quarter of the GPU memory. `make_parquet` parses the TSV once and encodes
+  the next row group while the writer compresses the current one; on PBMC 5k
+  (101M fragments, 6 cores) it takes 28 s and `filter_fragments` 13 s.
 - `make_parquet_batch` accepts one barcode prefix per input file.
 - `io.to_tsv` / `io.FragmentFile.to_tsv` write a Parquet fragment file back to
   a `fragments.tsv.gz` in file order, BGZF-compressed (tabix-indexable);

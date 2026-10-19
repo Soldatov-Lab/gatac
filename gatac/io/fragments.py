@@ -636,15 +636,19 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
         output_path, FILE_SCHEMA,
         use_dictionary=["chrom_id", "barcode_id", "count"],
         column_encoding={"start": "DELTA_BINARY_PACKED", "end": "DELTA_BINARY_PACKED",
-                         "bc_name": "DELTA_BYTE_ARRAY", "bc_n_unique": "DELTA_BINARY_PACKED",
+                         "bc_name": "DELTA_LENGTH_BYTE_ARRAY", "bc_n_unique": "DELTA_BINARY_PACKED",
                          "bc_n_total": "DELTA_BINARY_PACKED"},
-        # Data page v1: cuDF's chunked (low_memory) reader fails on v2 data pages
+        # Data page v1: cuDF's chunked (low_memory) reader fails on v2 data pages.
+        # bc_name is not DELTA_BYTE_ARRAY: with the page index, cuDF (26.02)
+        # reads those strings back as NUL bytes.
         compression="zstd",
         write_page_index=True,
         dictionary_pagesize_limit=64 << 20,
     )
     n = 0
-    with writer:
+
+    def row_groups():
+        nonlocal n
         for chunk in _fixed_size_chunks(batches(), row_group_size):
             k = chunk.num_rows
             chrom_id = _encode(chunk["chrom"], chrom_pos, chrom_list)
@@ -655,7 +659,7 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
             barcode_id = gid.astype(np.uint32)[barcode_enc.indices.to_numpy()]
             lo, hi = min(n, n_bc), min(n + k, n_bc)
             pad = k - (hi - lo)
-            writer.write_table(pa.table([
+            yield pa.table([
                 pa.array(chrom_id, pa.uint16()),
                 chunk["start"].cast(pa.uint32()),
                 chunk["end"].cast(pa.uint32()),
@@ -664,8 +668,13 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
                 pa.concat_arrays([names.slice(lo, hi - lo), pa.nulls(pad, pa.string())]),
                 pa.concat_arrays([n_unique.slice(lo, hi - lo), pa.nulls(pad, pa.uint32())]),
                 pa.concat_arrays([n_total.slice(lo, hi - lo), pa.nulls(pad, pa.uint32())]),
-            ], schema=FILE_SCHEMA), row_group_size=row_group_size)
+            ], schema=FILE_SCHEMA)
             n += k
+
+    with writer:
+        # The next row group is read and encoded while this one is compressed
+        for table in _prefetch(row_groups()):
+            writer.write_table(table, row_group_size=row_group_size)
         if n < n_bc:
             raise ValueError("The barcode statistics list barcodes that have no fragment")
         if len(chrom_list) > 65535:
@@ -692,6 +701,16 @@ def _encode(values: pa.ChunkedArray, pos: dict, names: list) -> np.ndarray:
             names.append(v)
     lut = np.array([pos[v] for v in enc.dictionary.to_pylist()], dtype=np.int64)
     return lut[enc.indices.to_numpy()]
+
+
+def _prefetch(items: Iterator) -> Iterator:
+    """Iterate ``items`` on a worker thread, one item ahead of the consumer."""
+    done = object()
+    with ThreadPoolExecutor(1) as pool:
+        nxt = pool.submit(next, items, done)
+        while (item := nxt.result()) is not done:
+            nxt = pool.submit(next, items, done)
+            yield item
 
 
 def _count_barcodes(batches: Iterator[pa.Table]) -> pd.DataFrame:

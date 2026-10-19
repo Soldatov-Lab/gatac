@@ -104,6 +104,11 @@ def test_file_layout(data):
     assert set(rows[:-1]) == {9_000}
     keys = set(pq.ParquetFile(data["path"]).metadata.metadata)
     assert {b"gatac.format_version", b"gatac.chroms", b"gatac.n_barcodes"} <= keys
+    # cuDF reads the barcode table too (it reads DELTA_BYTE_ARRAY strings
+    # written with a page index back as NUL bytes)
+    import cudf
+    names = cudf.read_parquet(data["path"], columns=["bc_name"])["bc_name"].dropna()
+    assert names.to_arrow().to_pylist() == list(ff.barcodes)
 
 
 @pytest.mark.parametrize("chroms", [None, ["chr2", "chrM"]])
@@ -164,6 +169,8 @@ def test_batch_prefixes_and_no_partial_file(data, tmp_path):
                                     barcode_prefix=["A_", "B_"], workers=2)
     for out, prefix in zip(outs, ["A_", "B_"]):
         assert all(b.startswith(prefix) for b in FragmentFile(out).barcode_counts()["barcode"])
+    # The staging Parquet of the TSV parse is removed
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["frags.parquet", "other.parquet"]
     bad = pd.DataFrame({"barcode": ["not-in-file"], "n_unique": [1], "n_total": [1]})
     target = tmp_path / "bad.parquet"
     with pytest.raises(ValueError):
@@ -221,6 +228,23 @@ def test_filter(data):
     kept = kept[kept["barcode"].isin(n.index[n >= 200])].reset_index(drop=True)
     assert np.array_equal(t[["chrom", "start", "end", "barcode"]].to_numpy().astype(str),
                           kept[["chrom", "start", "end", "barcode"]].to_numpy().astype(str))
+
+
+def test_filter_with_metrics(data):
+    # Cells from a metrics table, one of them absent from the file
+    cells = _cells(data, 30)
+    metrics = pd.DataFrame({"barcode": cells + ["S1_not-in-file"]})
+    out = ga.pp.filter_fragments(data["path"], data["dir"] / "filtered_metrics.parquet",
+                                 metrics=metrics, chrom_sizes=CHROM_SIZES)
+    ff = FragmentFile(out)
+    ref = data["df"]
+    kept = ref[ref["chrom"].isin(CHROM_SIZES) & ref["barcode"].isin(cells)].reset_index(drop=True)
+    t = pa.concat_tables(ff.iter_arrow()).to_pandas()
+    assert np.array_equal(t.to_numpy().astype(str), kept.to_numpy().astype(str))
+    exp = kept.groupby("barcode")["count"].agg(["size", "sum"])
+    counts = ff.barcode_counts().set_index("barcode").loc[exp.index]
+    assert ff.n_barcodes == len(exp)
+    assert np.array_equal(counts["n_unique"], exp["size"]) and np.array_equal(counts["n_total"], exp["sum"])
 
 
 def _adata_equal(a, b):

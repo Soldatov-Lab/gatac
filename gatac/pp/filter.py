@@ -236,12 +236,13 @@ def _filter_single_file_streaming(
     fragments = FragmentFile(input_path)
     chroms = sorted(valid_chroms) if valid_chroms is not None else None
 
-    # First pass if no valid_barcodes
+    # Counts on the kept chromosomes select the cells, and those of the kept
+    # cells are the output's barcode table: the writer needs no counting pass
+    logger.info("Computing fragment counts per cell")
+    counts = fragments.barcode_counts(chroms=chroms)
+    if barcode_prefix:
+        counts['barcode'] = barcode_prefix + counts['barcode']
     if valid_barcodes is None:
-        logger.info("Computing fragment counts per cell")
-        counts = fragments.barcode_counts(chroms=chroms)
-        if barcode_prefix:
-            counts['barcode'] = barcode_prefix + counts['barcode']
         valid_barcodes = set(counts.loc[counts['n_unique'] >= min_fragments_per_cell, 'barcode'])
         logger.info(f"Found {len(valid_barcodes):,} cells with >= {min_fragments_per_cell} fragments")
 
@@ -269,7 +270,8 @@ def _filter_single_file_streaming(
             totals['out'] += t.num_rows
             yield t
 
-    write_fragments(batches, output_path, chroms=fragments.chroms)
+    write_fragments(batches, output_path, chroms=fragments.chroms,
+                    barcode_stats=counts[counts['barcode'].isin(valid_barcodes)])
 
     logger.info(f"Filtered {totals['in']:,} -> {totals['out']:,} fragments "
                 f"({100 * totals['out'] / totals['in']:.1f}% retained)")

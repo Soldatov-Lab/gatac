@@ -10,6 +10,7 @@ from typing import Optional, Sequence
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from .fragments import NAMED_SCHEMA, FragmentFile, write_fragments
 
@@ -30,8 +31,9 @@ def make_parquet(
     barcode table (full original names, fragment and read counts per
     barcode); see :class:`gatac.io.FragmentFile`. Files are written with
     ZSTD and delta-encoded coordinates, keeping the input row order. The
-    TSV is parsed by DuckDB and streamed to the Parquet writer, so files
-    larger than RAM are fine.
+    TSV is parsed once by DuckDB into a temporary Parquet next to the
+    output (about the size of the gzipped TSV), which is then streamed to
+    the writer, so files larger than RAM are fine.
 
     Parameters
     ----------
@@ -96,28 +98,29 @@ def make_parquet(
           AND column2 IS NOT NULL AND column3 IS NOT NULL
     """
 
-    def batches():
-        con = duckdb.connect()
-        try:
-            result = con.execute(query)
-            # to_arrow_reader is DuckDB >= 1.5; fetch_record_batch (deprecated
-            # there) is the same reader on older versions
-            reader = getattr(result, "to_arrow_reader", None) or result.fetch_record_batch
-            for b in reader(row_group_size):
+    # The TSV is parsed once, by a parallel COPY to a staging Parquet next to
+    # the output; the barcode counts and the writer both read that file. A
+    # streamed DuckDB result is produced on one thread, and counting the
+    # barcodes first would parse the gzip a second time.
+    stage = output_path.with_name(output_path.name + ".stage.parquet")
+    try:
+        with duckdb.connect() as con:
+            con.execute(f"COPY ({query}) TO '{stage}' (FORMAT parquet, ROW_GROUP_SIZE {row_group_size})")
+            barcode_stats = con.execute(f"""
+                SELECT barcode, count(*)::BIGINT AS n_unique, sum(count)::BIGINT AS n_total
+                FROM read_parquet('{stage}') GROUP BY barcode
+            """).fetchdf()
+
+        def batches():
+            for b in pq.ParquetFile(stage).iter_batches(batch_size=row_group_size):
                 yield pa.Table.from_batches([b]).cast(NAMED_SCHEMA)
-        finally:
-            con.close()
 
-    with duckdb.connect() as con:
-        barcode_stats = con.execute(f"""
-            SELECT barcode, count(*)::BIGINT AS n_unique, sum(count)::BIGINT AS n_total
-            FROM ({query}) GROUP BY barcode
-        """).fetchdf()
-
-    write_fragments(
-        batches, output_path,
-        row_group_size=row_group_size, barcode_stats=barcode_stats,
-    )
+        write_fragments(
+            batches, output_path,
+            row_group_size=row_group_size, barcode_stats=barcode_stats,
+        )
+    finally:
+        stage.unlink(missing_ok=True)
 
     logger.info(f"Created {output_path.name}")
     return output_path

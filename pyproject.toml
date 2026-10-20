@@ -48,6 +48,9 @@ conflicts = [
 ]
 
 [dependency-groups]
+test = [
+    "pytest>=8",
+]
 docs = [
     "sphinx>=9.1",  # TODO: remove conf.py monkey-patch once executablebooks/MyST-Parser#1052 is fixed
     "scanpydoc[typehints]>=0.17.5",  # extra pulls a matching sphinx-autodoc-typehints; <0.17.5 breaks with it >=3.14
@@ -65,3 +68,7 @@ docs = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib", "--strict-markers"]

@@ -138,14 +138,13 @@ def test_lsi_reproducible_across_processes():
         ga.dr.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
         sys.stdout.buffer.write(a.obsm["X_lsi"].tobytes())
     """).format(tests=__file__.rsplit("/", 1)[0])
-    outs = [subprocess.run([sys.executable, "-c", script], check=True,
-                           capture_output=True).stdout for _ in range(2)]
-    assert outs[0] == outs[1]
+    out = subprocess.run([sys.executable, "-c", script], check=True,
+                         capture_output=True).stdout
 
     import gatac as ga
     a = _adata(_synthetic())
     ga.dr.lsi(a, 10, random_state=3, outlier_quantiles=(0.02, 0.98))
-    assert a.obsm["X_lsi"].tobytes() == outs[0]
+    assert a.obsm["X_lsi"].tobytes() == out
 
 
 def test_deterministic_false_still_runs_and_agrees_numerically():

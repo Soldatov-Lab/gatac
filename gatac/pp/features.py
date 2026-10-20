@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 
 def _is_binary_matrix(X) -> bool:
     """
-    Detect if a sparse matrix is binary by checking its dtype.
+    Detect if a sparse matrix is binary: bool dtype, or only 0/1 stored.
+
+    The value check is what catches GATAC's own binary matrices:
+    ``make_tile_matrix(count_strategy="binarize")`` stores its 0/1 values in
+    a numeric dtype.
 
     Parameters
     ----------
@@ -30,14 +34,17 @@ def _is_binary_matrix(X) -> bool:
     Returns
     -------
     bool
-        True if matrix is binary (bool dtype), False otherwise
+        True if matrix is binary, False otherwise
     """
     if isinstance(X, (cusp.csr_matrix, cusp.csc_matrix)):
-        return X.data.dtype == cp.bool_ or X.data.dtype == bool
+        xp = cp
     elif sp.issparse(X):
-        return X.data.dtype == np.bool_ or X.data.dtype == bool
-    
-    return False
+        xp = np
+    else:
+        return False
+    if X.data.dtype == bool:
+        return True
+    return bool(xp.all((X.data == 0) | (X.data == 1)))
 
 
 def _find_most_accessible_features_gpu(
@@ -287,8 +294,6 @@ def select_features_multi(
         Lower quantile threshold for filtering (default: 0.005)
     filter_upper_quantile : float
         Upper quantile threshold for filtering (default: 0.005)
-    chunk_size : int
-        Chunk size for row processing (default: 6000)
     binarize : bool
         Whether to binarize the output matrix (default: True)
 
@@ -312,20 +317,6 @@ def select_features_multi(
 
     if len(input_paths) == 0:
         raise ValueError("No input files provided")
-
-    if len(input_paths) == 1:
-        # Single file - use regular function
-        logger.info("Single file provided, using standard feature selection")
-        adata = sc.read_h5ad(str(input_paths[0]))
-        select_features(
-            adata,
-            n_features=n_features,
-            filter_lower_quantile=filter_lower_quantile,
-            filter_upper_quantile=filter_upper_quantile,
-            inplace=True,
-            output_path=output_path,
-        )
-        return
 
     logger.info(f"Processing {len(input_paths)} h5ad files")
 
@@ -429,12 +420,12 @@ def select_features_multi(
     total_cells_processed = 0
 
     for fpath in tqdm(input_paths, desc="Building matrix"):
-        # Read metadata first to avoid loading data if not needed
-        adata_meta = sc.read_h5ad(str(fpath), backed='r')
-        n_obs = adata_meta.n_obs
-        
-        # Pull only selected features into memory
-        X = adata_meta[:, selected_indices_cpu].to_memory().X
+        # Read in full, as pass 1 does: backed reads of sparse X are broken
+        # in anndata 0.10.9 with scipy 1.17
+        adata_file = sc.read_h5ad(str(fpath))
+        n_obs = adata_file.n_obs
+
+        X = adata_file.X[:, selected_indices_cpu]
         
         if not sp.issparse(X):
             X = sp.csr_matrix(X)
@@ -458,7 +449,7 @@ def select_features_multi(
             indptr_list.append(chunk_indptr + current_nnz)
 
         # Collect obs metadata
-        obs_df = adata_meta.obs.copy()
+        obs_df = adata_file.obs.copy()
         obs_df['source_file'] = fpath.name
         obs_list.append(obs_df)
 
@@ -466,7 +457,7 @@ def select_features_multi(
         total_cells_processed += n_obs
         
         # Explicit cleanup per file
-        del adata_meta, X, obs_df
+        del adata_file, X, obs_df
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
 

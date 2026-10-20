@@ -32,11 +32,7 @@ def _binarized_tile_matrix(tiles, world):
     return a[tiles.obs_names].copy()
 
 
-@pytest.mark.parametrize("source", ["bool", pytest.param("make_tile_matrix", marks=pytest.mark.xfail(
-    strict=True, reason=(
-        "select_features detects binary input by bool dtype only (gatac/pp/features.py:38); "
-        "make_tile_matrix(count_strategy='binarize') stores 0/1 in a numeric dtype, so GATAC's own "
-        "binary tile matrices take the count path and get quantile-trimmed.")))])
+@pytest.mark.parametrize("source", ["bool", "make_tile_matrix"])
 def test_select_features_ignores_quantiles_on_binary_input(tiles, world, source):
     """Binary matrices: plain top-N by accessibility, quantile filters "ignored for binary matrices"."""
     a = _binarized_tile_matrix(tiles, world) if source == "make_tile_matrix" else tiles
@@ -50,10 +46,6 @@ def test_select_features_ignores_quantiles_on_binary_input(tiles, world, source)
     assert count[sel].min() >= count[~sel].max()
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError, reason=(
-    "Every multi-file call crashes: with the locked anndata 0.10.9, "
-    "adata_meta[:, idx].to_memory().X of a backed file is None (gatac/pp/features.py:437), "
-    "and sp.csr_matrix(None) raises 'does not support dtype object'."))
 def test_select_features_multi_matches_in_memory_selection(split_h5ad, tmp_path):
     """Streaming over files selects what select_features selects on all cells, and keeps every cell's row."""
     paths, ordered = split_h5ad
@@ -72,9 +64,6 @@ def test_select_features_multi_matches_in_memory_selection(split_h5ad, tmp_path)
     assert (got.X != (ref.X > 0)).nnz == 0
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "With one input, select_features_multi falls back to select_features (gatac/pp/features.py:323): "
-    "the output keeps every feature and ignores binarize, unlike any multi-file call."))
 def test_select_features_multi_output_does_not_depend_on_number_of_inputs(split_h5ad, tmp_path):
     """One file in gives the same kind of output as several: only selected features, binarized."""
     paths, _ = split_h5ad

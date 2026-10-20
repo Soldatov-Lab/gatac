@@ -444,9 +444,16 @@ def create_gene_matrix_gpu(
     else:
         matrix = matrix.astype(np.uint8)
 
-    # Prepare gene metadata (unique features)
-    gene_metadata = gene_df.groupby('id').first().reset_index()
-    gene_metadata = gene_metadata.merge(unique_features, on='id', how='left')
+    # Prepare gene metadata (unique features): chrom, names and strand of the
+    # feature's first transcript in annotation order, and the span of its
+    # transcripts' domains on that chromosome, the region whose fragments
+    # count for it. (groupby.first picked an arbitrary transcript.)
+    first = gene_df.groupby('id').agg({'gene_idx': 'min'}).reset_index()
+    gene_metadata = gene_df[['gene_idx', 'chrom', 'name', 'strand', 'gene_name']].merge(first, on='gene_idx')
+    span = (gene_df[['id', 'chrom', 'start', 'end']]
+            .merge(gene_metadata[['id', 'chrom']], on=['id', 'chrom'])
+            .groupby('id').agg({'start': 'min', 'end': 'max'}).reset_index())
+    gene_metadata = gene_metadata.merge(span, on='id').merge(unique_features, on='id', how='left')
     gene_metadata = gene_metadata.sort_values('final_feature_idx').reset_index(drop=True)
     gene_metadata = gene_metadata[['chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name', 'final_feature_idx']]
     gene_metadata = gene_metadata.rename(columns={'final_feature_idx': 'gene_idx'})

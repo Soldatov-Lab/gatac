@@ -111,6 +111,11 @@
 
 ### Fixed
 
+- `make_gene_matrix` gives the same gene coordinates on every run: `var`
+  `start`/`end` are the span of the gene's transcript domains on its
+  chromosome, and `chrom`, `strand` and the names come from its first
+  transcript in the annotation. They came from an arbitrary transcript, which
+  changed between runs for ~2% of genes. The matrix is unchanged.
 - `tobias.bindetect` needs far less host memory: genome-wide on 5 pseudobulks
   with the 3,935 cisBP motifs (102M binding sites) it ran out of memory on a
   23 GB machine. Per-site scores are normalised one group at a time in chunks,

@@ -293,6 +293,36 @@ def test_gene_matrices_run(data, fn):
     assert set(res.obs_names) <= set(data["df"]["barcode"])
 
 
+def test_gene_matrix_var_spans_transcripts(data, tmp_path):
+    # Genes with up to three transcripts of different extents: each gene's
+    # coordinates are the span of its transcripts' domains, the same every run
+    rng = np.random.default_rng(2)
+    rows = []
+    for i in range(40):
+        c = list(CHROM_SIZES)[i % 4]
+        strand = "+" if i % 2 else "-"
+        gene_attrs = f'gene_id "G{i}"; gene_name "GENE{i}";'
+        s0 = int(rng.integers(5_000, CHROM_SIZES[c] - 80_000))
+        for t in range(1 + i % 3):
+            s = s0 + int(rng.integers(0, 10_000))
+            e = s + int(rng.integers(2_000, 50_000))
+            if t == 0:
+                rows.append(f"{c}\ttest\tgene\t{s0}\t{s0 + 70_000}\t.\t{strand}\t.\t{gene_attrs}")
+            attrs = f'{gene_attrs} transcript_id "T{i}.{t}"; transcript_name "GENE{i}-20{t}";'
+            rows.append(f"{c}\ttest\ttranscript\t{s}\t{e}\t.\t{strand}\t.\t{attrs}")
+    gtf = tmp_path / "multi.gtf"
+    gtf.write_text("\n".join(rows) + "\n")
+
+    runs = [ga.pp.make_gene_matrix(data["path"], gtf, output_path=tmp_path / f"genes{k}.h5ad",
+                                   min_fragments_per_cell=50).var for k in range(2)]
+    pd.testing.assert_frame_equal(runs[0], runs[1])
+    domains = ga.pp.gene.load_gene_annotation(gtf)
+    exp = domains.groupby("id").agg(start=("start", "min"), end=("end", "max"))
+    got = runs[0].set_index("id")[["start", "end"]]
+    pd.testing.assert_frame_equal(got.sort_index(), exp.loc[got.index].sort_index(), check_dtype=False)
+    assert (domains.groupby("id").size() > 1).sum() > 10
+
+
 @pytest.mark.parametrize("fn", ["gene", "genescore"])
 def test_gene_matrices_barcode_only_metrics(data, fn):
     # A metrics table with only barcodes selects those cells; the fragment

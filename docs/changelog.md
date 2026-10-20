@@ -49,7 +49,6 @@
 - Motif scanning from MEME format files.
 - chromVAR deviation scoring (fully GPU-accelerated).
 - GPU-accelerated preranked GSEA (`motif.gsea`).
-- Mini-batch LDA via Online Variational Bayes (`dr.lda`, `dr.MiniBatchLDA`).
 - Built-in chromosome sizes for hg38, hg19, mm10, mm39.
 - `motif.gsea` now also reports `lead_edge_idx`, the ranked-list
   indices of the leading-edge features (previously only the count was
@@ -80,8 +79,8 @@
 - Fragment file I/O moved to a new `gatac.io` namespace: `make_parquet`,
   `make_parquet_batch`, `FragmentFile` and `read_fragments_parquet` are no
   longer in `gatac.pp`.
-- `gatac.tl` is split by mode of analysis into `gatac.dr` (spectral, LSI,
-  LDA), `gatac.peak` (peak calling, peak matrix, marker peaks) and
+- `gatac.tl` is split by mode of analysis into `gatac.dr` (spectral, LSI),
+  `gatac.peak` (peak calling, peak matrix, marker peaks) and
   `gatac.motif` (motif enrichment, GSEA, chromVAR). Motif functions drop the
   `motif` from their names: `read`, `scan`, `enrichment`, `presence_matrix`,
   `enrichment_regression` and `gsea` (were `read_motifs`, `scan_motifs`,

@@ -2,12 +2,10 @@
 
 Compute a spectral decomposition of the cell × feature matrix — the standard
 entry point for UMAP and clustering in ATAC-seq workflows (`spectral`, after
-SnapATAC2 {cite:p}`Zhang2024`) — run TF-IDF followed by a truncated SVD, the
+SnapATAC2 {cite:p}`Zhang2024`) — or run TF-IDF followed by a truncated SVD, the
 latent semantic indexing {cite:p}`Cusanovich2015` of Signac {cite:p}`Stuart2021`
 and ArchR {cite:p}`Granja2021` (`lsi`, with `project_lsi` to place new cells on
-a fitted embedding) — or model topics over the peak-accessibility matrix with
-GPU-accelerated mini-batch Online Variational Bayes {cite:p}`Hoffman2013`
-(`lda`, `MiniBatchLDA`).
+a fitted embedding).
 
 `lsi` reproduces `ArchR:::.computeLSI` component for component, including its
 three `LSIMethod` variants, its depth-outlier hold-out, and the
@@ -29,8 +27,6 @@ requires cuGraph for the clustering step; `lsi` does not.
    iterative_lsi
    project_lsi
    model_from_adata
-   lda
-   MiniBatchLDA
 ```
 
 The individual stages of the LSI pipeline are importable from their module,

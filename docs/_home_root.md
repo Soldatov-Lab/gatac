@@ -119,8 +119,8 @@ or many h5ad files using streaming aggregation.
 :::{grid-item-card} {fas}`project-diagram` Dimensionality Reduction
 :shadow: none
 
-Embed cells for UMAP and clustering via spectral decomposition, ArchR-style
-(iterative) **LSI** with projection of new cells, or **LDA** topic modelling.
+Embed cells for UMAP and clustering via spectral decomposition or ArchR-style
+(iterative) **LSI** with projection of new cells.
 
 <a href="api/dr.html">→ API: dr</a>
 :::

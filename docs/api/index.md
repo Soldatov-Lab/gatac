@@ -42,7 +42,7 @@ selection.
 :link-type: doc
 :shadow: none
 
-Spectral embedding, ArchR-style (iterative) LSI, and LDA topic modelling.
+Spectral embedding and ArchR-style (iterative) LSI.
 :::
 
 :::{grid-item-card} {fas}`mountain` Peaks — `gatac.peak`

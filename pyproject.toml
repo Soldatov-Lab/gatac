@@ -50,10 +50,9 @@ conflicts = [
 [dependency-groups]
 docs = [
     "sphinx>=9.1",  # TODO: remove conf.py monkey-patch once executablebooks/MyST-Parser#1052 is fixed
-    "scanpydoc>=0.13",
+    "scanpydoc[typehints]>=0.17.5",  # extra pulls a matching sphinx-autodoc-typehints; <0.17.5 breaks with it >=3.14
     "myst-parser>=4.0",
     "myst-nb>=1.1",
-    "sphinx-autodoc-typehints>=2.0,<3.14",  # 3.14 drops format_annotation, which scanpydoc 0.17.4 imports
     "sphinx-copybutton>=0.5",
     "sphinx-design>=0.5",
     "sphinxcontrib-mermaid>=0.9",

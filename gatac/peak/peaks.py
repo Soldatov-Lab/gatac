@@ -1288,6 +1288,18 @@ def merge(
     return result
 
 
+def _expand_ranges(lo: cp.ndarray, hi: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
+    """``(i, j)`` for every ``j`` in ``[lo[i], hi[i])``, as two index arrays."""
+    n = cp.maximum(hi - lo, 0)
+    total = int(n.sum())
+    if total == 0:
+        return cp.empty(0, dtype=cp.int64), cp.empty(0, dtype=cp.int64)
+    ends = cp.cumsum(n)
+    k = cp.arange(total, dtype=cp.int64)
+    i = cp.searchsorted(ends, k, side='right')
+    return i, k - (ends - n)[i] + lo[i]
+
+
 def _count_fragments_in_peaks_gpu(
     fragments_df: cudf.DataFrame,
     peaks_by_chrom: dict,
@@ -1345,86 +1357,53 @@ def _count_fragments_in_peaks_gpu(
         frag_ends = chrom_frags['end'].to_cupy()
         global_frag_indices = chrom_frags['_global_frag_idx'].to_cupy()
         
+        def emit(f_local, p_local):
+            if len(f_local) > 0:
+                all_results.append(cudf.DataFrame({
+                    'frag_idx': global_frag_indices[f_local],
+                    'peak_idx': peak_indices[p_local],
+                }))
+
+        # Peaks from peak.merge never overlap, so the peak holding a position
+        # is the last one starting at or before it. A peak_file may hold
+        # overlapping peaks: then every peak starting within the widest peak's
+        # width before the position is a candidate.
+        max_width = int((peak_ends - peak_starts).max())
+        disjoint = bool(cp.all(peak_starts[1:] >= peak_ends[:-1]))
+
         if counting_strategy == "fragment":
             # Frag overlaps peak if: frag_start < peak_end AND frag_end > peak_start
-            # Find all peaks that could overlap with this fragment:
-            # First peak with peak_end > frag_start
-            left_indices = cp.searchsorted(peak_ends, frag_starts, side='right')
-            # First peak with peak_start >= frag_end
-            right_indices = cp.searchsorted(peak_starts, frag_ends, side='left')
-            
-            # For each fragment i, its overlapping peaks are in range [left_indices[i], right_indices[i])
-            counts_per_frag = right_indices - left_indices
-            valid_frags = cp.where(counts_per_frag > 0)[0]
-            
-            if len(valid_frags) > 0:
-                # Expand ranges into (fragment_idx, peak_idx) pairs
-                # This could be expensive if many peaks per fragment, but typically 1-2
-                repeat_counts = counts_per_frag[valid_frags]
-                f_indices = cp.repeat(valid_frags, repeat_counts)
-                
-                # Offset indices into the peak array
-                offsets = cp.cumsum(repeat_counts) - repeat_counts
-                p_indices_local = cp.arange(len(f_indices)) - cp.repeat(offsets, repeat_counts) + cp.repeat(left_indices[valid_frags], repeat_counts)
-                
-                overlap_df = cudf.DataFrame({
-                    'frag_idx': global_frag_indices[f_indices],
-                    'peak_idx': peak_indices[p_indices_local],
-                })
-                all_results.append(overlap_df)
-                
+            lo = cp.searchsorted(peak_starts, frag_starts.astype(cp.int64) - max_width, side='right')
+            hi = cp.searchsorted(peak_starts, frag_ends, side='left')
+            f_local, p_local = _expand_ranges(lo, hi)
+            keep = peak_ends[p_local] > frag_starts[f_local]
+            emit(f_local[keep], p_local[keep])
         else:
-            # Insertion-based counting (paired-insertion or insertion)
-            # Find peaks containing insertion 1 (at start)
-            # Insertion at p is in peak if: peak_start <= p < peak_end
-            # Use searchsorted to find candidate peak (since peaks are sorted and non-overlapping)
-            # Find first peak where peak_start > p, then candidate is index-1
-            
-            # Find peaks for insertion 1 (start)
-            idx1 = cp.searchsorted(peak_starts, frag_starts, side='right') - 1
-            valid1 = (idx1 >= 0) & (frag_starts < peak_ends[idx1])
-            
-            # Find peaks for insertion 2 (end-1)
+            # Insertion-based counting (paired-insertion or insertion), at
+            # start and end - 1. Insertion at p is in peak if:
+            # peak_start <= p < peak_end
             ins2_pos = frag_ends - 1
-            idx2 = cp.searchsorted(peak_starts, ins2_pos, side='right') - 1
-            valid2 = (idx2 >= 0) & (ins2_pos < peak_ends[idx2])
-            
-            if counting_strategy == "paired-insertion":
-                # For paired-insertion, we want to count once per fragment AND peak
-                # If both insertions are in the SAME peak, count once
-                # If both are in DIFFERENT peaks, count once for each peak
-                
-                # Case 1: Ins 1 is valid
-                v1_indices = cp.where(valid1)[0]
-                if len(v1_indices) > 0:
-                    all_results.append(cudf.DataFrame({
-                        'frag_idx': global_frag_indices[v1_indices],
-                        'peak_idx': peak_indices[idx1[v1_indices]],
-                    }))
-                
-                # Case 2: Ins 2 is valid AND (either ins 1 is invalid OR ins 1 is in a different peak)
-                v2_extra = valid2 & (~valid1 | (idx1 != idx2))
-                v2_indices = cp.where(v2_extra)[0]
-                if len(v2_indices) > 0:
-                    all_results.append(cudf.DataFrame({
-                        'frag_idx': global_frag_indices[v2_indices],
-                        'peak_idx': peak_indices[idx2[v2_indices]],
-                    }))
-            else:  # "insertion" strategy
-                # Count both separately
-                v1_indices = cp.where(valid1)[0]
-                if len(v1_indices) > 0:
-                    all_results.append(cudf.DataFrame({
-                        'frag_idx': global_frag_indices[v1_indices],
-                        'peak_idx': peak_indices[idx1[v1_indices]],
-                    }))
-                
-                v2_indices = cp.where(valid2)[0]
-                if len(v2_indices) > 0:
-                    all_results.append(cudf.DataFrame({
-                        'frag_idx': global_frag_indices[v2_indices],
-                        'peak_idx': peak_indices[idx2[v2_indices]],
-                    }))
+            if disjoint:
+                idx1 = cp.searchsorted(peak_starts, frag_starts, side='right') - 1
+                valid1 = (idx1 >= 0) & (frag_starts < peak_ends[idx1])
+                idx2 = cp.searchsorted(peak_starts, ins2_pos, side='right') - 1
+                valid2 = (idx2 >= 0) & (ins2_pos < peak_ends[idx2])
+                if counting_strategy == "paired-insertion":
+                    # Both insertions in one peak: count the fragment once
+                    valid2 &= ~valid1 | (idx1 != idx2)
+                v1 = cp.where(valid1)[0]
+                v2 = cp.where(valid2)[0]
+                emit(v1, idx1[v1])
+                emit(v2, idx2[v2])
+            else:
+                for pos in (frag_starts, ins2_pos):
+                    lo = cp.searchsorted(peak_starts, pos.astype(cp.int64) - max_width, side='right')
+                    hi = cp.searchsorted(peak_starts, pos, side='right')
+                    f_local, p_local = _expand_ranges(lo, hi)
+                    keep = pos[f_local] < peak_ends[p_local]
+                    # paired-insertion: the drop_duplicates below counts a
+                    # fragment with both insertions in one peak once
+                    emit(f_local[keep], p_local[keep])
         
         mempool.free_all_blocks()
     
@@ -1439,10 +1418,7 @@ def _count_fragments_in_peaks_gpu(
     frag_cells = fragments_df['cell'].values
     all_overlaps['cell_idx'] = cell_index[frag_cells[all_overlaps['frag_idx'].values]]
     
-    # For paired-insertion, deduplicate (frag_idx, peak_idx) pairs
-    # (Note: my optimized logic for paired-insertion already handles same-peak case, 
-    # but a fragment could potentially overlap two peaks if they were contiguous.
-    # However, merge ensures they are non-overlapping with a gap of at least 1.)
+    # For paired-insertion, count each (fragment, peak) pair once
     if counting_strategy == "paired-insertion":
         all_overlaps = all_overlaps.drop_duplicates(subset=['frag_idx', 'peak_idx'])
     
@@ -1646,10 +1622,7 @@ def make_matrix(
     import scipy.sparse as sp
     from anndata import AnnData as AD
     
-    # Get peaks
-    if peak_file is not None and use_rep is not None:
-        raise ValueError("Cannot specify both peak_file and use_rep")
-    
+    # Get peaks: a peak_file takes precedence over use_rep
     if peak_file is not None:
         # Read from BED file
         peaks_df = pd.read_csv(

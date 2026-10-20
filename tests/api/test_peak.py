@@ -140,10 +140,7 @@ def test_merge_of_called_peaks_is_non_overlapping_and_covers_every_call(peaks, c
 # -------------------------------------------------------------------- make_matrix
 
 
-@pytest.mark.parametrize("strategy", ["paired-insertion", "insertion", pytest.param("fragment", marks=pytest.mark.xfail(
-    strict=True, raises=ValueError, reason=(
-        "counting_strategy='fragment' crashes: cp.repeat is given a device array of repeats "
-        "(gatac/peak/peaks.py:1364), which CuPy rejects.")))])
+@pytest.mark.parametrize("strategy", ["paired-insertion", "insertion", "fragment"])
 def test_make_matrix_counts_as_documented(peaks, world, strategy, chrom_sizes):
     """Each counting strategy counts exactly what its docstring says, per cell and peak."""
     merged = ga.peak.merge(peaks.uns["gmacs"], chrom_sizes=chrom_sizes)
@@ -154,10 +151,6 @@ def test_make_matrix_counts_as_documented(peaks, world, strategy, chrom_sizes):
     np.testing.assert_array_equal(got.X.toarray(), expected)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "make_matrix assumes non-overlapping peaks: _count_fragments_in_peaks_gpu (gatac/peak/peaks.py:1383) "
-    "assigns each insertion to the last peak starting before it, so an insertion inside an earlier, "
-    "overlapping peak is lost. A peak_file need not come from peak.merge."))
 def test_make_matrix_counts_overlapping_peaks_from_file(peaks, world, tmp_path, chrom_sizes):
     """A BED of overlapping peaks (e.g. from another caller) gets every peak counted in full."""
     merged = _coords(peaks.var_names)
@@ -170,9 +163,6 @@ def test_make_matrix_counts_overlapping_peaks_from_file(peaks, world, tmp_path, 
     np.testing.assert_array_equal(got.X.toarray(), expected)
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError, reason=(
-    "make_matrix raises 'Cannot specify both peak_file and use_rep' (gatac/peak/peaks.py:1651) because "
-    "use_rep defaults to 'peaks'; a peak_file only works with an explicit use_rep=None."))
 def test_make_matrix_peak_file_takes_precedence(peaks, world, tmp_path, chrom_sizes):
     """``peak_file``: "If provided, peak information will be read from this file instead of use_rep"."""
     bed = tmp_path / "peaks.bed"

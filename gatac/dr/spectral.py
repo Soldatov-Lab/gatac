@@ -50,6 +50,7 @@ from ._gpu import (
     _scale_rows_kernel,
     _to_gpu_csr,
 )
+from .lsi import _pinned_signs, _spmv
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,7 @@ def _spectral_mf(
     X: cusp.csr_matrix,
     n_comps: int,
     random_state: int,
+    deterministic: bool = True,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """
     Matrix-free spectral embedding on GPU (full matrix in VRAM).
@@ -180,6 +182,10 @@ def _spectral_mf(
         Number of eigenpairs to compute.
     random_state : int
         Seed for the random starting vector.
+    deterministic : bool
+        Apply ``X`` and ``Xᵀ`` with the fixed-order product of
+        :func:`gatac.dr.lsi._spmv` instead of cuSPARSE, whose SpMV is not
+        run-to-run reproducible. Costs a materialised copy of ``Xᵀ``.
 
     Returns
     -------
@@ -189,14 +195,23 @@ def _spectral_mf(
         Corresponding eigenvectors.
     """
     n_cells = X.shape[0]
+    if deterministic:
+        XT = X.T.tocsr()
+
+        def dot(A, v):
+            return _spmv(A, cp.ascontiguousarray(v, dtype=cp.float32),
+                         cp.empty(A.shape[0], dtype=cp.float32))
+    else:
+        XT = X.T
+
+        def dot(A, v):
+            return A.dot(v)
 
     # Column sums of the normalized matrix
-    col_sum = cp.asarray(X.sum(axis=0), dtype=cp.float32).ravel()
+    col_sum = dot(XT, cp.ones(n_cells, dtype=cp.float32))
 
     # Degree vector: d_i = (X @ col_sum)_i - 1   (== Σ_{j≠i} cos(x_i, x_j))
-    degree = cp.asarray(
-        X.dot(col_sum.reshape(-1, 1)), dtype=cp.float32
-    ).ravel() - cp.float32(1.0)
+    degree = dot(X, col_sum) - cp.float32(1.0)
 
     n_zero = int(cp.sum(degree <= 0))
     if n_zero > 0:
@@ -218,11 +233,16 @@ def _spectral_mf(
         _scale_rows_kernel, n_cells,
         X.data, indptr32, sqrt_dinv, np.int32(n_cells),
     )
+    if deterministic:
+        # Xᵀ was materialised before the scaling; scale its columns to match
+        XT.data *= sqrt_dinv[XT.indices]
     del sqrt_dinv
 
     # Linear operator: A v = X (Xᵀ v) − D⁻¹ v
     def matvec(v):
-        return X.dot(X.T.dot(v)) - degree_inv * v
+        shp = v.shape
+        y = dot(X, dot(XT, v.ravel())) - degree_inv * v.ravel()
+        return y.reshape(shp)
 
     A = cusla.LinearOperator(
         shape=(n_cells, n_cells),
@@ -428,6 +448,7 @@ def spectral(
     feature_weights: np.ndarray | None = None,
     inplace: bool = True,
     chunk_size: int | None = None,
+    deterministic: bool = True,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """
     GPU-accelerated spectral embedding via Laplacian Eigenmaps.
@@ -457,7 +478,9 @@ def spectral(
         ``pp.select_features``. You can also pass a NumPy boolean array of
         length ``n_vars`` or ``None`` to use all features.
     random_state
-        Seed for reproducibility of the Lanczos starting vector.
+        Seed of the Lanczos starting vector. With ``deterministic=True`` and
+        no ``chunk_size``, the same input and seed give a bitwise-identical
+        embedding; each component's sign is pinned in every mode.
     weighted_by_sd
         If True (default), weight each eigenvector by the square root of its
         eigenvalue and discard components with non-positive eigenvalues. This
@@ -477,6 +500,12 @@ def spectral(
         iteration, trading throughput for reduced peak GPU memory.
         Recommended values: 20 000 – 50 000.  ``None`` (default) loads the
         full matrix to the GPU (fastest, but requires enough VRAM).
+        The chunked products are not run-to-run reproducible in the last
+        bits, whatever ``deterministic`` says.
+    deterministic
+        Use a fixed-order sparse product instead of cuSPARSE, whose SpMV is
+        not run-to-run reproducible. Costs a second copy of the normalized
+        matrix in GPU memory; ``False`` saves it.
 
     Returns
     -------
@@ -489,7 +518,9 @@ def spectral(
     In the default full-GPU path, the matrix is uploaded in its original
     integer dtype and only ``X.data`` is converted to float32 in place during
     normalization. The sparse index arrays stay int32, and peak GPU memory is
-    roughly one float32 copy of the ``data`` array.
+    roughly one float32 copy of the ``data`` array, plus the transposed copy
+    of the matrix the deterministic product needs. A matrix already on the GPU
+    is copied first rather than normalized in place.
 
     When ``chunk_size`` is set, peak GPU memory is roughly one chunk. The full
     matrix stays on the CPU, row chunks are streamed to the GPU for each eigsh
@@ -582,6 +613,9 @@ def spectral(
     else:
         # ---- Full-GPU path (memory-optimised) ----
         X_gpu = _to_gpu_csr(X)
+        if X_gpu is adata.X:
+            # normalisation below rewrites X_gpu.data in place
+            X_gpu = X_gpu.copy()
 
         if feature_weights is not None:
             weights = cp.asarray(feature_weights, dtype=cp.float64)
@@ -596,11 +630,14 @@ def spectral(
         cp.get_default_memory_pool().free_all_blocks()
         logger.info("Row normalization done.")
 
-        evals, evecs = _spectral_mf(X_gpu, n_comps, random_state)
+        evals, evecs = _spectral_mf(X_gpu, n_comps, random_state, deterministic)
         del X_gpu
         cp.get_default_memory_pool().free_all_blocks()
 
     logger.info("Eigen-decomposition done.")
+
+    # eigsh leaves each eigenvector's sign arbitrary; pin it to the data
+    evecs = evecs * _pinned_signs(evecs)
 
     # ---- SD weighting ----
     if weighted_by_sd:

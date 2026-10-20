@@ -330,6 +330,7 @@ class LSIModel:
     method: int
     scale_to: float
     binarize: bool
+    scale_by_sv: bool = True         #: embedding is U·S (True) or U (False)
     deterministic: bool = True       #: whether the *reproducible* solver ran
     random_state: int = 0
     depth_cor: np.ndarray | None = None      #: |r| with log10 depth, per component
@@ -504,12 +505,17 @@ def _flip_signs(u: cp.ndarray, vt: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
     ``sum(u)`` can). ``sum(u)`` and finally ``+1`` are the fallbacks if it is
     exactly zero. The product ``u @ diag(s) @ vt`` is unchanged either way.
     """
+    signs = _pinned_signs(u)
+    return u * signs, vt * signs[:, None]
+
+
+def _pinned_signs(u: cp.ndarray) -> cp.ndarray:
+    """Per-column ``±1`` from ``sum(u³)``; the rule of :func:`_flip_signs`."""
     crit = (u.astype(cp.float64) ** 3).sum(axis=0)
     fallback = u.astype(cp.float64).sum(axis=0)
     crit = cp.where(crit == 0, fallback, crit)
     signs = cp.sign(crit)
-    signs = cp.where(signs == 0, 1.0, signs).astype(u.dtype)
-    return u * signs, vt * signs[:, None]
+    return cp.where(signs == 0, 1.0, signs).astype(u.dtype)
 
 
 def _augment_orthonormal(x: cp.ndarray, n_aug: int, rng) -> cp.ndarray:
@@ -980,6 +986,7 @@ def compute_lsi(
         method=method,
         scale_to=float(scale_to),
         binarize=bool(binarize),
+        scale_by_sv=bool(scale_by_sv),
         deterministic=used_deterministic,
         random_state=random_state,
         n_held_out=n_held_out,
@@ -1133,6 +1140,10 @@ def _project(
         if Xg.dtype == cp.float32
         else Xg.dot(loadings)
     )
+    if not model.scale_by_sv:
+        # X @ loadings is U·S; an unscaled model embeds the fitted cells as U
+        s = cp.asarray(model.singular_values, dtype=cp.float32)
+        emb = emb / cp.where(s == 0, cp.float32(1.0), s)
     out = cp.asnumpy(emb).astype(np.float32)
     del Xg, emb, idf, inv_depth, depth
     cp.get_default_memory_pool().free_all_blocks()
@@ -1153,7 +1164,8 @@ def project_lsi(model: LSIModel, X_new) -> np.ndarray:
     4. TF from that depth,
     5. IDF from the training ``row_sums`` and ``n_train``,
 
-    then ``emb = X_new @ loadings``. A cell whose nonzeros all fell in features
+    then ``emb = X_new @ loadings``, divided by the singular values for a
+    model fitted with ``scale_by_sv=False``. A cell whose nonzeros all fell in features
     dropped at fit time has zero depth after step 1 and projects to an all-zero
     row, as in ArchR (``colSm[colSm == 0] <- 1``), rather than to NaN.
 
@@ -1307,6 +1319,12 @@ def initial_features(
             "(ArchR: Not Enough Non-Zero Features to Filter!)."
         )
         top = order[:n_features]
+    if top.size == 0:
+        raise ValueError(
+            f"total_features={total_features:,} skips the {rm_top:,} most "
+            f"accessible features, but the matrix has only {acc.size:,}; "
+            "lower total_features to the number of features you have."
+        )
     return np.sort(top)
 
 
@@ -1827,12 +1845,13 @@ def model_from_adata(adata, uns_key: str = "lsi") -> LSIModel:
         embedding=np.empty((0, loadings_full.shape[1]), dtype=np.float32),
         singular_values=np.asarray(stored["singular_values"]),
         feature_loadings=loadings_full[mask].astype(np.float32),
-        idx=np.arange(int(mask.sum()), dtype=np.int64),
+        idx=np.flatnonzero(mask).astype(np.int64),
         row_sums=np.asarray(stored["row_sums"], dtype=np.float32),
         n_train=int(stored["n_train"]),
         method=int(stored["method"]),
         scale_to=float(stored["scale_to"]),
         binarize=bool(stored["binarize"]),
+        scale_by_sv=bool(stored.get("scale_by_sv", True)),
         # absent in models written before the reproducible solver existed
         deterministic=bool(stored.get("deterministic", False)),
         random_state=int(stored["random_state"]),

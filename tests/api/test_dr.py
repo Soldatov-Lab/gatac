@@ -55,10 +55,6 @@ def test_embedding_separates_the_groups(selected, name):
     assert silhouette_score(selected.obsm[key], selected.obs["group"]) > 0.3
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "spectral: cusla.eigsh runs on cuSPARSE products that are not run-to-run "
-    "deterministic, and the eigenvector signs are never fixed, so the same "
-    "random_state flips component signs at random (spectral.py:_spectral_mf)"))
 def test_spectral_same_seed_same_result(selected):
     """``random_state`` is documented as the 'seed for reproducibility'."""
     out = [ga.dr.spectral(selected.copy(), N_COMPS, random_state=3, inplace=False)[1] for _ in range(3)]
@@ -93,13 +89,7 @@ def test_cell_without_signal_raises(selected, name):
         fn(selected)
 
 
-@pytest.mark.parametrize("name", [
-    "lsi",
-    pytest.param("spectral", marks=pytest.mark.xfail(strict=True, reason=(
-        "spectral: _to_gpu_csr returns a float32 cupy CSR as-is (_gpu.py:104) and "
-        "_normalize_rows_inplace / _scale_rows_kernel then rewrite it, i.e. adata.X "
-        "(spectral.py:582-592)"))),
-])
+@pytest.mark.parametrize("name", list(EMBEDDINGS))
 def test_gpu_input_gives_the_same_result_and_is_left_alone(tiles, name):
     """An AnnData already on the GPU (e.g. via rapids_singlecell) embeds like the host one and keeps its X."""
     fn, key = EMBEDDINGS[name]
@@ -112,10 +102,6 @@ def test_gpu_input_gives_the_same_result_and_is_left_alone(tiles, name):
     assert _abs_corr(tiles.obsm[key], host.obsm[key]).min() > 0.9999
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "lsi: with scale_by_sv=False the fitted cells get U (lsi.py:969) but held-out "
-    "depth outliers are reinserted by _project, which returns X @ V = U·S "
-    "(lsi.py:999), so their rows are scaled by the singular values"))
 def test_scale_by_sv_only_rescales_columns(selected):
     """``scale_by_sv`` returns ``V @ diag(d)`` instead of ``V`` — for every cell, held-out ones included."""
     kw = dict(outlier_quantiles=(0.02, 0.98), depth_cor_cutoff=None)
@@ -156,8 +142,8 @@ def test_stored_models_survive_h5ad_and_project_cells_back(selected, tmp_path):
     for key, obsm in [("lsi", "X_lsi"), ("iterative_lsi", "X_iterative_lsi")]:
         uns = back.uns[key]
         model = ga.dr.model_from_adata(back, key)
-        mask = np.asarray(uns["model"]["feature_mask"], bool)
-        proj = ga.dr.project_lsi(model, back.X[:, mask])
+        # the full matrix: project_lsi picks the model's features itself
+        proj = ga.dr.project_lsi(model, back.X)
         kept = np.setdiff1d(np.arange(proj.shape[1]), uns["dims_dropped"])
         proj, emb = proj[:, kept], back.obsm[obsm]
         assert uns["n_held_out"] > 0

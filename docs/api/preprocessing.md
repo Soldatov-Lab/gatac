@@ -10,7 +10,7 @@ files written by [`gatac.io`](io.md).
 
 Compute TSS enrichment score and fragment-level statistics entirely on GPU
 using a streaming approach, filter barcodes by quality thresholds, and detect
-doublet / multiplet cells with the AMULET Poisson method.  `filter_fragments`
+doublet / multiplet cells with the AMULET Poisson method {cite:p}`Thibodeau2021`.  `filter_fragments`
 accepts a pre-computed metrics DataFrame or CSV and a Polars query string;
 `detect_doublets` returns per-cell p/q values and an `is_doublet` flag.
 
@@ -32,10 +32,10 @@ accepts a pre-computed metrics DataFrame or CSV and a Polars query string;
 
 Build cell × feature matrices from QC-filtered fragments, and post-process the
 resulting `.h5ad` files.  Includes fixed-width genomic bins (`make_tile_matrix`,
-compatible with SnapATAC2's count strategy), gene activity over a GTF annotation
+compatible with SnapATAC2's count strategy {cite:p}`Zhang2024`), gene activity over a GTF annotation
 — either SnapATAC2-style paired-insertion counts (`make_gene_matrix`) or
 ArchR-style distance-weighted gene scores (`make_gene_score_matrix`, a port of
-`addGeneScoreMatrix`) — and operations on existing `.h5ad` files: combining
+`addGeneScoreMatrix` {cite:p}`Granja2021`) — and operations on existing `.h5ad` files: combining
 samples (`combine`) and selecting the most accessible genomic features across
 one or many matrices (`select_features`, `select_features_multi`).
 

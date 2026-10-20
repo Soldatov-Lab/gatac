@@ -246,7 +246,7 @@ def markers(
     
     Identifies differentially accessible peaks between cell groups using
     the binomial test on binarized accessibility data. This approach follows
-    ArchR's getMarkerFeatures with testMethod="binomial".
+    ArchR's getMarkerFeatures with testMethod="binomial" :cite:p:`Granja2021`.
     
     For each group, compares the proportion of cells with accessible peaks
     in the foreground group vs the background (all other cells or a specific
@@ -291,7 +291,7 @@ def markers(
         - "mean_bg": Mean accessibility in background
         - "mean_diff": mean_fg - mean_bg
         - "p_value": Raw p-value from two-sided binomial test
-        - "fdr": Benjamini-Hochberg adjusted p-value
+        - "fdr": Benjamini-Hochberg :cite:p:`Benjamini1995` adjusted p-value
         
     Notes
     -----

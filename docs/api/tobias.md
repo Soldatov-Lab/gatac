@@ -1,6 +1,7 @@
 # Footprinting — `gatac.tobias`
 
-GPU port of the [TOBIAS](https://github.com/loosolab/TOBIAS) pipeline.
+GPU port of the [TOBIAS](https://github.com/loosolab/TOBIAS) pipeline
+{cite:p}`Bentsen2020`.
 `footprint` corrects the Tn5 insertion bias of each pseudobulk
 (TOBIAS `ATACorrect`) and computes footprint scores (`ScoreBigwig`), reading
 cut sites straight from the fragments parquet — no BAM or bigwig files.
@@ -18,7 +19,8 @@ reproduces TOBIAS's quirks; `tobias_compat=False` fixes them:
 * the bias model depends on the BAM read length (`read_length`, 50 by
   default);
 * for MEME motifs the reverse-strand matrix is rebuilt from
-  `round(p × nsites)`, which is coarse for `nsites=1` files such as cisBP;
+  `round(p × nsites)`, which is coarse for `nsites=1` files such as cisBP
+  {cite:p}`Weirauch2014`;
 * the per-peak log2FC average actually groups by binding site.
 
 ```{eval-rst}

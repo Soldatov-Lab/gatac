@@ -438,7 +438,9 @@ def spectral(
     computation runs on the GPU via CuPy, using a matrix-free approach
     that never materializes the N × N similarity matrix.
 
-    This is a GPU-accelerated port of SnapATAC2's ``dr.spectral``.
+    This is a GPU-accelerated port of SnapATAC2's ``dr.spectral``
+    :cite:p:`Zhang2024`, itself an implementation of Laplacian Eigenmaps
+    :cite:p:`Belkin2003`.
 
     Parameters
     ----------

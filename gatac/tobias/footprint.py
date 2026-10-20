@@ -791,9 +791,9 @@ def footprint(
     """
     Tn5 bias correction and footprint scores per pseudobulk (GPU TOBIAS).
 
-    Reproduces TOBIAS 0.17.5 ``ATACorrect`` followed by ``ScoreBigwig --score
-    footprint`` with default parameters, for each group of cells, reading cut
-    sites directly from the fragments parquet. Feed the result to
+    Reproduces TOBIAS 0.17.5 :cite:p:`Bentsen2020` ``ATACorrect`` followed by
+    ``ScoreBigwig --score footprint`` with default parameters, for each group
+    of cells, reading cut sites directly from the fragments parquet. Feed the result to
     :func:`gatac.tobias.bindetect` for differential TF binding.
 
     Parameters

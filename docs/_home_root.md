@@ -3,7 +3,8 @@
 GATAC is a GPU-accelerated toolkit for end-to-end ATAC-seq data processing.
 Starting from raw fragment files, it produces analysis-ready sparse matrices
 (tile, peak, and gene activity) that integrate directly with the
-[scverse](https://scverse.org) ecosystem — AnnData, Scanpy, and SnapATAC2.
+[scverse](https://scverse.org) ecosystem {cite:p}`Virshup2023` — AnnData,
+Scanpy {cite:p}`Wolf2018`, and SnapATAC2 {cite:p}`Zhang2024`.
 Computations are offloaded to the GPU via [RAPIDS cuDF](https://rapids.ai),
 [CuPy](https://cupy.dev), and [cuML](https://docs.rapids.ai/api/cuml/stable/),
 delivering 10–50× speedups over CPU-only workflows on typical single-cell
@@ -34,7 +35,8 @@ Inside the Parquet file
 :shadow: none
 
 GATAC [reproduces](reproducibility) the core operations of established tools
-like **SnapATAC2**, **ArchR**, **MACS3**, and **chromVAR** within a unified
+like **SnapATAC2** {cite:p}`Zhang2024`, **ArchR** {cite:p}`Granja2021`,
+**MACS3** {cite:p}`Zhang2008`, and **chromVAR** {cite:p}`Schep2017` within a unified
 framework. It produces standard **AnnData** objects fully compatible with the
 **scverse** ecosystem.
 

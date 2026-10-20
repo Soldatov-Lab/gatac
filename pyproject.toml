@@ -59,6 +59,7 @@ docs = [
     "sphinx-autobuild>=2024",
     "numpydoc>=1.7",
     "sphinx-book-theme>=1.2.0",
+    "sphinxcontrib-bibtex>=2.6",
 ]
 
 [build-system]

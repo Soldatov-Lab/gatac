@@ -1,8 +1,8 @@
 # Motifs — `gatac.motif`
 
 Read motifs from MEME-format files, test for over-representation in peak
-sets, run GSEA on motif rankings, and score per-cell TF activity with
-chromVAR.
+sets, run GSEA {cite:p}`Subramanian2005` on motif rankings, and score
+per-cell TF activity with chromVAR {cite:p}`Schep2017`.
 
 ```{eval-rst}
 .. currentmodule:: gatac.motif

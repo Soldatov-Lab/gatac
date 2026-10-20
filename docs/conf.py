@@ -47,7 +47,12 @@ extensions = [
     "sphinx_copybutton",
     "sphinx_design",
     "sphinxcontrib.mermaid",
+    # Citations: {cite:p}`key` in pages and :cite:p:`key` in docstrings,
+    # resolved against references.bib and listed on references.md
+    "sphinxcontrib.bibtex",
 ]
+
+bibtex_bibfiles = ["references.bib"]
 
 # MyST extensions
 myst_enable_extensions = [

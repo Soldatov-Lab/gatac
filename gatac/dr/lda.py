@@ -26,7 +26,7 @@ class MiniBatchLDA:
     """GPU-accelerated Mini-batch LDA via Online Variational Bayes.
 
     Learns latent topics from a binary cell-by-peak matrix using stochastic
-    variational inference with CuPy GPU acceleration.  The E-step works
+    variational inference :cite:p:`Hoffman2013` with CuPy GPU acceleration.  The E-step works
     directly on the CSR sparsity pattern so the per-cell working set is
     ``K × nnz_i`` instead of ``K × V``.
 
@@ -433,7 +433,7 @@ def lda(
     """
     Learn topics from a binarized peak matrix using GPU-accelerated mini-batch LDA.
 
-    Uses Online Variational Bayes (Hoffman et al., 2013) with JAX.
+    Uses Online Variational Bayes :cite:p:`Hoffman2013` with CuPy.
     Optimised for single-cell ATAC-seq binary peak-by-cell matrices.
 
     Parameters

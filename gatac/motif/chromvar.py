@@ -374,7 +374,7 @@ def sample_bg_peaks(
     biases (e.g., GC content and accessibility). Two methods are supported:
     
     1. **"knn"** (default): GPU-accelerated k-NN using cuML. Faster and recommended.
-    2. **"chromvar"**: Original chromVAR binning method. Slower but faithful to R package.
+    2. **"chromvar"**: Original chromVAR :cite:p:`Schep2017` binning method. Slower but faithful to R package.
     
     Parameters
     ----------
@@ -860,7 +860,7 @@ def compute_deviations(
     Compute chromVAR TF deviation scores.
 
     Computes per-cell, per-motif deviation scores normalized by background
-    expectation. Requires prior setup:
+    expectation, following chromVAR :cite:p:`Schep2017`. Requires prior setup:
 
     1. `sample_bg_peaks()` to generate `adata.varm["bg_peaks"]`
     2. `scan()` to generate `adata.varm["motif_match"]`
@@ -1125,7 +1125,7 @@ def chromvar(
     """
     Run the full chromVAR pipeline in a single call.
 
-    Executes the following steps in order:
+    Executes the steps of chromVAR :cite:p:`Schep2017` in order:
 
     1. `compute_peak_bias` — GC content from genome FASTA
     2. `sample_bg_peaks` — background peak sampling

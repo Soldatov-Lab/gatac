@@ -1,11 +1,13 @@
 # Dimensionality reduction — `gatac.dr`
 
 Compute a spectral decomposition of the cell × feature matrix — the standard
-entry point for UMAP and clustering in ATAC-seq workflows (`spectral`) — run
-TF-IDF followed by a truncated SVD, the Signac/ArchR latent semantic indexing
-(`lsi`, with `project_lsi` to place new cells on a fitted embedding) — or model
-topics over the peak-accessibility matrix with GPU-accelerated mini-batch
-Online Variational Bayes (`lda`, `MiniBatchLDA`).
+entry point for UMAP and clustering in ATAC-seq workflows (`spectral`, after
+SnapATAC2 {cite:p}`Zhang2024`) — run TF-IDF followed by a truncated SVD, the
+latent semantic indexing {cite:p}`Cusanovich2015` of Signac {cite:p}`Stuart2021`
+and ArchR {cite:p}`Granja2021` (`lsi`, with `project_lsi` to place new cells on
+a fitted embedding) — or model topics over the peak-accessibility matrix with
+GPU-accelerated mini-batch Online Variational Bayes {cite:p}`Hoffman2013`
+(`lda`, `MiniBatchLDA`).
 
 `lsi` reproduces `ArchR:::.computeLSI` component for component, including its
 three `LSIMethod` variants, its depth-outlier hold-out, and the

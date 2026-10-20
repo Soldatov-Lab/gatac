@@ -1,7 +1,7 @@
 # `gatac genescore`
 
 Build a cell × gene **score** matrix from an ATAC-seq fragment Parquet file.
-This is a faithful GPU port of ArchR's `addGeneScoreMatrix`: tile insertion
+This is a faithful GPU port of ArchR's `addGeneScoreMatrix` {cite:p}`Granja2021`: tile insertion
 counts are weighted by their signed distance to each gene and an inverse
 gene-width factor, then summed and per-cell normalised.
 

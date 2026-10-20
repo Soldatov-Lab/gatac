@@ -633,7 +633,8 @@ def make_gene_matrix(
     """
     Process ATAC fragments parquet file and generate gene activity matrix.
 
-    Uses paired-insertion counting strategy matching SnapATAC2: each fragment 
+    Uses paired-insertion counting strategy matching SnapATAC2
+    :cite:p:`Zhang2024`: each fragment 
     contributes insertions at start and end positions. If both insertions fall 
     within the same gene's regulatory domain, count +1. If in different genes, 
     each gene gets +1.

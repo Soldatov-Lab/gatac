@@ -1530,10 +1530,10 @@ def gsea(
     """
     Run preranked GSEA to identify enriched TF motifs from a LogFC-ranked peak list.
 
-    Unlike Fisher/hypergeometric motif enrichment, GSEA does not require a hard
-    significance threshold to define "marker peaks". Instead it ranks *all* peaks
-    by log2 fold change and asks whether motif-containing peaks cluster at the top
-    (or bottom) of that ranking. This provides statistical power even in shallow
+    Unlike Fisher/hypergeometric motif enrichment, GSEA :cite:p:`Subramanian2005`
+    does not require a hard significance threshold to define "marker peaks".
+    Instead it ranks *all* peaks by log2 fold change and asks whether
+    motif-containing peaks cluster at the top (or bottom) of that ranking. This provides statistical power even in shallow
     ATAC-seq data where no individual peak may reach significance.
 
     Motif gene sets are built from the binary peak×motif matrix stored at
@@ -1576,7 +1576,8 @@ def gsea(
 
         * ``"gpu"`` – CuPy-based GPU implementation. Much faster for large
           numbers of motifs (10-50× speedup). Requires a CUDA-capable GPU.
-        * ``"gseapy"`` – Delegates to ``gseapy.prerank`` (Rust backend).
+        * ``"gseapy"`` – Delegates to ``gseapy.prerank`` :cite:p:`Fang2023`
+          (Rust backend).
           No GPU required.
     gs_batch_size : int, default 128
         Number of gene sets processed simultaneously on the GPU per kernel
@@ -1592,7 +1593,7 @@ def gsea(
         * ``NES``             – normalised enrichment score (positive = enriched
           at the top / high-logFC end)
         * ``pval``            – nominal p-value
-        * ``fdr``             – FDR q-value (Benjamini–Hochberg)
+        * ``fdr``             – FDR q-value (Benjamini–Hochberg :cite:p:`Benjamini1995`)
         * ``lead_edge_n``     – number of peaks in the leading edge
         * ``set_size``        – number of ranked peaks containing the motif
         * ``lead_edge_frac``  – ``lead_edge_n / set_size``; fraction of the

@@ -4,7 +4,7 @@
 
 Most of GATAC code was written with AI assistance, used responsibly under strict validation against the expected behavior of the original CPU-based tools being translated. The bulk of the core feature porting/translations and GPU optimization work was carried out with Claude Opus 4.6 and GPT-5.4, while Claude Sonnet 4.6 was used for secondary development tasks.
 
-All AI-assisted implementations were tightly constrained to match reference outputs from [SnapATAC2](https://github.com/scverse/SnapATAC2), [ArchR](https://www.archrproject.com/), [chromVAR](https://greenleaflab.github.io/chromVAR/index.html), [MACS3](https://github.com/macs3-project/MACS), [AMULET](https://github.com/UcarLab/AMULET), and [TOBIAS](https://github.com/loosolab/TOBIAS). Results were also thoroughly tested for reproducibility on the [Reproducibility](reproducibility) page and in the associated test suite.
+All AI-assisted implementations were tightly constrained to match reference outputs from [SnapATAC2](https://github.com/scverse/SnapATAC2) {cite:p}`Zhang2024`, [ArchR](https://www.archrproject.com/) {cite:p}`Granja2021`, [chromVAR](https://greenleaflab.github.io/chromVAR/index.html) {cite:p}`Schep2017`, [MACS3](https://github.com/macs3-project/MACS) {cite:p}`Zhang2008`, [AMULET](https://github.com/UcarLab/AMULET) {cite:p}`Thibodeau2021`, and [TOBIAS](https://github.com/loosolab/TOBIAS) {cite:p}`Bentsen2020`. Results were also thoroughly tested for reproducibility on the [Reproducibility](reproducibility) page and in the associated test suite.
 
 ## Algorithms
 
@@ -12,7 +12,7 @@ All AI-assisted implementations were tightly constrained to match reference outp
 
 GATAC's doublet/multiplet detection (`gatac.pp.detect_doublets`) is a **direct
 port** of the [**AMULET**](https://github.com/UcarLab/AMULET) algorithm of
-Thibodeau A. et al., *Genome Biology*, 2021.
+{cite:t}`Thibodeau2021`.
 
 The overlap-detection sweep-line, the per-cell Poisson scoring, the row-sum
 Poisson repeat-inference, and the BH-FDR correction are translated
@@ -34,16 +34,14 @@ source code is bundled with or linked into GATAC.
 GATAC's footprinting (`gatac.tobias.footprint`) and differential binding
 (`gatac.tobias.bindetect`) are a **port** of
 [**TOBIAS**](https://github.com/loosolab/TOBIAS) 0.17.5 (`ATACorrect`,
-`ScoreBigwig`, `BINDetect`) of Bentsen M. et al., *Nature Communications*,
-2020. The algorithms are translated line for line and executed on the GPU;
+`ScoreBigwig`, `BINDetect`) of {cite:t}`Bentsen2020`. The algorithms are translated line for line and executed on the GPU;
 TOBIAS is run as an external tool in the reproducibility tests. TOBIAS is
 distributed under the
 [MIT License](https://github.com/loosolab/TOBIAS/blob/master/LICENSE).
 
 The motif match thresholds port `threshold_from_p` of
-[MOODS](https://github.com/jhkorhonen/MOODS) (Korhonen J. H. et al.,
-*Bioinformatics*, 2017; GPL v3 or Biopython License, used here under the
-Biopython License), and site scanning follows MOODS's summation order.
+[MOODS](https://github.com/jhkorhonen/MOODS) {cite:p}`Korhonen2017` (GPL v3
+or Biopython License, used here under the Biopython License), and site scanning follows MOODS's summation order.
 
 ## Third-party code
 
@@ -60,7 +58,8 @@ file.
 ### scPrinter
 
 GATAC's `chromvar` implementation originated from the
-[scPrinter](https://github.com/buenrostrolab/scPrinter/) repository and
+[scPrinter](https://github.com/buenrostrolab/scPrinter/) repository
+{cite:p}`Hu2025` and
 underwent additional work for GPU memory optimization and closer agreement
 with the original chromVAR R results.
 
@@ -68,7 +67,7 @@ with the original chromVAR R results.
 
 Portions of GATAC's GPU-accelerated peak-calling code are derived from
 [**gmacs**](https://github.com/latchbio-workflows/gmacs) — a GPU-accelerated
-implementation of the [MACS3](https://github.com/macs3-project/MACS) algorithm developed by Harihara Subrahmaniam Muralidharan at
+implementation of the [MACS3](https://github.com/macs3-project/MACS) algorithm {cite:p}`Zhang2008` developed by Harihara Subrahmaniam Muralidharan at
 LatchBio.
 
 The relevant code has been extensively modified for integration into the GATAC pipeline. Key updates include adaptation to the GATAC Parquet/cuDF data model, enhanced memory management through streaming, and a refactored API designed to align with the scverse ecosystem.

@@ -575,7 +575,7 @@ def make_gene_score_matrix(
 ) -> "sc.AnnData":
     """GPU-accelerated ArchR-style gene activity *score* matrix.
 
-    Faithful port of ArchR ``addGeneScoreMatrix``. See module docstring for the
+    Faithful port of ArchR ``addGeneScoreMatrix`` :cite:p:`Granja2021`. See module docstring for the
     algorithm. Parameter defaults match ArchR's defaults.
 
     Parameters

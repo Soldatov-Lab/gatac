@@ -1143,6 +1143,8 @@ def project_lsi(model: LSIModel, X_new) -> np.ndarray:
     """
     Project new cells onto a fitted LSI, following ``ArchR:::.projectLSI``.
 
+    ArchR's projection :cite:p:`Granja2021`, step for step.
+
     The order is not interchangeable:
 
     1. subset to the retained features (``model.idx``),
@@ -1575,8 +1577,9 @@ def lsi(
     """
     GPU-accelerated LSI: TF-IDF followed by truncated SVD.
 
-    A port of ``ArchR:::.computeLSI``, and the same computation Signac performs
-    with ``RunTFIDF`` + ``RunSVD``. For the iterative feature-selection variant
+    A port of ``ArchR:::.computeLSI`` :cite:p:`Granja2021`, and the same
+    computation Signac :cite:p:`Stuart2021` performs with ``RunTFIDF`` +
+    ``RunSVD``. For the iterative feature-selection variant
     (``ArchR::addIterativeLSI``) see :func:`gatac.dr.iterative_lsi`.
 
     Parameters
@@ -1632,9 +1635,9 @@ def lsi(
         Return ``V @ diag(d)``, as ArchR's ``matSVD`` does, rather than the
         orthonormal ``V``.
     tol, ncv
-        Solver controls. ``tol=1e-5`` matches irlba, the solver ArchR and
-        Signac use, rather than CuPy's machine-precision default; ``ncv=None``
-        picks a Krylov basis of ``max(4 * n_comps + 1, n_comps + 60)``, which
+        Solver controls. ``tol=1e-5`` matches irlba :cite:p:`Baglama2005`, the
+        solver ArchR and Signac use, rather than CuPy's machine-precision
+        default; ``ncv=None`` picks a Krylov basis of ``max(4 * n_comps + 1, n_comps + 60)``, which
         measured 29–47 % faster than CuPy's default at 200k–500k cells with no
         loss of accuracy.
     store_model
@@ -1864,9 +1867,10 @@ def iterative_lsi(
     Iterative feature selection followed by LSI — ``ArchR::addIterativeLSI``.
 
     One LSI on the most accessible features is dominated by whichever
-    populations happen to be abundant. ArchR's answer is to iterate: cluster on
-    a first embedding, score every feature by how much its per-cluster
-    accessibility varies, keep the most variable, and redo the LSI on those.
+    populations happen to be abundant. ArchR's answer :cite:p:`Granja2021` is
+    to iterate: cluster on a first embedding, score every feature by how much
+    its per-cluster accessibility varies, keep the most variable, and redo the
+    LSI on those.
     Each round therefore selects features that separate the structure the
     previous round found.
 
@@ -1902,8 +1906,9 @@ def iterative_lsi(
     cluster_params
         Overrides for the built-in clusterer, e.g.
         ``{"resolution": 2.0, "max_clusters": 6, "k": 20, "flavor": "leiden"}``.
-        Defaults are ArchR's iterative-LSI ``clusterParams``. Every keyword of
-        :func:`~gatac.dr._clustering.snn_cluster` is accepted, ``quantize`` and
+        Defaults are ArchR's iterative-LSI ``clusterParams``; ``flavor`` picks
+        Leiden :cite:p:`Traag2019` or Louvain :cite:p:`Blondel2008`. Every
+        keyword of :func:`~gatac.dr._clustering.snn_cluster` is accepted, ``quantize`` and
         ``max_resolution_retries`` included; the values actually used are
         recorded in ``uns["iterative_lsi"]["params"]`` under a ``cluster_``
         prefix.

@@ -180,7 +180,8 @@ def select_features(
     """
     GPU-accelerated feature selection for ATAC-seq tile matrices.
 
-    For binary matrices: selects top N most accessible features (ArchR approach).
+    For binary matrices: selects top N most accessible features, as ArchR does
+    :cite:p:`Granja2021`.
     For count matrices: selects top N accessible features, excluding quantile tails.
 
     Parameters

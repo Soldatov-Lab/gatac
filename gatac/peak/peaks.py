@@ -648,8 +648,9 @@ def call(
     GPU-accelerated peak calling per cluster using gmacs algorithm.
     
     Calls peaks for each group of cells defined by `groupby`, using the
-    fragment data from parquet files. Similar to SnapATAC2's macs3 function
-    but using GPU-accelerated gmacs.
+    fragment data from parquet files. Similar to SnapATAC2's
+    :cite:p:`Zhang2024` macs3 function but using GPU-accelerated gmacs, a port
+    of MACS3 :cite:p:`Zhang2008`.
     
     Parameters
     ----------
@@ -1045,7 +1046,7 @@ def merge(
 ) -> Optional[pd.DataFrame]:
     """Merge peaks from different groups into fixed-width, non-overlapping peaks.
 
-    This mirrors the behavior of SnapATAC2's ``merge``.
+    This mirrors the behavior of SnapATAC2's ``merge`` :cite:p:`Zhang2024`.
 
     The algorithm expands each peak summit by ``half_width`` on both sides,
     sorts peaks by genomic position, groups overlapping or adjacent intervals,

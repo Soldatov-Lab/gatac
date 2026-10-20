@@ -793,10 +793,11 @@ def bindetect_sites(
     """
     Motif binding sites of a peak set, for :func:`bindetect` (GPU).
 
-    Scans the peaks for every motif with MOODS's thresholds and summation order,
-    resolves overlapping sites of the same motif and counts the overlap between
-    motifs for the motif clustering, exactly as TOBIAS BINDetect does. None of
-    this depends on the footprints, so one site set serves every call of
+    Scans the peaks for every motif with MOODS's :cite:p:`Korhonen2017`
+    thresholds and summation order, resolves overlapping sites of the same
+    motif and counts the overlap between motifs for the motif clustering,
+    exactly as TOBIAS BINDetect :cite:p:`Bentsen2020` does. None of this
+    depends on the footprints, so one site set serves every call of
     :func:`bindetect` on tracks footprinted over the same peaks.
 
     Parameters
@@ -1155,7 +1156,7 @@ def bindetect(
     Scans the peaks of ``tracks`` for every motif, scores each binding site by
     the footprint score at its centre in each group, calls bound sites and
     tests per motif whether footprints change between groups, reproducing
-    TOBIAS 0.17.5 ``BINDetect`` with default parameters.
+    TOBIAS 0.17.5 ``BINDetect`` :cite:p:`Bentsen2020` with default parameters.
 
     The binding sites depend only on the peaks and motifs: build them once with
     :func:`bindetect_sites` and pass ``sites=`` to reuse them across calls.

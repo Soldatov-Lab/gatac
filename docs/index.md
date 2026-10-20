@@ -24,6 +24,7 @@ cli/index
 :maxdepth: 1
 
 reproducibility
+references
 license
 credits
 ```

@@ -2,7 +2,7 @@
 
 Detect doublet / multiplet cells in a single-cell ATAC-seq sample using the
 [AMULET](https://github.com/UcarLab/AMULET) Poisson method of
-Thibodeau et al. (2021).  Cells with significantly more overlapping
+{cite:t}`Thibodeau2021`.  Cells with significantly more overlapping
 insertions than expected are flagged as doublets.
 
 ---

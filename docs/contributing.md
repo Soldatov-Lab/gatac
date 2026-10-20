@@ -93,6 +93,17 @@ make html
 # Open _build/html/index.html
 ```
 
+### Citing publications
+
+When a docstring or page names a published tool or method, cite it so the
+reader can click through to the [References](references.md) page. Add the
+entry to `docs/references.bib` (key: first author + year, e.g. `Granja2021`),
+then cite it with ``:cite:p:`Granja2021` `` in a docstring or
+``{cite:p}`Granja2021` `` in a Markdown page. Use `cite:t` instead of `cite:p`
+when the authors are part of the sentence (it renders as "Thibodeau et al.
+[TEM+21]"). Keep citations out of a docstring's first line, which becomes the
+summary in the API tables.
+
 Analysis notebooks live in the separate
 [`gatac-notebooks`](https://github.com/Soldatov-Lab/gatac-notebooks)
 repository — see [Tutorials](tutorials/index.md) for details.

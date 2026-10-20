@@ -401,7 +401,7 @@ def detect_doublets(
     """
     AMULET doublet/multiplet detection from a GATAC parquet fragment file.
 
-    Implements the original AMULET Poisson method of Thibodeau et al. (2021):
+    Implements the original AMULET Poisson method :cite:p:`Thibodeau2021`:
     cells with an abnormally high number of overlapping fragment insertions
     are flagged as doublets/multiplets. Overlap detection runs on the GPU.
 

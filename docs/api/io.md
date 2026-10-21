@@ -51,7 +51,11 @@ the names once, inside the same file:
   `count`). Barcode ids are ordered by decreasing fragment count, so the
   table is filled in the first rows of the file and null everywhere after;
   the null runs take almost no space. Reading the table only touches the
-  first row groups.
+  first row groups. The table is stored as columns rather than in the
+  footer because the footer is not compressed, and every Parquet reader
+  parses all of it each time it opens the file: with 500,000 barcodes the
+  names alone would add over 10 MB to every open. As columns, the names and
+  counts are compressed and only read when asked for.
 - **Chromosome names.** They are in the file footer (`gatac.chroms`, a JSON
   list indexed by `chrom_id`), with the format version and the number of
   barcodes.
@@ -108,12 +112,15 @@ categoricals from the ids and needs about a quarter of the GPU memory.
 
 Each column in the [schematic](#file-layout) gives its encoding and type:
 *dict* is Parquet dictionary encoding, *delta* is `DELTA_BINARY_PACKED`, and
-*delta strings* is `DELTA_BYTE_ARRAY`.
+*delta lengths* is `DELTA_LENGTH_BYTE_ARRAY` (delta-encoded string lengths,
+then the strings back to back).
 
 Fragments are sorted by position in a `fragments.tsv.gz`, so consecutive
 `start` and `end` values differ by little and delta-encode to a few bits.
-Pages are compressed with ZSTD and written as data page v1, which cuDF's
-chunked reader requires. Row groups hold 1,000,000 fragments
+The barcode table is sorted by decreasing fragment count, so its counts
+delta-encode the same way. Pages are compressed with ZSTD and written as
+data page v1, which cuDF's chunked reader requires; the footer is not
+compressed. Row groups hold 1,000,000 fragments
 (`row_group_size`), the unit GATAC streams in.
 
 ### Reading a file outside GATAC

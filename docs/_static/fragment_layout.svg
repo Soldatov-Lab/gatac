@@ -42,11 +42,11 @@
 
   <!-- the parquet file -->
   <rect x="20" y="186" width="720" height="360" rx="8" class="cf-file"/>
-  <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">ZSTD · coordinates stored as the change from the row above</tspan></text>
+  <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">signed values (+34, −79) are stored as the change from the row above</tspan></text>
 
   <!-- row group 0 -->
   <rect x="36" y="218" width="688" height="196" rx="6" class="cf-box"/>
-  <text x="48" y="236" class="cf-muted">row group 0 · 1,000,000 rows</text>
+  <text x="48" y="236" class="cf-muted">row group 0 · 1,000,000 rows · pages compressed with ZSTD</text>
   <text x="48" y="256" class="cf-text cf-bold">fragments: one row per fragment</text>
   <text x="440" y="256" class="cf-text cf-bold">barcode table: row i = barcode id i</text>
 
@@ -63,23 +63,23 @@
 
   <!-- headers: name · encoding · type -->
   <text y="281" class="cf-text cf-bold" style="font-size:11px"><tspan x="56">chrom_id</tspan><tspan x="130">start</tspan><tspan x="204">end</tspan><tspan x="278">barcode_id</tspan><tspan x="354">count</tspan><tspan x="448">bc_name</tspan><tspan x="558">bc_n_unique</tspan><tspan x="644">bc_n_total</tspan></text>
-  <text y="296" class="cf-muted" style="font-size:10px"><tspan x="56">dict · uint16</tspan><tspan x="130">delta · uint32</tspan><tspan x="204">delta · uint32</tspan><tspan x="278">dict · uint32</tspan><tspan x="354">dict · uint16</tspan><tspan x="448">delta strings · string</tspan><tspan x="558">delta · uint32</tspan><tspan x="644">delta · uint32</tspan></text>
+  <text y="296" class="cf-muted" style="font-size:10px"><tspan x="56">dict · uint16</tspan><tspan x="130">delta · uint32</tspan><tspan x="204">delta · uint32</tspan><tspan x="278">dict · uint32</tspan><tspan x="354">dict · uint16</tspan><tspan x="448">delta lengths · string</tspan><tspan x="558">delta · uint32</tspan><tspan x="644">delta · uint32</tspan></text>
   <path d="M48,304 H420 M440,304 H712" class="cf-line" style="stroke-width:0.8"/>
 
   <!-- values -->
   <text y="324" class="cf-mono"><tspan x="56">0</tspan><tspan x="130">10001</tspan><tspan x="204">10200</tspan><tspan x="278">1</tspan><tspan x="354">2</tspan><tspan x="448">TTGCATGA-1</tspan><tspan x="558">41,203</tspan><tspan x="644">97,410</tspan></text>
-  <text y="344" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+34</tspan><tspan x="204" class="cf-delta">−20</tspan><tspan x="278">0</tspan><tspan x="354">1</tspan><tspan x="448">AAACGAAC-1</tspan><tspan x="558">38,950</tspan><tspan x="644">90,122</tspan></text>
-  <text y="364" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+67</tspan><tspan x="204" class="cf-delta">+208</tspan><tspan x="278">0</tspan><tspan x="354">1</tspan><tspan x="448">GCTTAGCA-1</tspan><tspan x="558">2,114</tspan><tspan x="644">4,871</tspan></text>
+  <text y="344" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+34</tspan><tspan x="204" class="cf-delta">−20</tspan><tspan x="278">0</tspan><tspan x="354">1</tspan><tspan x="448">AAACGAAC-1</tspan><tspan x="558" class="cf-delta">−2,253</tspan><tspan x="644" class="cf-delta">−7,288</tspan></text>
+  <text y="364" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+67</tspan><tspan x="204" class="cf-delta">+208</tspan><tspan x="278">0</tspan><tspan x="354">1</tspan><tspan x="448">GCTTAGCA-1</tspan><tspan x="558" class="cf-delta">−79</tspan><tspan x="644" class="cf-delta">+913</tspan></text>
   <text y="384" class="cf-mono"><tspan x="56">0</tspan><tspan x="130" class="cf-delta">+138</tspan><tspan x="204" class="cf-delta">+123</tspan><tspan x="278">2</tspan><tspan x="354">3</tspan></text>
   <text y="384" class="cf-null"><tspan x="448">null</tspan><tspan x="558">null</tspan><tspan x="644">null</tspan></text>
   <text y="400" class="cf-muted"><tspan x="80">⋮</tspan><tspan x="154">⋮</tspan><tspan x="228">⋮</tspan><tspan x="303">⋮</tspan><tspan x="380">⋮</tspan><tspan x="490">⋮</tspan><tspan x="588">⋮</tspan><tspan x="671">⋮</tspan></text>
 
   <!-- later row groups -->
   <rect x="36" y="424" width="688" height="40" rx="6" class="cf-box"/>
-  <text x="48" y="448" class="cf-muted">row groups 1 … N · 1,000,000 fragments each · bc_* columns all null (almost no space)</text>
+  <text x="48" y="448" class="cf-muted">row groups 1 … N · 1,000,000 fragments each, ZSTD · bc_* columns all null (almost no space)</text>
 
   <!-- footer -->
   <rect x="36" y="474" width="688" height="60" rx="6" class="cf-foot"/>
-  <text x="48" y="495" class="cf-text cf-bold">footer (key-value metadata)</text>
+  <text x="48" y="495" class="cf-text cf-bold">footer (key-value metadata, not compressed)</text>
   <text x="48" y="519" class="cf-mono" style="font-size:10.5px">gatac.format_version = 1 · gatac.chroms = ["chr1", "chr2", …] · gatac.n_barcodes = 3</text>
 </svg>

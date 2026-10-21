@@ -63,16 +63,26 @@ the names once, inside the same file:
 The barcode table also gives the fragment counts per barcode without
 reading the fragments (`FragmentFile.barcode_counts()`).
 
-The file is about 2.6× smaller than the `fragments.tsv.gz` it comes from:
+The file is about 2.7× smaller than the `fragments.tsv.gz` it comes from.
+On a 50M-fragment library, each column of the text file gzipped on its own
+compares with the same data in the Parquet file:
 
-| File, 50M-fragment library | Size |
-|---|---|
-| `fragments.tsv.gz` (gzip) | 557 MB |
-| GATAC Parquet | 211 MB |
+| Column | `fragments.tsv.gz` (gzip) | GATAC Parquet |
+|---|---|---|
+| chromosome | 0.4 MB | < 0.01 MB |
+| start | 122.5 MB | 44.3 MB |
+| end | 134.6 MB | 66.9 MB |
+| barcode | 200.7 MB | 88.3 MB |
+| count | 14.2 MB | 10.1 MB |
+| **Whole file** | **557 MB** | **210 MB** |
 
-The names are stored once, ids and counts are dictionary-encoded, and the
-sorted coordinates delta-encode to a few bits before ZSTD compression (see
-[Encoding](#encoding)).
+The gzip columns add up to 472 MB: gzip loses the other 85 MB to the rows
+interleaving the columns, which a column store does not pay. The barcode
+names, once per barcode, take 1.2 MB of the 88.3 MB; the rest is the
+`barcode_id` of every fragment. The ids and counts are dictionary-encoded,
+and the sorted coordinates delta-encode to a few bits before ZSTD compression
+(see [Encoding](#encoding)). `end` stays larger than `start` because the rows
+are sorted by `start`, so consecutive `end` values vary more.
 
 ```{note}
 Ids are per file: chromosomes are numbered in the order they first appear in

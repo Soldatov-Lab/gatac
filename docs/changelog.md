@@ -123,6 +123,12 @@
 
 ### Fixed
 
+- `peak.merge` gives SnapATAC2's `merge_peaks` peaks: among equally
+  significant overlapping peaks it keeps the last in position order, as
+  SnapATAC2 does, and clips to the chromosome after merging, with the summit
+  offset of peaks clipped at position 0. 147 of 119,141 merged peaks differed
+  on PBMC 5k.
+
 - `make_gene_matrix` gives the same gene coordinates on every run: `var`
   `start`/`end` are the span of the gene's transcript domains on its
   chromosome, and `chrom`, `strand` and the names come from its first

@@ -372,14 +372,15 @@ def _iterative_merge_numba(
         available = np.ones(n_group, dtype=np.bool_)
         
         while True:
-            # Find the best available peak (highest p_value)
+            # Find the best available peak (highest p_value); among equal
+            # p-values the last in position order, as Rust's max_by in SnapATAC2
             best_local_idx = -1
             best_pval = -np.inf
             
             for i in range(n_group):
                 if available[i]:
                     idx = start_i + i
-                    if p_values[idx] > best_pval:
+                    if p_values[idx] >= best_pval:
                         best_pval = p_values[idx]
                         best_local_idx = i
             
@@ -584,9 +585,10 @@ def merge(
             summit = (start_vals + end_vals) // 2
 
         # Expand to fixed width - match SnapATAC2's half-open interval convention
-        df_copy["start"] = summit - half_width
+        start = np.maximum(summit - half_width, 0)
+        df_copy["start"] = start
         df_copy["end"] = summit + half_width + 1  # +1 for half-open interval
-        df_copy["peak"] = half_width
+        df_copy["peak"] = summit - start
 
         expanded_peaks.append(df_copy)
 
@@ -611,15 +613,10 @@ def merge(
     chrom_codes_cp = chrom_cat.cat.codes.to_cupy().astype(cp.int32)
     unique_chroms = chrom_cat.cat.categories.to_pandas().tolist()
     
-    # Clip peaks to chromosome boundaries on GPU (vectorized)
-    for i, chrom in enumerate(unique_chroms):
-        chrom_size = chrom_sizes.get(chrom)
-        if chrom_size is None:
-            continue
-        mask = chrom_codes_cp == i
-        starts_cp[mask] = cp.clip(starts_cp[mask], 0, chrom_size - 1)
-        ends_cp[mask] = cp.clip(ends_cp[mask], 1, chrom_size)
-    
+    # Peaks are merged unclipped (start saturating at 0) and clipped to the
+    # chromosome afterwards, as SnapATAC2 does
+    starts_cp = cp.maximum(starts_cp, 0)
+
     # Global sort: by chromosome code, then by start, then by end
     # Use composite key for stable sorting on GPU
     max_pos = int(cp.max(ends_cp)) + 1
@@ -703,7 +700,20 @@ def merge(
         pinned_mempool.free_all_blocks()
         
         logger.debug(f"After deduplication: {len(result):,} peaks")
-    
+
+    # Clip to the chromosomes, as SnapATAC2's clip_peak
+    if len(result) > 0:
+        size = result["chrom"].map(chrom_sizes).to_numpy(dtype=np.float64)
+        known = ~np.isnan(size)
+        start = result["start"].to_numpy(dtype=np.int64)
+        end = result["end"].to_numpy(dtype=np.int64)
+        size = np.where(known, size, np.iinfo(np.int64).max).astype(np.int64)
+        new_start = np.minimum(start, size)
+        new_end = np.minimum(end, size)
+        result["peak"] = np.minimum(new_start + result["peak"].to_numpy(dtype=np.int64), new_end) - new_start
+        result["start"] = new_start
+        result["end"] = new_end
+
     # Store in AnnData if requested
     if adata is not None and inplace:
         adata.uns[key_added] = result

@@ -33,8 +33,78 @@ pinned_mempool = cp.get_default_pinned_memory_pool()
 
 
 # =============================================================================
-# Reading the fragments of every group in one pass
+# Reading the fragments of the groups
 # =============================================================================
+
+# Host memory a group's fragments take while read: uint32 starts and ends
+_HOST_BYTES_PER_FRAGMENT = 8
+
+
+def _available_host_memory() -> int:
+    """
+    Bytes of host memory still available: the system's available memory,
+    capped by the limit of each cgroup the process is in (a SLURM job, a
+    container) less the memory its processes use.
+    """
+    with open("/proc/meminfo") as f:
+        info = dict(line.split(":", 1) for line in f)
+    available = int(info["MemAvailable"].split()[0]) * 1024
+    try:
+        with open("/proc/self/cgroup") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return available
+    for line in lines:
+        _, controllers, path = line.split(":", 2)
+        if controllers == "":
+            root, limit_file, used_key = Path("/sys/fs/cgroup"), "memory.max", "anon"
+        elif "memory" in controllers.split(","):
+            root, limit_file, used_key = Path("/sys/fs/cgroup/memory"), "memory.limit_in_bytes", "total_rss"
+        else:
+            continue
+        # The limit may be set on any ancestor (SLURM sets it on the job)
+        d = root / path.lstrip("/")
+        while True:
+            try:
+                limit = int((d / limit_file).read_text())
+                stat = dict(l.split() for l in (d / "memory.stat").read_text().splitlines())
+                available = min(available, limit - int(stat[used_key]))
+            except (OSError, ValueError, KeyError):
+                pass
+            if d == root:
+                break
+            d = d.parent
+    return max(available, 0)
+
+
+def _group_fragment_counts(sources: list, n_groups: int) -> np.ndarray:
+    """Fragments of each group, from the barcode tables of the files (all chromosomes)."""
+    n = np.zeros(n_groups, np.int64)
+    for fragments, cells, cell_group in sources:
+        counts = fragments.barcode_counts()
+        per_cell = pd.Series(counts["n_unique"].to_numpy(), index=counts["barcode"].to_numpy())
+        per_cell = per_cell.reindex(cells).fillna(0).to_numpy()
+        n += np.bincount(cell_group, weights=per_cell, minlength=n_groups).astype(np.int64)
+    return n
+
+
+def _group_passes(n_fragments: np.ndarray, cap: int) -> list:
+    """
+    Groups read in each pass over the files, at most ``cap`` fragments per
+    pass (first fit, largest groups first; a group above ``cap`` gets its
+    own pass).
+    """
+    passes, room = [], []
+    for i in np.argsort(-n_fragments, kind="stable"):
+        n = int(n_fragments[i])
+        k = next((k for k, r in enumerate(room) if n <= r), None)
+        if k is None:
+            passes.append([])
+            room.append(cap)
+            k = len(passes) - 1
+        passes[k].append(int(i))
+        room[k] -= n
+    return passes
 
 
 def _read_groups(
@@ -51,6 +121,7 @@ def _read_groups(
 
     Each batch is sorted by (group, chromosome) on the GPU and copied to the
     host once, so the file is read a single time whatever the number of groups.
+    Each group keeps its own copy, freed once its peaks are called.
     """
     names = list(chroms) if chroms is not None else list(fragments.chroms)
     lut = cp.asarray(cell_group, dtype=cp.int64)
@@ -67,14 +138,17 @@ def _read_groups(
         bounds = np.flatnonzero(key[1:] != key[:-1]) + 1
         for lo, hi in zip(np.concatenate(([0], bounds)), np.concatenate((bounds, [key.size]))):
             group, chrom = divmod(int(key[lo]), n_chroms)
-            out[group][names[chrom]].append((starts[lo:hi], ends[lo:hi]))
+            out[group][names[chrom]].append((starts[lo:hi].copy(), ends[lo:hi].copy()))
         mempool.free_all_blocks()
 
 
 def _concat_group(chunks: dict) -> dict:
-    """``{chrom: [(starts, ends), ...]}`` to ``{chrom: (starts, ends)}``."""
-    return {c: (np.concatenate([s for s, _ in parts]), np.concatenate([e for _, e in parts]))
-            for c, parts in chunks.items()}
+    """``{chrom: [(starts, ends), ...]}`` to ``{chrom: (starts, ends)}``, emptying ``chunks`` as it goes."""
+    out = {}
+    for c in list(chunks):
+        parts = chunks.pop(c)
+        out[c] = (np.concatenate([s for s, _ in parts]), np.concatenate([e for _, e in parts]))
+    return out
 
 
 # =============================================================================
@@ -102,6 +176,7 @@ def call(
     verbose: bool = True,
     batch_size: int = 10,
     filter_chromosomes: bool = True,
+    host_memory_gb: Optional[float] = None,
 ) -> Optional[dict]:
     """
     Call peaks per group of cells with MACS3, on the GPU.
@@ -116,7 +191,8 @@ def call(
     at least ``peak_amp`` bp, and summits are called inside each peak. The
     computation is MACS3's, on run-length pileups on the GPU, so peaks,
     summits and scores are the ones MACS3 reports, at a fraction of the
-    time. Fragments are read once for all groups.
+    time. Fragments are read once for all the groups that fit in
+    `host_memory_gb`.
 
     Parameters
     ----------
@@ -171,7 +247,12 @@ def call(
         If True, only keep fragments from chromosomes recognized by the 
         provided genome (keys if genome is a dict, or standard chromosomes 
         for the named genome) (default: True).
-    
+    host_memory_gb : float, optional
+        Host memory for the fragments held at once, in GB (8 bytes per
+        fragment). Groups that do not fit together are read in further
+        passes over the files; results are the same. Default: half the
+        available memory, within the limit of the job or container if any.
+
     Returns
     -------
     dict[str, pd.DataFrame] or None
@@ -246,8 +327,7 @@ def call(
         # Add .parquet extension
         return f"{name}.parquet"
 
-    # Fragments of every group, read in one pass over each file
-    chunks = [defaultdict(list) for _ in groups]
+    # (file, cells, their groups) to read
     if parquet_path.is_dir():
         # Directory mode - use source_file obs
         if 'source_file' not in adata.obs.columns:
@@ -258,45 +338,61 @@ def call(
         source = adata.obs['source_file'].to_numpy()
         source_files = pd.unique(source[has_group])
         logger.info(f"Using {len(source_files)} source files from source_file obs")
-        if verbose:
-            from tqdm.auto import tqdm
-            source_files = tqdm(source_files, desc="Reading files")
+        sources = []
         for src_file in source_files:
             src_path = parquet_path / _h5ad_to_parquet_name(src_file)
             if not src_path.exists():
                 logger.warning(f"Parquet file not found: {src_path}")
                 continue
             sel = has_group & (source == src_file)
-            _read_groups(FragmentFile(src_path), adata.obs_names.to_numpy()[sel], cell_group[sel],
-                         chunks, chroms, batch_size)
+            sources.append((FragmentFile(src_path), adata.obs_names.to_numpy()[sel], cell_group[sel]))
     else:
-        _read_groups(FragmentFile(parquet_path), adata.obs_names.to_numpy()[has_group],
-                     cell_group[has_group], chunks, chroms, batch_size)
-    gc.collect()
+        sources = [(FragmentFile(parquet_path), adata.obs_names.to_numpy()[has_group], cell_group[has_group])]
+
+    # Groups are read together, in as few passes over the files as the host
+    # memory allows, and called smallest first so that each group's call
+    # runs with the fragments of fewer groups still held
+    n_frag = _group_fragment_counts(sources, len(groups))
+    if host_memory_gb is None:
+        budget = 0.5 * _available_host_memory()
+    else:
+        budget = host_memory_gb * 1e9
+    passes = _group_passes(n_frag, int(budget // _HOST_BYTES_PER_FRAGMENT))
+    if len(passes) > 1:
+        logger.info(f"Reading the groups in {len(passes)} passes to fit {budget / 1e9:.0f} GB of host memory")
 
     if verbose:
         from tqdm.auto import tqdm
-        groups_iter = tqdm(list(enumerate(groups)), desc="Groups")
-    else:
-        groups_iter = enumerate(groups)
-
     peaks_dict = {}
-    for i, group in groups_iter:
-        group_str = str(group)
-        fragments = _concat_group(chunks[i])
-        chunks[i] = None
-        num_fragments = sum(len(s) for s, _ in fragments.values())
-        if num_fragments == 0:
-            logger.warning(f"  No fragments found for group {group_str}")
-            peaks_dict[group_str] = _macs._empty()
-            continue
-        logger.info(f"Group {group_str}: {num_fragments:,} fragments, calling peaks...")
-        peaks = _macs.callpeak(fragments, params)
-        del fragments
-        peaks_dict[group_str] = peaks
-        logger.info(f"  Found {len(peaks):,} summits")
-        mempool.free_all_blocks()
-        pinned_mempool.free_all_blocks()
+    for k, members in enumerate(passes):
+        chunks = {i: defaultdict(list) for i in members}
+        lut = np.full(len(groups), -1, np.int64)
+        lut[members] = np.arange(len(members))
+        step = "" if len(passes) == 1 else f" ({k + 1}/{len(passes)})"
+        files = tqdm(sources, desc=f"Reading files{step}") if verbose else sources
+        for ff, cells, cg in files:
+            sel = lut[cg] >= 0
+            if sel.any():
+                _read_groups(ff, cells[sel], lut[cg[sel]], [chunks[i] for i in members], chroms, batch_size)
+        gc.collect()
+
+        order = sorted(members, key=lambda i: n_frag[i])
+        for i in tqdm(order, desc=f"Groups{step}") if verbose else order:
+            group_str = str(groups[i])
+            fragments = _concat_group(chunks.pop(i))
+            num_fragments = sum(len(s) for s, _ in fragments.values())
+            if num_fragments == 0:
+                logger.warning(f"  No fragments found for group {group_str}")
+                peaks_dict[group_str] = _macs._empty()
+                continue
+            logger.info(f"Group {group_str}: {num_fragments:,} fragments, calling peaks...")
+            peaks = _macs.callpeak(fragments, params)
+            del fragments
+            peaks_dict[group_str] = peaks
+            logger.info(f"  Found {len(peaks):,} summits")
+            mempool.free_all_blocks()
+            pinned_mempool.free_all_blocks()
+    peaks_dict = {str(g): peaks_dict[str(g)] for g in groups}
 
     if inplace:
         adata.uns[key_added] = peaks_dict

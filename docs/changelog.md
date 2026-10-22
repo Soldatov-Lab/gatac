@@ -74,8 +74,10 @@
   identical, in 5.7 s against 140 s for SnapATAC2 (24x). Pileups are kept as
   runs between breakpoints instead of one value per base, so the time follows
   the number of fragments instead of the genome length (~16 s per group
-  before, whatever its depth), and the file is read once for all groups.
-  Results differ from the previous gmacs port: one row per summit
+  before, whatever its depth), and the files are read once for all the
+  groups that fit in host memory (new `host_memory_gb`, by default half of
+  what the job or machine has left). Host memory beyond the fragments read
+  stays at about 20 GB for a 1.4e9-fragment group. Results differ from the previous gmacs port: one row per summit
   (`call_summits=True`, as SnapATAC2), MACS3's peak boundaries and scores.
   New `shift`, `call_summits` and `macs3_version` (`"3.1"` for the summit
   filtering of MACS3 3.1) parameters; the other parameters keep their names

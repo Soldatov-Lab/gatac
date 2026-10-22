@@ -109,6 +109,28 @@ def test_call_is_independent_of_chromosome_batches(tiles, world, chrom_sizes, mo
         pd.testing.assert_frame_equal(one[g], many[g])
 
 
+def test_call_is_independent_of_read_passes(tiles, world, split_parquets, chrom_sizes):
+    """Reading each group in its own pass over the files (no host memory to share) gives the same peaks, in group order."""
+    d, source = split_parquets
+    tiles.obs["source_file"] = source.loc[tiles.obs_names].to_numpy()
+    one = ga.peak.call(tiles, "group", d, genome=chrom_sizes, inplace=False, verbose=False)
+    many = ga.peak.call(tiles, "group", d, genome=chrom_sizes, inplace=False, verbose=False, host_memory_gb=0)
+    assert list(many) == list(one)
+    for g in one:
+        pd.testing.assert_frame_equal(one[g], many[g])
+
+
+def test_group_passes_fit_the_cap():
+    """Groups are packed into passes of at most ``cap`` fragments; a group above it gets its own pass."""
+    from gatac.peak.peaks import _group_passes
+    n = np.array([5, 1, 7, 3, 12, 2])
+    passes = _group_passes(n, 8)
+    assert sorted(i for p in passes for i in p) == list(range(n.size))
+    assert [12] in [list(n[p]) for p in passes]
+    assert all(n[p].sum() <= 8 for p in passes if len(p) > 1)
+    assert len(passes) == 4
+
+
 def test_call_without_summits_gives_one_row_per_peak(tiles, world, chrom_sizes):
     """``call_summits=False``: the same peaks, each once, with its summit inside it."""
     sub = ga.peak.call(tiles, "group", world["parquet"], genome=chrom_sizes, inplace=False, verbose=False)

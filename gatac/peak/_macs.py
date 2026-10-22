@@ -711,6 +711,15 @@ def callpeak(fragments: dict, p: Params, budget_bytes: int | None = None) -> pd.
         pool.free_all_blocks()
 
 
+def _runs(fragments, names, p: Params, lambda_bg, ctrl_scale):
+    """End key, start key and (pileup, lambda) key of each run of a batch of chromosomes."""
+    pos, cid, minus = _tags(fragments, names)
+    end, start, treat, ctrl = _segments(pos, cid, minus, len(names), p, lambda_bg, ctrl_scale)
+    del pos, cid, minus
+    key = (treat.astype(cp.int64) << 32) | ctrl.view(cp.uint32).astype(cp.int64)
+    return end, start, key
+
+
 def _callpeak(fragments: dict, p: Params, budget_bytes: int | None) -> pd.DataFrame:
     names = sorted(c for c, (s, _) in fragments.items() if len(s))
     sizes = {c: len(fragments[c][0]) for c in names}
@@ -723,24 +732,22 @@ def _callpeak(fragments: dict, p: Params, budget_bytes: int | None) -> pd.DataFr
         free = cp.cuda.Device().mem_info[0] + cp.get_default_memory_pool().free_bytes()
         budget_bytes = int(0.6 * free)
     batches = _batches(names, sizes, budget_bytes)
-    keep_on_gpu = len(batches) == 1
 
-    # Pass 1: runs of every chromosome, and the genome-wide length of each
-    # distinct (pileup, lambda) pair
-    runs, tables = [], []
+    # Pass 1: the genome-wide length of each distinct (pileup, lambda) pair.
+    # A single batch keeps its runs on the GPU for pass 2; with several, each
+    # batch's runs are built again in pass 2 rather than held on the host
+    # (about 100 bytes per fragment).
+    kept, tables = None, []
     for names_b in batches:
-        pos, cid, minus = _tags(fragments, names_b)
-        end, start, treat, ctrl = _segments(pos, cid, minus, len(names_b), p, lambda_bg, ctrl_scale)
-        del pos, cid, minus
-        key = (treat.astype(cp.int64) << 32) | ctrl.view(cp.uint32).astype(cp.int64)
-        del treat, ctrl
+        end, start, key = _runs(fragments, names_b, p, lambda_bg, ctrl_scale)
         ukey, inv = cp.unique(key, return_inverse=True)
         del key
         lengths = cp.bincount(inv.ravel(), weights=(end - start).astype(cp.float64), minlength=ukey.size)
-        inv = inv.ravel().astype(cp.int32)
+        del start
         tables.append((ukey.get(), lengths.get().astype(np.int64)))
-        runs.append((end, inv) if keep_on_gpu else (end.get(), inv.get()))
-        del start, ukey, lengths
+        if len(batches) == 1:
+            kept = (end, inv.ravel().astype(cp.int32))
+        del end, inv, ukey, lengths
     keys = np.unique(np.concatenate([k for k, _ in tables]))
     lengths = np.zeros(keys.size, np.int64)
     for k, l in tables:
@@ -754,29 +761,45 @@ def _callpeak(fragments: dict, p: Params, budget_bytes: int | None) -> pd.DataFr
 
     # Pass 2: runs above the cutoff, joined into peaks, and their summits
     out = []
-    for names_b, (end, inv), (ukey, _) in zip(batches, runs, tables):
-        end, inv = cp.asarray(end), cp.asarray(inv)
-        to_global = cp.asarray(np.searchsorted(keys, ukey))
-        q = key_q_gpu[to_global][inv]
-        above = cp.flatnonzero(q > cutoff)
-        del q
+    for names_b, (ukey, _) in zip(batches, tables):
+        if kept is not None:
+            end, inv = kept
+            kept = None
+            gkey = cp.asarray(np.searchsorted(keys, ukey).astype(np.int32))[inv]
+            del inv
+        else:
+            end, _, key = _runs(fragments, names_b, p, lambda_bg, ctrl_scale)
+            gkey = cp.searchsorted(cp.asarray(keys), key).astype(cp.int32)
+            del key
+        above = cp.flatnonzero(key_q_gpu[gkey] > cutoff)
         if above.size == 0:
             continue
         a_end = end[above]
         a_start = _run_starts(end)[above]
-        a_key = to_global[inv[above]]
-        del end, inv, above
+        a_key = gkey[above]
+        del end, gkey, above
         brk = cp.flatnonzero((a_start[1:] - a_end[:-1]) > p.max_gap) + 1
         g0 = cp.concatenate((cp.zeros(1, brk.dtype), brk))
         g1 = cp.concatenate((brk, cp.full(1, a_end.size, brk.dtype)))
         keep = (a_end[g1 - 1] - a_start[g0]) >= p.min_length
-        g0, g1 = g0[keep].get(), g1[keep].get()
-        if g0.size == 0:
+        if not bool(keep.any()):
             continue
-        chrom = (a_start.get() >> _POS_BITS)
+        # Only the runs of the peaks kept go to the host
+        region = cp.zeros(a_end.size, cp.int32)
+        region[brk] = 1
+        in_kept = keep[cp.cumsum(region)]
+        del region
+        a_start, a_end, a_key = a_start[in_kept], a_end[in_kept], a_key[in_kept]
+        del in_kept
+        n = (g1 - g0)[keep]
+        g1 = cp.cumsum(n)
+        g0 = g1 - n
+        chrom = (a_start[g0] >> _POS_BITS).get()
+        g0, g1 = g0.get(), g1.get()
         a_start_h = (a_start & _POS_MASK).get()
         a_end_h = (a_end & _POS_MASK).get()
         a_key = a_key.get()
+        del a_start, a_end
         a_treat = key_treat[a_key].astype(np.float32)
         run, summit = _summits(a_start_h, a_end_h, a_treat, g0, g1, p)
         region = np.searchsorted(g0, run, side="right") - 1
@@ -785,7 +808,7 @@ def _callpeak(fragments: dict, p: Params, budget_bytes: int | None) -> pd.DataFr
         q = key_q[k]
         start = a_start_h[g0[region]]
         df = pd.DataFrame({
-            "chrom": np.asarray(names_b, dtype=object)[chrom[g0[region]]],
+            "chrom": np.asarray(names_b, dtype=object)[chrom[region]],
             "start": start,
             "end": a_end_h[g1[region] - 1],
             "name": ".",
@@ -797,6 +820,7 @@ def _callpeak(fragments: dict, p: Params, budget_bytes: int | None) -> pd.DataFr
             "peak": summit - start,
         })
         out.append(df[fc.astype(np.float64) >= p.fe_cutoff])
+        del a_start_h, a_end_h, a_key, a_treat
     if not out:
         return _empty()
     return pd.concat(out, ignore_index=True)

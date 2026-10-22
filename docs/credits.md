@@ -43,6 +43,19 @@ The motif match thresholds port `threshold_from_p` of
 [MOODS](https://github.com/jhkorhonen/MOODS) {cite:p}`Korhonen2017` (GPL v3
 or Biopython License, used here under the Biopython License), and site scanning follows MOODS's summation order.
 
+### MACS3
+
+GATAC's peak calling (`gatac.peak.call`) is a **port** of
+[**MACS3**](https://github.com/macs3-project/MACS) `callpeak` {cite:p}`Zhang2008`
+(narrow peaks without control, with sub-peak summits), as SnapATAC2
+{cite:p}`Zhang2024` runs it. The pileups, the p-score series and its rounding,
+the q-value table, the peak closing and the Savitzky-Golay summit caller are
+translated from MACS3 3.0 and 3.1 and run on run-length pileups on the GPU;
+MACS3 and SnapATAC2 are run as external tools in the reproducibility tests,
+where every summit and score matches. MACS3 is distributed under the
+BSD 3-Clause License (Copyright (c) 2025, macs3 project team); the full notice
+is kept in `gatac/peak/_macs.py`.
+
 ## Third-party code
 
 ### MINPACK (via SciPy)
@@ -65,14 +78,12 @@ with the original chromVAR R results.
 
 ### gmacs
 
-Portions of GATAC's GPU-accelerated peak-calling code are derived from
-[**gmacs**](https://github.com/latchbio-workflows/gmacs) — a GPU-accelerated
-implementation of the [MACS3](https://github.com/macs3-project/MACS) algorithm {cite:p}`Zhang2008` developed by Harihara Subrahmaniam Muralidharan at
-LatchBio.
-
-The relevant code has been extensively modified for integration into the GATAC pipeline. Key updates include adaptation to the GATAC Parquet/cuDF data model, enhanced memory management through streaming, and a refactored API designed to align with the scverse ecosystem.
-
-gmacs is dual-licensed under
+GATAC's GPU peak calling started from
+[**gmacs**](https://github.com/latchbio-workflows/gmacs), a GPU-accelerated
+implementation of the [MACS3](https://github.com/macs3-project/MACS) algorithm
+{cite:p}`Zhang2008` developed by Harihara Subrahmaniam Muralidharan at
+LatchBio, adapted to the GATAC Parquet/cuDF data model. It has since been
+replaced by the MACS3 port above. gmacs is dual-licensed under
 [CC0 1.0 Universal](https://github.com/latchbio-workflows/gmacs/blob/main/COPYING)
 and the
 [MIT License](https://github.com/latchbio-workflows/gmacs/blob/main/LICENSE.MIT).

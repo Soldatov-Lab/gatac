@@ -98,6 +98,29 @@ def test_call_finds_each_groups_own_hotspots(tiles, world, chrom_sizes):
         assert np.abs(summit - hot.centre.to_numpy()[at]).max() < 250
 
 
+def test_call_is_independent_of_chromosome_batches(tiles, world, chrom_sizes, monkeypatch):
+    """Calling one chromosome per batch (a tiny GPU budget) gives the peaks of a single batch."""
+    from gatac.peak import _macs
+    one = ga.peak.call(tiles, "group", world["parquet"], genome=chrom_sizes, inplace=False, verbose=False)
+    callpeak = _macs.callpeak
+    monkeypatch.setattr(_macs, "callpeak", lambda f, p, budget_bytes=None: callpeak(f, p, budget_bytes=1))
+    many = ga.peak.call(tiles, "group", world["parquet"], genome=chrom_sizes, inplace=False, verbose=False)
+    for g in one:
+        pd.testing.assert_frame_equal(one[g], many[g])
+
+
+def test_call_without_summits_gives_one_row_per_peak(tiles, world, chrom_sizes):
+    """``call_summits=False``: the same peaks, each once, with its summit inside it."""
+    sub = ga.peak.call(tiles, "group", world["parquet"], genome=chrom_sizes, inplace=False, verbose=False)
+    single = ga.peak.call(tiles, "group", world["parquet"], genome=chrom_sizes, inplace=False, verbose=False,
+                          call_summits=False)
+    for g, df in single.items():
+        key = ["chrom", "start", "end"]
+        assert not df.duplicated(key).any()
+        assert set(map(tuple, df[key].to_numpy())) == set(map(tuple, sub[g][key].to_numpy()))
+        assert ((df.peak >= 0) & (df.peak < df.end - df.start)).all()
+
+
 def test_call_from_directory_matches_single_file(tiles, world, split_parquets, chrom_sizes):
     """Directory mode reads each cell from its ``source_file`` and gives the peaks of the single combined file."""
     d, source = split_parquets

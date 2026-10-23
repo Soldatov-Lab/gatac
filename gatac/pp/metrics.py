@@ -2,21 +2,24 @@
 GPU-accelerated metrics for ATAC-seq data.
 
 Implementation:
-1. compute_metrics: Polars-based, streams data in chunks to reduce peak memory.
-   This is the standard implementation for both small and large datasets.
+1. compute_metrics: streams the fragments onto the GPU in batches of row
+   groups to bound peak memory, on small and large datasets alike.
 """
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Union
 
 import cudf
 import cupy as cp
 import cupyx
 import numpy as np
+import pandas as pd
 
 from ._utils import cleanup_gpu_memory
+from .._readers import read_gtf
 from ..io.fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
@@ -63,50 +66,27 @@ void compute_tsse_kernel(
 }
 ''', 'compute_tsse_kernel')
 
-def _load_tss_from_gtf(gtf_path: str | Path) -> 'pl.DataFrame':
-    """Load TSS locations from a GTF file using Polars.
+def _load_tss_from_gtf(gtf_path: str | Path) -> pd.DataFrame:
+    """Distinct transcript TSSs of a GTF file: ``chrom``, ``tss`` (0-based), ``strand``.
 
     Private helper used by :func:`compute_metrics` when the caller passes a
     ``gtf_path`` instead of a pre-loaded TSS DataFrame.
     """
-
-    import polars as pl
-
-    logger.info(f"Loading TSS from {gtf_path} (Polars)")
-
-    # GTF columns
-    cols = ['chrom', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attribute']
-
-    # Read GTF (tab-separated, ignore lines starting with #)
-    df = pl.read_csv(
-        gtf_path,
-        separator='\t',
-        comment_prefix='#',
-        has_header=False,
-        new_columns=cols,
-    ).select(['chrom', 'feature', 'start', 'end', 'strand'])
-
-    # Filter for transcripts and compute TSS
-    df = df.filter(pl.col('feature') == 'transcript')
+    logger.info(f"Loading TSS from {gtf_path}")
+    df = read_gtf(gtf_path, "transcript")
 
     # TSS is start-1 for + strand, end-1 for - strand (0-based)
-    df = df.with_columns([
-        pl.when(pl.col('strand') == '-')
-          .then(pl.col('end') - 1)
-          .otherwise(pl.col('start') - 1)
-          .alias('tss')
-    ])
+    tss = np.where(df['strand'] == '-', df['end'] - 1, df['start'] - 1)
+    tss_df = pd.DataFrame({'chrom': df['chrom'], 'tss': tss, 'strand': df['strand']})
+    tss_df = tss_df.drop_duplicates(ignore_index=True)
 
-    # Keep unique TSS positions
-    tss_df = df.select(['chrom', 'tss', 'strand']).unique()
-
-    logger.info(f"Loaded {len(tss_df):,} unique TSSs (Polars)")
+    logger.info(f"Loaded {len(tss_df):,} unique TSSs")
     return tss_df
 
 
 def compute_metrics(
     parquet_path: str | Path,
-    tss_source: Union[str, Path, 'pl.DataFrame'],
+    tss_source: Union[str, Path, pd.DataFrame],
     window_size: int = 2000,
     smooth_window: int = 11,
     min_unique_frags: int = 100,
@@ -124,10 +104,10 @@ def compute_metrics(
     ----------
     parquet_path : str or Path
         Path to the parquet file containing ATAC fragments.
-    tss_source : str, Path, or pl.DataFrame
+    tss_source : str, Path, or DataFrame
         Either a path to a GTF file (the TSS table is loaded internally)
-        or a pre-built ``polars.DataFrame`` of TSS positions
-        (columns: ``chrom``, ``tss``, ``strand``).  When a pre-built
+        or a pre-built pandas, cuDF or Polars DataFrame of TSS positions
+        (columns: ``chrom``, ``tss`` (0-based), ``strand``).  When a pre-built
         DataFrame is passed, the underlying GTF file is not re-read.
     window_size : int
         Distance around TSS to consider (default: 2000)
@@ -160,14 +140,18 @@ def compute_metrics(
     >>> metrics.columns.tolist()
     ['barcode', 'tsse_score', 'n_unique', 'duplicate_fraction', 'mito_fraction']
     """
-
-    import polars as pl
-
     # Resolve TSS source: accept either a GTF path or a pre-loaded DataFrame.
-    if isinstance(tss_source, (str, Path)):
+    if isinstance(tss_source, (str, os.PathLike)):
         tss_df = _load_tss_from_gtf(tss_source)
-    else:
+    elif isinstance(tss_source, pd.DataFrame):
         tss_df = tss_source
+    elif hasattr(tss_source, "to_pandas"):     # cuDF or Polars
+        tss_df = tss_source.to_pandas()
+    else:
+        raise TypeError(
+            "tss_source must be a GTF path or a pandas, cuDF or Polars DataFrame, "
+            f"not {type(tss_source).__name__}"
+        )
 
     logger.info(f"Computing metrics (streaming mode, row_groups_per_batch={row_groups_per_batch})")
     fragments = FragmentFile(parquet_path)
@@ -202,20 +186,19 @@ def compute_metrics(
     # =========================================================================
     # Filter TSS
     if exclude_chroms:
-        tss_filtered = tss_df.filter(~pl.col('chrom').is_in(exclude_chroms))
+        tss_filtered = tss_df[~tss_df['chrom'].isin(exclude_chroms)]
     else:
         tss_filtered = tss_df
-    
-    # Create chromosome -> integer encoding for faster processing
-    tss_chroms = tss_filtered['chrom'].unique().sort().to_list()
-    
-    # Group TSS by chromosome for efficient lookup
+
+    # Group TSS by chromosome for efficient lookup. The kernel adds whole
+    # counts over every TSS in a window, so the order of tied TSSs is free.
     tss_by_chrom = {}
-    for chrom in tss_chroms:
-        tss_sub = tss_filtered.filter(pl.col('chrom') == chrom).sort('tss')
+    for chrom, tss_sub in tss_filtered.groupby('chrom', sort=True):
+        tss_sub = tss_sub.sort_values('tss', kind='stable')
         tss_pos = cp.asarray(tss_sub['tss'].to_numpy(), dtype='int32')
         tss_strand = cp.asarray((tss_sub['strand'] == '-').to_numpy(), dtype='int8')
         tss_by_chrom[chrom] = (tss_pos, tss_strand)
+    tss_chroms = list(tss_by_chrom)
 
     # =========================================================================
     # Phase 3: Stream fragments and compute TSSe using row group batches

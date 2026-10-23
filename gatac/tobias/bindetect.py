@@ -39,11 +39,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Sequence, Union
 
+import cudf
 import cupy as cp
 import numba
 import numpy as np
 import pandas as pd
-import polars as pl
 
 from .._cupy_compat import to_device
 from .footprint import FootprintTracks, _fai, _region_bytes
@@ -1118,12 +1118,14 @@ def _tobias_site_order(sites: SiteSet, idx: Optional[np.ndarray] = None) -> np.n
     n = len(sites.start) if idx is None else len(idx)
     out_t = np.int32 if n < 2**31 else np.int64
     if any("_" in c for c in sites.chroms):            # a chrom name could prefix another's id
-        key = (pl.DataFrame({"m": col(sites.motif), "c": np.asarray(sites.chroms)[col(sites.chrom)],
-                             "s": col(sites.start), "e": col(sites.end)})
-               .with_columns(k=pl.concat_str([pl.col("c"), pl.col("s").cast(pl.String),
-                                              pl.col("e").cast(pl.String)], separator="_"))
-               .with_row_index("i").sort(["m", "k"], maintain_order=True))
-        return key["i"].to_numpy().astype(out_t)
+        # The ids as strings on the device; cuDF compares them byte-wise, which is Python's
+        # order, and the row index as last key makes the sort stable.
+        chrom = cudf.Series(np.asarray(sites.chroms, dtype=object)).take(to_device(col(sites.chrom)))
+        key = chrom.reset_index(drop=True).str.cat(
+            [cudf.Series(to_device(col(sites.start))).astype(str),
+             cudf.Series(to_device(col(sites.end))).astype(str)], sep="_")
+        df = cudf.DataFrame({"m": to_device(col(sites.motif)), "k": key, "i": cp.arange(n)})
+        return df.sort_values(["m", "k", "i"])["i"].values.astype(out_t).get()
     # without "_" in names, "chrA_..." vs "chrB_..." is decided by chrA + "_" vs chrB + "_"
     rank = np.empty(len(sites.chroms), np.int64)
     rank[sorted(range(len(sites.chroms)), key=lambda i: sites.chroms[i] + "_")] = np.arange(len(sites.chroms))

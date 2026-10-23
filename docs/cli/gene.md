@@ -42,7 +42,7 @@ gatac gene <input.parquet> -g <annotations.gtf>
 | `-m`, `--min-fragments` | `100` | Minimum unique fragments per barcode |
 | `-e`, `--exclude-chroms` | `chrM M` | Chromosomes to exclude |
 | `--metrics` | — | Metrics CSV for quality-based filtering |
-| `--filter` | — | Polars query string applied to metrics |
+| `--filter` | — | Pandas `DataFrame.query` string applied to metrics |
 | `--barcode-prefix` | — | String prepended to barcodes |
 | `--low-memory` | off | Process one Parquet row-group at a time |
 

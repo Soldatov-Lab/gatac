@@ -6,7 +6,6 @@ readme = "README.md"
 license = { text = "BSD-3-Clause" }
 requires-python = ">=3.12"
 dependencies = [
-    "polars>=1.0,<1.32",
     "pyarrow>=22.0.0",
     "duckdb>=1.0",
     "scanpy>=1.11.5",
@@ -24,13 +23,11 @@ archr-compat = [
 ]
 cuda12 = [
     "cudf-cu12==26.02.*",
-    "cudf-polars-cu12==26.02.*",
     "cuml-cu12==26.02.*",
     "cugraph-cu12==26.02.*",
 ]
 cuda13 = [
     "cudf-cu13==26.02.*",
-    "cudf-polars-cu13==26.02.*",
     "cuml-cu13==26.02.*",
     "cugraph-cu13==26.02.*",
 ]

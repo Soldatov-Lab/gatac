@@ -18,7 +18,6 @@ from typing import Literal, Optional, Union
 import cupy as cp
 import numpy as np
 import pandas as pd
-import polars as pl
 from numba import njit
 
 from ._bias_matching import sample_bias_matched_indices
@@ -1494,7 +1493,7 @@ def enrichment(
         group_pvals = p_values[group_mask]
         adjusted_pvals = _p_adjust_bh(group_pvals)
         
-        group_df = pl.DataFrame({
+        group_df = pd.DataFrame({
             "id": [motif_ids[i] for i, m in enumerate(group_mask) if m],
             "name": [motif_names[i] for i, m in enumerate(group_mask) if m],
             "family": [motif_families[i] for i, m in enumerate(group_mask) if m],
@@ -1505,7 +1504,7 @@ def enrichment(
         result[group] = group_df
     
     logger.info("Motif enrichment analysis complete")
-    return {k: v.to_pandas() for k, v in result.items()}
+    return result
 
 
 # =============================================================================
@@ -1681,7 +1680,7 @@ def gsea(
     # ------------------------------------------------------------------
     # Internal helpers: run GSEA for a single ranked DataFrame
     # ------------------------------------------------------------------
-    def _run_one_gseapy(df: pd.DataFrame, group_label: str = "") -> pl.DataFrame:
+    def _run_one_gseapy(df: pd.DataFrame, group_label: str = "") -> pd.DataFrame:
         import gseapy as gp
 
         if logfc_col not in df.columns:
@@ -1727,9 +1726,9 @@ def gsea(
             .reset_index(drop=True)
         )
 
-        return pl.from_pandas(result_df)
+        return result_df
 
-    def _run_one_gpu(df: pd.DataFrame, group_label: str = "") -> pl.DataFrame:
+    def _run_one_gpu(df: pd.DataFrame, group_label: str = "") -> pd.DataFrame:
         if logfc_col not in df.columns:
             raise KeyError(
                 f"Column '{logfc_col}' not found in rankings DataFrame"
@@ -1752,7 +1751,7 @@ def gsea(
         )
 
         if not results:
-            return pl.DataFrame({
+            return pd.DataFrame({
                 "motif": [],
                 "NES": [],
                 "pval": [],
@@ -1762,7 +1761,7 @@ def gsea(
                 "lead_edge_frac": [],
             })
 
-        result_df = pl.DataFrame({
+        result_df = pd.DataFrame({
             "motif": [r["term"] for r in results],
             "NES": [r["nes"] for r in results],
             "pval": [r["pval"] for r in results],
@@ -1773,7 +1772,7 @@ def gsea(
                 r["lead_edge_n"] / len(r["hits"]) if len(r["hits"]) > 0 else 0.0
                 for r in results
             ],
-        }).sort("NES", descending=True)
+        }).sort_values("NES", ascending=False, kind="stable", ignore_index=True)
 
         return result_df
 
@@ -1786,11 +1785,11 @@ def gsea(
         output: dict[str, pd.DataFrame] = {}
         for group, df in rankings.items():
             logger.info(f"Running GSEA ({backend}) for group '{group}'...")
-            output[group] = _run_one(df, group_label=str(group)).to_pandas()
+            output[group] = _run_one(df, group_label=str(group))
         return output
     else:
         logger.info(f"Running GSEA ({backend}) on provided rankings...")
-        return _run_one(rankings).to_pandas()
+        return _run_one(rankings)
 
 
 # =============================================================================

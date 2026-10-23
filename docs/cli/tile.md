@@ -36,7 +36,7 @@ gatac tile <input.parquet|input.h5ad|input.h5> -g <genome|chr_sizes>
 | `-m`, `--min-fragments` | `100` | Minimum unique fragments per barcode |
 | `-e`, `--exclude-chroms` | `chrM chrY M Y` | Chromosomes to exclude (space-separated) |
 | `--metrics` | — | Metrics CSV for quality-based cell filtering |
-| `--filter` | — | Polars query string applied to metrics |
+| `--filter` | — | Pandas `DataFrame.query` string applied to metrics |
 | `--count-strategy` | `unique` | Counting strategy: `unique`, `count`, or `binarize` |
 | `--barcode-prefix` | — | String prepended to barcodes |
 | `--low-memory` | off | Enable low-memory (single row-group) mode |

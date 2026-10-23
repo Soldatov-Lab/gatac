@@ -16,10 +16,9 @@ import cupy as cp
 import cupyx.scipy.sparse as cusp
 import numpy as np
 import pandas as pd
-import polars as pl
 import scipy.sparse as sp
 
-from .._readers import read_metrics
+from .._readers import read_gtf, read_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -96,135 +95,65 @@ def load_gene_annotation(
         where start/end define the regulatory domain.
     """
     logger.info(f"Loading gene annotation from {gtf_path}")
-    
-    # Detect file format from extension
-    gtf_path = Path(gtf_path)
-    is_gff3 = '.gff' in gtf_path.name.lower() or '.gff3' in gtf_path.name.lower()
-    
-    # GTF/GFF columns (same for both formats)
-    cols = ['chrom', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attribute']
-    
-    # Read GTF/GFF (tab-separated, ignore lines starting with #)
-    df = pl.read_csv(
-        str(gtf_path),
-        separator='\t',
-        comment_prefix='#',
-        has_header=False,
-        new_columns=cols,
-    ).select(['chrom', 'feature', 'start', 'end', 'strand', 'attribute'])
-    
-    # Filter for transcripts - SnapATAC2 always counts at transcript level
-    # then aggregates to gene level using MAX (for id_type="gene")
-    df = df.filter(pl.col('feature') == 'transcript')
-    
-    # Parse attributes to extract gene name/id and transcript name/id
-    # We always need gene_name for gene-level aggregation
-    if is_gff3:
-        # GFF3: key=value;key2=value2
-        df = df.with_columns([
-            pl.col('attribute')
-                .str.extract(rf'{gene_name_key}=([^;]+)')
-                .alias('gene_name'),
-            pl.col('attribute')
-                .str.extract(rf'{gene_id_key}=([^;]+)')
-                .alias('gene_id'),
-            pl.col('attribute')
-                .str.extract(rf'{transcript_name_key}=([^;]+)')
-                .alias('transcript_name'),
-            pl.col('attribute')
-                .str.extract(rf'{transcript_id_key}=([^;]+)')
-                .alias('transcript_id'),
-        ])
-    else:
-        # GTF: key "value";
-        df = df.with_columns([
-            pl.col('attribute')
-                .str.extract(rf'{gene_name_key} "([^"]+)"')
-                .alias('gene_name'),
-            pl.col('attribute')
-                .str.extract(rf'{gene_id_key} "([^"]+)"')
-                .alias('gene_id'),
-            pl.col('attribute')
-                .str.extract(rf'{transcript_name_key} "([^"]+)"')
-                .alias('transcript_name'),
-            pl.col('attribute')
-                .str.extract(rf'{transcript_id_key} "([^"]+)"')
-                .alias('transcript_id'),
-        ])
-    
-    # Set name/id based on id_type
-    if id_type == "gene":
-        df = df.with_columns([
-            pl.col('gene_name').alias('name'),
-            pl.col('gene_id').alias('id'),
-        ])
-    else:
-        df = df.with_columns([
-            pl.col('transcript_name').alias('name'),
-            pl.col('transcript_id').alias('id'),
-        ])
-    
-    # Drop rows with missing name or id
-    df = df.filter(pl.col('name').is_not_null() & pl.col('id').is_not_null())
-    
+
+    # Transcripts only - SnapATAC2 always counts at transcript level
+    # then aggregates to gene level using MAX (for id_type="gene").
+    # We always need gene_name for gene-level aggregation.
+    df = read_gtf(gtf_path, "transcript", {
+        "gene_name": gene_name_key,
+        "gene_id": gene_id_key,
+        "transcript_name": transcript_name_key,
+        "transcript_id": transcript_id_key,
+    })
+
+    # Set name/id based on id_type, and drop rows with missing name or id
+    level = "gene" if id_type == "gene" else "transcript"
+    df["name"], df["id"] = df[f"{level}_name"], df[f"{level}_id"]
+    df = df[df["name"].notna() & df["id"].notna()]
+
     # Compute regulatory domain
     # SnapATAC2 converts 1-based GTF to 0-based positions:
     #   left = GTF_start - 1 (0-based start)
     #   right = GTF_end - 1 (0-based position of last base)
     # Then computes regulatory domain using these positions
+    plus = (df["strand"] == "+").to_numpy()
+    left = df["start"].to_numpy() - 1
+    right = df["end"].to_numpy() - 1
     if include_gene_body:
         # Domain = [TSS - upstream, TES + downstream]
         # For + strand: TSS = left, TES = right
         # For - strand: TSS = right, TES = left
-        df = df.with_columns([
-            pl.when(pl.col('strand') == '+')
-                .then(pl.col('start') - 1 - upstream)  # left - upstream
-                .otherwise(pl.col('start') - 1 - downstream)  # left - downstream
-                .clip(lower_bound=0)
-                .alias('reg_start'),
-            pl.when(pl.col('strand') == '+')
-                .then(pl.col('end') - 1 + downstream)  # right + downstream (fixed: was end + downstream)
-                .otherwise(pl.col('end') - 1 + upstream)  # right + upstream (fixed: was end + upstream)
-                .alias('reg_end'),
-        ])
+        reg_start = np.where(plus, left - upstream, left - downstream)
+        reg_end = np.where(plus, right + downstream, right + upstream)
     else:
         # Domain = [TSS - upstream, TSS + downstream]
-        df = df.with_columns([
-            pl.when(pl.col('strand') == '+')
-                .then(pl.col('start') - 1 - upstream)
-                .otherwise(pl.col('end') - 1 - downstream)
-                .clip(lower_bound=0)
-                .alias('reg_start'),
-            pl.when(pl.col('strand') == '+')
-                .then(pl.col('start') - 1 + downstream)
-                .otherwise(pl.col('end') - 1 + upstream)
-                .alias('reg_end'),
-        ])
-    
-    # Select and rename columns - include gene_name for MAX aggregation
-    result = df.select([
-        'chrom',
-        pl.col('reg_start').alias('start'),
-        pl.col('reg_end').alias('end'),
-        'name',
-        'id',
-        'gene_name',  # For MAX aggregation across transcripts of same gene
-        'strand',
-    ])
-    
+        reg_start = np.where(plus, left - upstream, right - downstream)
+        reg_end = np.where(plus, left + downstream, right + upstream)
+
+    # gene_name is kept for the MAX aggregation across transcripts of a gene
+    result = pd.DataFrame({
+        "chrom": df["chrom"].to_numpy(),
+        "start": np.maximum(reg_start, 0),
+        "end": reg_end,
+        "name": df["name"].to_numpy(),
+        "id": df["id"].to_numpy(),
+        "gene_name": df["gene_name"].to_numpy(),
+        "strand": df["strand"].to_numpy(),
+    })
+
     # Deduplicate by (chrom, start, end, id) - transcripts with same region
-    result = result.unique(subset=['chrom', 'start', 'end', 'id'], keep='first')
-    
+    result = result.drop_duplicates(subset=["chrom", "start", "end", "id"], keep="first")
+
     # Sort by chromosome and start position
-    result = result.sort(['chrom', 'start'])
-    
+    result = result.sort_values(["chrom", "start"], kind="stable", ignore_index=True)
+
     logger.info(f"Loaded {len(result):,} transcript regulatory domains (for {id_type}-level output)")
-    return result.to_pandas()
+    return result
 
 
 def create_gene_matrix_gpu(
     fragments_df: cudf.DataFrame,
-    gene_regions: Union[pl.DataFrame, pd.DataFrame],
+    gene_regions: pd.DataFrame,
     exclude_chroms: Optional[list] = None,
     min_fragments_per_cell: int = 100,
     cell_metadata: Optional[cudf.DataFrame] = None,
@@ -244,7 +173,7 @@ def create_gene_matrix_gpu(
     ----------
     fragments_df : cudf.DataFrame
         Fragment data with columns: 'chrom', 'start', 'end', 'barcode', 'count'
-    gene_regions : pl.DataFrame
+    gene_regions : pd.DataFrame
         Gene regulatory domains from load_gene_annotation()
     exclude_chroms : list, optional
         List of chromosomes to exclude. (default: ["chrM", "chrY", "M", "Y"])
@@ -268,10 +197,7 @@ def create_gene_matrix_gpu(
         Metadata for genes
     """
     # Convert gene regions to cudf for GPU processing
-    if isinstance(gene_regions, pl.DataFrame):
-        gene_df = cudf.from_pandas(gene_regions.to_pandas())
-    else:
-        gene_df = cudf.from_pandas(gene_regions)
+    gene_df = cudf.from_pandas(gene_regions)
     
     # Get valid chromosomes (those in gene annotation, minus excluded ones)
     valid_chroms = set(gene_df['chrom'].unique().to_arrow().to_pylist())

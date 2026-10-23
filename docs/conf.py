@@ -96,7 +96,6 @@ autodoc_mock_imports = [
     "cudf",
     "cupy",
     "cuml",
-    "cudf_polars",
     "cupyx",
     "rmm",
     "pyfaidx",
@@ -111,7 +110,6 @@ intersphinx_mapping = {
     "anndata": ("https://anndata.readthedocs.io/en/stable/", None),
     "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
     "pandas": ("https://pandas.pydata.org/docs/", None),
-    "polars": ("https://docs.pola.rs/api/python/stable/", None),
 }
 intersphinx_timeout = 5  # seconds; avoids hanging on blocked network in CI/HPC
 

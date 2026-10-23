@@ -1,7 +1,7 @@
 # `gatac filter`
 
 Filter an ATAC-seq fragment Parquet file by barcode quality thresholds.
-Accepts pre-computed metrics and a Polars query string for flexible filtering.
+Accepts pre-computed metrics and a pandas `DataFrame.query` string for flexible filtering.
 Output is written as a new Parquet file, streamed in batches, in the same
 format as `gatac convert` writes.
 
@@ -33,7 +33,7 @@ gatac filter <input.parquet> [-o OUTPUT]
 | `-o`, `--output` | `<input>_filtered.parquet` | Output Parquet path |
 | `--metrics` | — | Path to metrics CSV (from `gatac metrics`) |
 | `-m`, `--min-fragments` | `100` | Minimum unique fragments per barcode |
-| `--filter` | — | Polars filter query string (e.g. `"tsse_score > 5"`) |
+| `--filter` | — | Pandas `DataFrame.query` string on the metrics (e.g. `"tsse_score > 5"`) |
 | `-g`, `--genome` | — | Genome name (`hg38`, `mm10`, …) for chromosome allowlist filtering |
 | `--barcode-prefix` | — | String prepended to barcodes |
 | `--batch-size` | `64` | Unused (kept for compatibility) |
@@ -42,8 +42,8 @@ gatac filter <input.parquet> [-o OUTPUT]
 
 ## Filter query syntax
 
-The `--filter` argument accepts any valid Polars expression string evaluated
-against the metrics DataFrame columns.  Supported operators: `>`, `<`, `>=`,
+The `--filter` argument accepts any pandas `DataFrame.query` expression
+evaluated against the metrics DataFrame columns.  Supported operators: `>`, `<`, `>=`,
 `<=`, `==`, `!=`, `and`, `or`, `not`.
 
 ```bash

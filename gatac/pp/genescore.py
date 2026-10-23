@@ -40,7 +40,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from .._readers import read_metrics
+from .._readers import read_gtf, read_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -172,27 +172,10 @@ def load_gene_score_annotation(
 
 
 def _load_gtf_genes(gtf_path, gene_name_key, gene_id_key) -> pd.DataFrame:
-    """Minimal GTF/GFF gene loader: one (start,end,strand) per gene symbol."""
-    import polars as pl
-
-    gtf_path = Path(gtf_path)
-    is_gff3 = ".gff" in gtf_path.name.lower()
-    cols = ["chrom", "source", "feature", "start", "end",
-            "score", "strand", "frame", "attribute"]
-    df = pl.read_csv(str(gtf_path), separator="\t", comment_prefix="#",
-                     has_header=False, new_columns=cols).select(
-        ["chrom", "feature", "start", "end", "strand", "attribute"])
-    df = df.filter(pl.col("feature") == "gene")
-    if is_gff3:
-        df = df.with_columns(
-            pl.col("attribute").str.extract(rf"{gene_name_key}=([^;]+)").alias("name"))
-    else:
-        df = df.with_columns(
-            pl.col("attribute").str.extract(rf'{gene_name_key} "([^"]+)"').alias("name"))
-    df = df.filter(pl.col("name").is_not_null()).unique(subset=["name"], keep="first")
-    pdf = df.select(["chrom", "start", "end", "strand", "name"]).to_pandas()
-    pdf["chrom"] = pdf["chrom"].astype(str)
-    return pdf
+    """Minimal GTF/GFF gene loader: one (start,end,strand) per gene symbol, from its first gene row."""
+    df = read_gtf(gtf_path, "gene", {"name": gene_name_key})
+    df = df[df["name"].notna()].drop_duplicates(subset="name", keep="first")
+    return df[["chrom", "start", "end", "strand", "name"]].reset_index(drop=True)
 
 
 # =============================================================================

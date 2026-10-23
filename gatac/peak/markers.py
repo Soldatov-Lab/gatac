@@ -24,7 +24,6 @@ import cupy as cp
 import cupyx.scipy.sparse as cusp
 import numpy as np
 import pandas as pd
-import polars as pl
 import scipy.sparse as sp
 from cupyx.scipy.special import betainc
 
@@ -318,7 +317,7 @@ def markers(
     >>> results = ga.peak.markers(adata, groupby="cluster")
     >>>
     >>> # Get top markers for a specific cluster
-    >>> cd8_markers = results["CD8_T"].filter(pl.col("fdr") < 0.05).head(100)
+    >>> cd8_markers = results["CD8_T"].query("fdr < 0.05").head(100)
     >>>
     >>> # For more sensitive detection (more hits), increase max_cells:
     >>> results = ga.peak.markers(adata, groupby="cluster", max_cells=1000, min_log2_fc=0.5)
@@ -430,27 +429,28 @@ def markers(
         fdr = _p_adjust_bh_gpu(p_values)
         
         # Create result DataFrame
-        df = pl.DataFrame({
-            "feature": var_names.tolist(),
-            "log2_fc": log2_fc.get().tolist(),
-            "mean_fg": mean_fg.get().tolist(),
-            "mean_bg": mean_bg.get().tolist(),
-            "mean_diff": mean_diff.get().tolist(),
-            "p_value": p_values.get().tolist(),
-            "fdr": fdr.get().tolist(),
+        df = pd.DataFrame({
+            "feature": np.asarray(var_names, dtype=object),
+            "log2_fc": log2_fc.get().astype(np.float64),
+            "mean_fg": mean_fg.get().astype(np.float64),
+            "mean_bg": mean_bg.get().astype(np.float64),
+            "mean_diff": mean_diff.get().astype(np.float64),
+            "p_value": p_values.get().astype(np.float64),
+            "fdr": fdr.get().astype(np.float64),
         })
-        
+
         # Apply filters
         if min_pct > 0 or min_log2_fc > 0:
-            df = df.filter(
-                ((pl.col("mean_fg") >= min_pct) | (pl.col("mean_bg") >= min_pct)) &
-                (pl.col("log2_fc").abs() >= min_log2_fc)
-            )
-        
-        # Sort by FDR, then by absolute log2_fc
-        df = df.with_columns(
-            pl.col("log2_fc").abs().alias("_abs_log2_fc")
-        ).sort(["fdr", "_abs_log2_fc"], descending=[False, True]).drop("_abs_log2_fc")
+            df = df[
+                ((df["mean_fg"] >= min_pct) | (df["mean_bg"] >= min_pct)) &
+                (df["log2_fc"].abs() >= min_log2_fc)
+            ]
+
+        # Sort by FDR, then by absolute log2_fc; ties keep the feature order
+        df = (df.assign(_abs_log2_fc=df["log2_fc"].abs())
+              .sort_values(["fdr", "_abs_log2_fc"], ascending=[True, False], kind="stable")
+              .drop(columns="_abs_log2_fc")
+              .reset_index(drop=True))
         
         results[group] = df
         logger.debug(f"  Found {len(df)} features for '{group}'")
@@ -465,7 +465,7 @@ def markers(
             "min_log2_fc": min_log2_fc,
             "seed": seed,
         },
-        "results": {k: v.to_pandas() for k, v in results.items()},
+        "results": {k: v.copy() for k, v in results.items()},
     }
     
     # Clean up GPU memory
@@ -475,7 +475,7 @@ def markers(
     
     logger.info(f"Marker peak detection complete. Results stored in adata.uns['{key_added}']")
     
-    return {k: v.to_pandas() for k, v in results.items()}
+    return results
 
 
 def get_markers(
@@ -526,18 +526,15 @@ def get_markers(
     results_dict = adata.uns[key]["results"]
     
     def filter_peaks(df):
-        if not isinstance(df, pl.DataFrame):
-            df = pl.from_pandas(df)
-        
-        filtered = df.filter(
-            (pl.col("fdr") <= fdr_threshold) &
-            (pl.col("log2_fc").abs() >= log2_fc_threshold)
-        )
-        
+        filtered = df[
+            (df["fdr"] <= fdr_threshold) &
+            (df["log2_fc"].abs() >= log2_fc_threshold)
+        ]
+
         if n_peaks is not None:
             filtered = filtered.head(n_peaks)
-        
-        return filtered["feature"].to_list()
+
+        return filtered["feature"].tolist()
     
     if group is not None:
         if group not in results_dict:

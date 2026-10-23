@@ -75,7 +75,7 @@ with optional barcode prefixing for multi-sample projects.
 :shadow: none
 
 GPU QC metrics (**TSSe**, unique fragments, duplicate & mito fraction) plus
-threshold-based barcode filtering via a Polars query engine.
+threshold-based barcode filtering with a query on the metrics.
 
 <a href="cli/metrics.html">→ CLI: metrics</a> · <a href="cli/filter.html">→ CLI: filter</a> · <a href="api/preprocessing.html#quality-metrics-filtering">→ API: pp</a>
 :::

@@ -11,7 +11,7 @@ files written by [`gatac.io`](io.md).
 Compute TSS enrichment score and fragment-level statistics entirely on GPU
 using a streaming approach, filter barcodes by quality thresholds, and detect
 doublet / multiplet cells with the AMULET Poisson method {cite:p}`Thibodeau2021`.  `filter_fragments`
-accepts a pre-computed metrics DataFrame or CSV and a Polars query string;
+accepts a pre-computed metrics DataFrame or CSV and a pandas `DataFrame.query` string;
 `detect_doublets` returns per-cell p/q values and an `is_doublet` flag.
 
 ```{eval-rst}

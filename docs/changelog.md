@@ -34,7 +34,7 @@
 - Gene activity matrix builder using paired-insertion counting.
 - GPU feature selection (ArchR-style quantile filtering).
 - Multi-sample streaming feature selection via `select_features_multi`.
-- Fragment filtering with Polars query engine (`filter_fragments`).
+- Fragment filtering on a query of the cell metrics (`filter_fragments`).
 - CLI: `convert`, `metrics`, `filter`, `tile`, `gene`, `features`, `combine`.
 - Spectral embedding (`dr.spectral`).
 - Latent semantic indexing — GPU TF-IDF plus truncated SVD (`dr.lsi`),
@@ -82,6 +82,19 @@
   path that does not exist raises `FileNotFoundError`; `make_tile_matrix`,
   `make_gene_matrix` and `make_gene_score_matrix` used to warn and keep every
   barcode, skipping `filter_query`.
+- Polars is no longer a dependency, nor `cudf-polars` in the `cuda12` /
+  `cuda13` extras (it was never used). GTF/GFF3 annotations are read by one
+  DuckDB reader for `compute_metrics`, `make_gene_matrix` and
+  `make_gene_score_matrix`: as fast as Polars on GENCODE v44 (1.7 s) with
+  0.5 GB of host memory instead of 5.1 GB. `compute_metrics(tss_source=)`
+  takes a pandas DataFrame (cuDF and Polars ones are converted).
+- Tied rows now keep a defined order where Polars left an arbitrary one:
+  annotation rows keep the file order, and `peak.markers` lists features with
+  equal FDR and |log2FC| in `var` order. On PBMC 5k this moves at most 2 of
+  the top 200 markers of a group, 0-5 of 1,165 motifs across the 0.05
+  threshold of `motif.enrichment`, and changes 58 of 53M entries (4 genes with
+  over 100 overlapping transcripts) of the `make_gene_matrix` notebook matrix;
+  the reproducibility gene matrix still matches SnapATAC2 exactly.
 
 - `peak.call` runs MACS3 `callpeak` on the GPU and gives the peaks of
   SnapATAC2's `macs3`: on PBMC 5k (3 groups, 235k summits) every summit's
@@ -146,6 +159,7 @@
   keep chromosome names as strings and skip `#`, `track` and `browser` lines,
   as `tobias.footprint` already did: chromosomes named `1`, `2`, ... were read
   as integers and matched no fragment.
+- The `peak.markers` example filtered its pandas result with Polars syntax.
 
 - `peak.merge` gives SnapATAC2's `merge_peaks` peaks: among equally
   significant overlapping peaks it keeps the last in position order, as

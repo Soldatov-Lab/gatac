@@ -263,7 +263,6 @@ def metrics_command(args):
     if output_path is None:
         output_path = input_path.with_suffix('').with_name(input_path.stem + '_metrics.csv')
 
-    # Use Polars GPU streaming for out-of-core processing
     from .pp.metrics import compute_metrics
 
     logging.info(f"Loading fragments from {input_path}")

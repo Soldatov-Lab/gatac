@@ -267,8 +267,7 @@ def test_tile_matrix_independent_of_batching(data, strategy):
 
 
 def test_metrics_independent_of_batching(data):
-    import polars as pl
-    tss = pl.DataFrame({"chrom": ["chr1", "chr1", "chr2", "chr3"],
+    tss = pd.DataFrame({"chrom": ["chr1", "chr1", "chr2", "chr3"],
                         "tss": [200_000, 900_000, 400_000, 1_000_000], "strand": ["+", "-", "+", "+"]})
     res = [ga.pp.compute_metrics(data["path"], tss, min_unique_frags=50,
                                  row_groups_per_batch=rg).to_pandas().sort_values("barcode").reset_index(drop=True)

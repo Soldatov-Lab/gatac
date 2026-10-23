@@ -80,9 +80,8 @@ print(cudf.get_device_info())
 | Storage   | —       | NVMe SSD    |
 
 :::{note}
-GATAC can run on CPU-only systems by omitting the `cuda12`/`cuda13` extras
-and relying on Polars CPU execution, but performance will be significantly
-reduced and some GPU-only features will be unavailable.
+GATAC needs an NVIDIA GPU: it imports cuDF and CuPy, which the
+`cuda12`/`cuda13` extras install.
 :::
 
 ---

@@ -76,9 +76,8 @@ def inputs(tmp_path_factory):
 
 @pytest.mark.parametrize("deduplicate", [True, False])
 @pytest.mark.parametrize("read_length", [None, 50])
-def test_load_cuts_matches_polars_unique(tmp_path, deduplicate, read_length):
-    # Reference: the former implementation (pl.DataFrame.unique over all rows, then partition)
-    import polars as pl
+def test_load_cuts_matches_unique_rows(tmp_path, deduplicate, read_length):
+    # Reference: the former implementation (unique over all rows, then partition)
     from gatac.tobias.footprint import _load_cuts
     rng = np.random.default_rng(3)
     n = 30_000
@@ -98,13 +97,13 @@ def test_load_cuts_matches_polars_unique(tmp_path, deduplicate, read_length):
     groups = {b: i % 3 for i, b in enumerate(bcs[:18])}       # two barcodes in no group
     got = _load_cuts(parquet, groups, CHROMS, read_length, deduplicate)
 
-    ref = pl.from_pandas(df[df["barcode"].isin(groups)].assign(g=lambda d: d["barcode"].map(groups)))
-    ref = ref.select("g", "chrom", "start", "end")
+    ref = df[df["barcode"].isin(groups)].assign(g=lambda d: d["barcode"].map(groups))
+    ref = ref[["g", "chrom", "start", "end"]]
     if deduplicate:
-        ref = ref.unique()
+        ref = ref.drop_duplicates()
     for g in range(3):
         for c, length in CHROMS.items():
-            sub = ref.filter((pl.col("g") == g) & (pl.col("chrom") == c))
+            sub = ref[(ref["g"] == g) & (ref["chrom"] == c)]
             s, e = sub["start"].to_numpy().astype(np.int64), sub["end"].to_numpy().astype(np.int64)
             ok = ((s >= 0) & (e <= length) if read_length is None else
                   (s - 4 >= 0) & (e + 4 - read_length >= 0) & (e + 4 <= length) & (s - 4 + read_length <= length))

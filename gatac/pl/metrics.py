@@ -15,12 +15,11 @@ if TYPE_CHECKING:
 
     import cudf
     import pandas as pd
-    import polars as pl
     import matplotlib.figure
 
 
 def qc_metrics(
-    metrics: "Union[str, Path, pd.DataFrame, cudf.DataFrame, pl.DataFrame]",
+    metrics: "Union[str, Path, pd.DataFrame, cudf.DataFrame]",
     *,
     tsse_threshold: float = 5.0,
     n_unique_threshold: int = 1000,

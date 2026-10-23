@@ -68,6 +68,21 @@
 
 ### Changed
 
+- Per-barcode fragment counts (`io.FragmentFile.barcode_counts` with `chroms`
+  or `mito_chroms`, behind `compute_metrics`, `make_tile_matrix`,
+  `filter_fragments` and `detect_doublets`) and `pl.fragment_size_distribution`
+  stream the fragments onto the GPU instead of scanning them with DuckDB, with
+  the same results. On PBMC 5k (101M fragments, L40S): counts 0.7 s -> 0.35 s,
+  size distribution 1.6 s -> 0.3 s, at about 1 GB of GPU memory whatever the
+  library size. `pl.fragment_size_distribution` now also checks the fragment
+  format, like every other reader.
+- Every function that takes `metrics` (`make_tile_matrix`, `make_gene_matrix`,
+  `make_gene_score_matrix`, `filter_fragments`, `pl.qc_metrics`) accepts the
+  same inputs: a CSV path, or a pandas, cuDF or Polars DataFrame. A metrics
+  path that does not exist raises `FileNotFoundError`; `make_tile_matrix`,
+  `make_gene_matrix` and `make_gene_score_matrix` used to warn and keep every
+  barcode, skipping `filter_query`.
+
 - `peak.call` runs MACS3 `callpeak` on the GPU and gives the peaks of
   SnapATAC2's `macs3`: on PBMC 5k (3 groups, 235k summits) every summit's
   start, end, position, score, fold enrichment and p- and q-value is
@@ -124,6 +139,13 @@
   34.5 s -> 22.6 s.
 
 ### Fixed
+
+- `make_tile_matrix`, `make_gene_matrix` and `make_gene_score_matrix` accept
+  a pandas `metrics` DataFrame (raised `TypeError`).
+- BED inputs (`peak.make_matrix(peak_file=)`, `detect_doublets(repeat_filter=)`)
+  keep chromosome names as strings and skip `#`, `track` and `browser` lines,
+  as `tobias.footprint` already did: chromosomes named `1`, `2`, ... were read
+  as integers and matched no fragment.
 
 - `peak.merge` gives SnapATAC2's `merge_peaks` peaks: among equally
   significant overlapping peaks it keeps the last in position order, as

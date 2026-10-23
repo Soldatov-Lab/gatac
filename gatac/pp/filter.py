@@ -14,6 +14,7 @@ import cupy as cp
 import pandas as pd
 
 from ._utils import cleanup_gpu_memory
+from .._readers import read_metrics
 from ..io.fragments import FragmentFile, write_fragments
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ def filter_fragments(
     """
     Filter ATAC fragment parquet file(s) based on cell quality metrics.
 
-    Counts fragments per cell with DuckDB and streams the filtered fragments
+    Counts fragments per cell on the GPU and streams the filtered fragments
     to the output, so memory stays bounded on large files. Supports both
     single and multiple input files.
 
@@ -46,9 +47,9 @@ def filter_fragments(
         Path for output filtered parquet file(s). If None, will use
         input name with '_filtered' suffix. For multiple inputs, can be
         None or a list of same length.
-    metrics : str, Path, pandas.DataFrame, or cudf.DataFrame, optional
-        Cell quality metrics to use for filtering. Can be a path to a
-        CSV file, or a pre-loaded DataFrame.
+    metrics : str, Path, pandas.DataFrame, cudf.DataFrame or polars.DataFrame, optional
+        Cell metrics for filtering: the table returned by
+        :func:`gatac.pp.compute_metrics`, or a CSV file of it.
     min_fragments_per_cell : int, default 100
         Minimum number of unique fragments required per cell.
     filter_query : str, optional
@@ -140,15 +141,8 @@ def filter_fragments(
 
     # Load metrics if provided
     valid_barcodes = None
-    if metrics is not None:
-        if isinstance(metrics, (str, Path)):
-            logger.info(f"Loading metrics from {metrics}")
-            metrics_df = pd.read_csv(metrics)
-        elif isinstance(metrics, (pd.DataFrame, cudf.DataFrame)):
-            metrics_df = metrics.copy()
-        else:
-            raise ValueError("metrics must be a path to a CSV file or a pandas/cudf DataFrame")
-        
+    metrics_df = read_metrics(metrics)
+    if metrics_df is not None:
         if barcode_column not in metrics_df.columns:
             raise ValueError(f"Barcode column '{barcode_column}' not found in metrics")
         
@@ -164,10 +158,7 @@ def filter_fragments(
             metrics_df = metrics_df[metrics_df['n_unique'] >= min_fragments_per_cell]
             logger.info(f"Retained {len(metrics_df):,} cells after min_fragments filter")
         
-        if isinstance(metrics_df, cudf.DataFrame):
-            valid_barcodes = set(metrics_df[barcode_column].astype(str).to_arrow().to_pylist())
-        else:
-            valid_barcodes = set(metrics_df[barcode_column].astype(str).values)
+        valid_barcodes = set(metrics_df[barcode_column].astype(str).values)
         logger.info(f"Total valid barcodes from metrics: {len(valid_barcodes):,}")
 
     # Process each input file

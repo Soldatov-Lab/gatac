@@ -17,10 +17,10 @@ port** of the [**AMULET**](https://github.com/UcarLab/AMULET) algorithm of
 The overlap-detection sweep-line, the per-cell Poisson scoring, the row-sum
 Poisson repeat-inference, and the BH-FDR correction are translated
 line-for-line from the upstream Python source (`FragmentFileOverlapCounter.py`
-and `AMULET.py`). The data flow has been rewritten to operate on GATAC's
-parquet fragment files via DuckDB and to parallelize per-chromosome with a
-worker pool; the optional repeat-filter pass is applied at the raw-read level
-rather than the overlap level. The original AMULET v1.1 release is run as an
+and `AMULET.py`). The data flow has been rewritten to stream GATAC's
+parquet fragment files onto the GPU, where the overlaps of all cells of a
+chromosome are found at once; the optional repeat-filter pass is applied at
+the raw-read level rather than the overlap level. The original AMULET v1.1 release is run as an
 external subprocess during the
 [reproducibility](reproducibility) tests, where it agrees with GATAC exactly
 (Jaccard 1.000, q-value Pearson r 1.000 on 13,735 cells × 22 autosomes).

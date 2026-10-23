@@ -37,6 +37,7 @@ import scipy.stats as stats
 import statsmodels.api as sm
 
 from .._cupy_compat import bincount
+from .._readers import read_bed
 from ._utils import cleanup_gpu_memory
 from ..io.fragments import FragmentFile
 from .genome import get_chrom_sizes
@@ -200,8 +201,7 @@ def _hits_regions(
 def _load_repeat_regions(repeat_filter: Union[str, Path], chromosomes: List[str]) -> dict:
     """Load a BED file of known repetitive regions, merged per chromosome on the GPU."""
     logger.info(f"Loading repeat regions from {repeat_filter}")
-    df = pd.read_csv(repeat_filter, sep="\t", header=None, usecols=[0, 1, 2],
-                     names=["chrom", "start", "end"])
+    df = read_bed(repeat_filter)
     regions = {}
     for chrom, sub in df[df["chrom"].isin(chromosomes)].groupby("chrom"):
         _, r_start, r_end = _merge_intervals(

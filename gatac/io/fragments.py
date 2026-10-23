@@ -41,6 +41,8 @@ import pyarrow.compute as pc
 import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 
+from .._cupy_compat import bincount
+
 logger = logging.getLogger(__name__)
 
 FORMAT_VERSION = "1"
@@ -195,31 +197,39 @@ class FragmentFile:
                 "n_total": t["bc_n_total"].to_numpy().astype(np.int64),
             })
 
-        pos = {c: i for i, c in enumerate(self.chroms)}
+        if chroms is not None and not set(chroms) & set(self.chroms):
+            return _empty_counts(mito_chroms is not None)
 
-        def values(names):
-            return ", ".join(str(pos[c]) for c in names if c in pos)
-
-        where = ""
-        if chroms is not None:
-            in_list = values(chroms)
-            if not in_list:
-                return _empty_counts(mito_chroms is not None)
-            where = f"WHERE chrom_id IN ({in_list})"
-        mito = ""
+        # One bin per barcode id, summed over the batches on the GPU. Weighted
+        # sums are float64, exact for any read count below 2**53. 16 row
+        # groups per batch keep the GPU memory near 1 GB on any library.
+        names = list(chroms) if chroms is not None else list(self.chroms)
+        columns = ["barcode", "count"] + (["chrom"] if mito_chroms is not None else [])
+        n = self.n_barcodes
+        n_unique = cp.zeros(n, dtype=cp.int64)
+        n_total = cp.zeros(n, dtype=cp.float64)
         if mito_chroms is not None:
-            in_list = values(mito_chroms)
-            mito = (f", sum(CASE WHEN chrom_id IN ({in_list}) THEN count ELSE 0 END)::BIGINT AS n_mito"
-                    if in_list else ", 0::BIGINT AS n_mito")
+            n_mito = cp.zeros(n, dtype=cp.float64)
+            is_mito = cp.asarray(np.isin(np.asarray(names, dtype=object), list(mito_chroms)),
+                                 dtype=cp.float64)
+        for df in self.iter_batches(columns, row_groups_per_batch=16, chroms=chroms):
+            barcode = df["barcode"].values
+            reads = df["count"].values.astype(cp.float64)
+            n_unique += bincount(barcode, minlength=n)
+            n_total += cp.bincount(barcode, weights=reads, minlength=n)
+            if mito_chroms is not None:
+                n_mito += cp.bincount(barcode, weights=reads * is_mito[df["chrom"].values], minlength=n)
+            del df, barcode, reads
 
-        df = duckdb.connect().execute(f"""
-            SELECT barcode_id AS barcode, count(*)::BIGINT AS n_unique,
-                   sum(count)::BIGINT AS n_total {mito}
-            FROM read_parquet('{self.path}') {where}
-            GROUP BY barcode_id
-        """).fetchdf()
-        df["barcode"] = self.barcodes[df["barcode"].to_numpy()]
-        return df
+        ids = cp.flatnonzero(n_unique)
+        out = pd.DataFrame({
+            "barcode": self.barcodes[ids.get()],
+            "n_unique": n_unique[ids].get(),
+            "n_total": n_total[ids].get().astype(np.int64),
+        })
+        if mito_chroms is not None:
+            out["n_mito"] = n_mito[ids].get().astype(np.int64)
+        return out
 
     def _row_group_batches(self, row_groups_per_batch: int) -> Iterator[List[int]]:
         n = self.num_row_groups

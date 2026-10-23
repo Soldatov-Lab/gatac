@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from numba import njit, prange
 
+from .._readers import read_bed
 from ..io.fragments import FragmentFile
 from ..pp.genome import get_chrom_sizes
 from ..pp.gene import optimize_sparse_matrix_dtype
@@ -1155,13 +1156,7 @@ def make_matrix(
     # Get peaks: a peak_file takes precedence over use_rep
     if peak_file is not None:
         # Read from BED file
-        peaks_df = pd.read_csv(
-            peak_file,
-            sep='\t',
-            header=None,
-            usecols=[0, 1, 2],
-            names=['chrom', 'start', 'end'],
-        )
+        peaks_df = read_bed(peak_file)
     elif use_rep is not None:
         if use_rep not in adata.uns:
             raise ValueError(f"'{use_rep}' not found in adata.uns")

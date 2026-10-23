@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from .._readers import read_metrics
 from ..io.fragments import FragmentFile
 
 logger = logging.getLogger(__name__)
@@ -254,25 +255,11 @@ def _extract_interval_features(var_names: pd.Index) -> pd.DataFrame:
     return parsed.reset_index(drop=True)
 
 
-def _load_metrics_dataframe(
-    metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame],
-    filter_query: Optional[str],
-) -> Optional[pd.DataFrame]:
-    """Load cell metrics and optionally apply a pandas query."""
-    if metrics is None:
+def _load_metrics_dataframe(metrics, filter_query: Optional[str]) -> Optional[pd.DataFrame]:
+    """Load cell metrics (see :func:`gatac._readers.read_metrics`) and optionally apply a pandas query."""
+    metrics_df = read_metrics(metrics)
+    if metrics_df is None:
         return None
-
-    if isinstance(metrics, cudf.DataFrame):
-        metrics_df = metrics.to_pandas()
-    elif isinstance(metrics, pd.DataFrame):
-        metrics_df = metrics.copy()
-    else:
-        metrics_path = Path(metrics)
-        if not metrics_path.exists():
-            logger.warning(f"Metrics file {metrics_path} not found.")
-            return None
-        logger.info(f"Loading cell metrics from {metrics_path}")
-        metrics_df = pd.read_csv(metrics_path)
 
     if 'barcode' not in metrics_df.columns:
         raise ValueError("Metrics table must contain a 'barcode' column.")
@@ -764,7 +751,7 @@ def make_tile_matrix(
     tile_size: int = 5000,
     min_fragments_per_cell: int = 100,
     exclude_chroms: Optional[list] = ["chrM", "chrY", "M", "Y"],
-    metrics: Optional[str | Path | cudf.DataFrame] = None,
+    metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     count_strategy: str = "unique",
     barcode_prefix: Optional[str] = None,
@@ -799,8 +786,9 @@ def make_tile_matrix(
         Minimum fragments required per barcode (default: 100)
     exclude_chroms : list, optional
         List of chromosomes to exclude. (default: ["chrM", "chrY", "M", "Y"])
-    metrics : str, Path, or cudf.DataFrame, optional
-        Path to a CSV file or a cuDF DataFrame containing cell metrics for filtering.
+    metrics : str, Path, pandas.DataFrame, cudf.DataFrame or polars.DataFrame, optional
+        Cell metrics for filtering: the table returned by
+        :func:`gatac.pp.compute_metrics`, or a CSV file of it.
     filter_query : str, optional
         Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
     count_strategy : str
@@ -904,37 +892,16 @@ def make_tile_matrix(
     fragments = FragmentFile(input_path)
 
     # ------------------------------------------------------------------ #
-    # 4. Count barcodes with DuckDB (fast CPU scan, no GPU memory)         #
+    # 4. Count barcodes                                                    #
     # ------------------------------------------------------------------ #
     barcode_counts = fragments.barcode_counts(chroms=all_chroms)[['barcode', 'n_unique']]
 
-    if metrics is not None:
-        if isinstance(metrics, cudf.DataFrame):
-            cell_metadata_input = metrics
-        else:
-            metrics_path = Path(metrics)
-            if metrics_path.exists():
-                logger.info(f"Loading cell metrics from {metrics_path}")
-                cell_metadata_input = cudf.read_csv(str(metrics_path))
-            else:
-                logger.warning(f"Metrics file {metrics_path} not found.")
-                cell_metadata_input = None
-
-        if cell_metadata_input is not None:
-            if filter_query:
-                cell_metadata_input = cell_metadata_input.query(filter_query)
-            cell_meta_extra = cell_metadata_input.to_pandas()
-            cell_meta_extra['barcode'] = cell_meta_extra['barcode'].astype(str)
-            del cell_metadata_input
-
-            # Restrict to candidate barcodes
-            barcode_counts = barcode_counts[
-                barcode_counts['barcode'].isin(set(cell_meta_extra['barcode']))
-            ]
-        else:
-            cell_meta_extra = None
-    else:
-        cell_meta_extra = None
+    cell_meta_extra = _load_metrics_dataframe(metrics, filter_query)
+    if cell_meta_extra is not None:
+        # Restrict to candidate barcodes
+        barcode_counts = barcode_counts[
+            barcode_counts['barcode'].isin(set(cell_meta_extra['barcode']))
+        ]
 
     barcode_counts = barcode_counts[barcode_counts['n_unique'] >= int(min_fragments_per_cell)]
     valid_barcodes = sorted(barcode_counts['barcode'].values)

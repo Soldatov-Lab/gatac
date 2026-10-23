@@ -19,6 +19,8 @@ import pandas as pd
 import polars as pl
 import scipy.sparse as sp
 
+from .._readers import read_metrics
+
 logger = logging.getLogger(__name__)
 
 
@@ -620,7 +622,7 @@ def make_gene_matrix(
     include_gene_body: bool = True,
     min_fragments_per_cell: int = 100,
     exclude_chroms: Optional[list] = None,
-    metrics: Optional[str | Path | cudf.DataFrame] = None,
+    metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
@@ -659,8 +661,9 @@ def make_gene_matrix(
         Minimum fragments required per barcode (default: 100)
     exclude_chroms : list, optional
         List of chromosomes to exclude. (default: None)
-    metrics : str, Path, or cudf.DataFrame, optional
-        Path to a CSV file or a cuDF DataFrame containing cell metrics for filtering.
+    metrics : str, Path, pandas.DataFrame, cudf.DataFrame or polars.DataFrame, optional
+        Cell metrics for filtering: the table returned by
+        :func:`gatac.pp.compute_metrics`, or a CSV file of it.
     filter_query : str, optional
         Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
     barcode_prefix : str, optional
@@ -724,17 +727,7 @@ def make_gene_matrix(
     )
 
     # Load metrics if provided
-    cell_metadata_input = None
-    if metrics is not None:
-        if isinstance(metrics, cudf.DataFrame):
-            cell_metadata_input = metrics
-        else:
-            metrics_path = Path(metrics)
-            if metrics_path.exists():
-                logger.info(f"Loading cell metrics from {metrics_path}")
-                cell_metadata_input = cudf.read_csv(str(metrics_path))
-            else:
-                logger.warning(f"Metrics file {metrics_path} not found. Proceeding without it.")
+    cell_metadata_input = read_metrics(metrics, gpu=True)
 
     logger.info(f"Processing {input_parquet.name}")
 

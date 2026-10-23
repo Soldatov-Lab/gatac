@@ -173,7 +173,7 @@ def compute_metrics(
     fragments = FragmentFile(parquet_path)
 
     # =========================================================================
-    # Phase 1: Per-barcode fragment and read counts (DuckDB scan)
+    # Phase 1: Per-barcode fragment and read counts
     # =========================================================================
     valid_chroms_qc = list(chrom_sizes.keys()) if chrom_sizes else None
     qc_summary = fragments.barcode_counts(chroms=valid_chroms_qc, mito_chroms=['chrM', 'M'])

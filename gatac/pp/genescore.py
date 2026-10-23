@@ -40,6 +40,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from .._readers import read_metrics
+
 logger = logging.getLogger(__name__)
 
 _INT32_MAX = 2147483647
@@ -565,7 +567,7 @@ def make_gene_score_matrix(
     scale_to: float = 10000.0,
     exclude_chroms: Optional[list] = ("chrY", "chrM"),
     min_fragments_per_cell: int = 100,
-    metrics: Optional[str | Path | "cudf.DataFrame"] = None,
+    metrics: Optional[str | Path | pd.DataFrame | "cudf.DataFrame"] = None,
     filter_query: Optional[str] = None,
     barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
@@ -598,6 +600,12 @@ def make_gene_score_matrix(
         Clip windows so tiles cannot contribute across a neighbouring gene.
     use_tss
         Build the model on the 1bp TSS rather than the gene body.
+    metrics
+        Cell metrics for filtering: the table returned by
+        :func:`gatac.pp.compute_metrics` (pandas, cuDF or Polars), or a CSV
+        file of it.
+    filter_query
+        Query on ``metrics`` selecting the cells (e.g. ``"tsse_score > 5"``).
 
     Returns
     -------
@@ -623,16 +631,7 @@ def make_gene_score_matrix(
         gene_id_key=gene_id_key,
     )
 
-    cell_metadata_input = None
-    if metrics is not None:
-        if isinstance(metrics, cudf.DataFrame):
-            cell_metadata_input = metrics
-        else:
-            mp = Path(metrics)
-            if mp.exists():
-                cell_metadata_input = cudf.read_csv(str(mp))
-            else:
-                logger.warning(f"Metrics file {mp} not found; proceeding without it.")
+    cell_metadata_input = read_metrics(metrics, gpu=True)
 
     def _cleanup():
         gc.collect()

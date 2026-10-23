@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import duckdb
+import cupy as cp
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
+
+from .._cupy_compat import bincount
+from ..io.fragments import FragmentFile
 
 if TYPE_CHECKING:
     import matplotlib.axes
@@ -49,18 +53,21 @@ def fragment_size_distribution(
     >>> import gatac as ga
     >>> ax = ga.pl.fragment_size_distribution("pbmc.parquet")
     """
-    fragment_sizes = duckdb.sql(
-        f"""
-        SELECT ("end" - "start") AS fragment_size
-        FROM read_parquet('{parquet_path}')
-        WHERE ("end" - "start") < {max_size}
-        """
-    ).df()
+    # Fragments per size, counted on the GPU one batch at a time. Drawing the
+    # sizes that occur, weighted by their counts, gives the same bins as a
+    # histogram of every fragment. 16 row groups per batch keep the GPU
+    # memory near 1 GB on any library.
+    n_per_size = cp.zeros(max_size, dtype=cp.int64)
+    for batch in FragmentFile(parquet_path).iter_batches(["start", "end"], row_groups_per_batch=16):
+        size = batch["end"].values.astype(cp.int64) - batch["start"].values.astype(cp.int64)
+        n_per_size += bincount(size[(size >= 0) & (size < max_size)], minlength=max_size)
+    n_per_size = n_per_size.get()
+    sizes = np.flatnonzero(n_per_size)
 
     if ax is None:
         _, ax = plt.subplots(figsize=(8, 3))
 
-    ax.hist(fragment_sizes["fragment_size"], bins=bins, color=color, edgecolor="none")
+    ax.hist(sizes, bins=bins, weights=n_per_size[sizes], color=color, edgecolor="none")
     ax.set_xlabel("Fragment size (bp)")
     ax.set_ylabel("Count")
     ax.set_title(title)

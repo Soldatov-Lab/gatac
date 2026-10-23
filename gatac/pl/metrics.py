@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Union
-import os
 
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from .._readers import read_metrics
+
 if TYPE_CHECKING:
+    from pathlib import Path
+
+    import cudf
     import pandas as pd
     import polars as pl
     import matplotlib.figure
 
 
 def qc_metrics(
-    metrics: "Union[str, pd.DataFrame, pl.DataFrame]",
+    metrics: "Union[str, Path, pd.DataFrame, cudf.DataFrame, pl.DataFrame]",
     *,
     tsse_threshold: float = 5.0,
     n_unique_threshold: int = 1000,
@@ -35,8 +39,8 @@ def qc_metrics(
     Parameters
     ----------
     metrics:
-        Either a path to a CSV file or a :class:`pandas.DataFrame` /
-        :class:`polars.DataFrame` produced by :func:`gatac.pp.compute_metrics`.
+        The table returned by :func:`gatac.pp.compute_metrics` (pandas, cuDF
+        or Polars), or a CSV file of it.
         Must contain columns ``tsse_score`` and ``n_unique``.
     tsse_threshold:
         Vertical/horizontal line drawn on plots to mark the TSSe cut-off.
@@ -60,30 +64,7 @@ def qc_metrics(
     >>> metrics = ga.pp.compute_metrics("pbmc.parquet", tss)
     >>> fig = ga.pl.qc_metrics(metrics, tsse_threshold=5.0, n_unique_threshold=1000)
     """
-    import pandas as pd
-
-    if isinstance(metrics, str):
-        if not os.path.isfile(metrics):
-            raise FileNotFoundError(f"Metrics file not found: {metrics}")
-        df = pd.read_csv(metrics)
-    else:
-        # Accept polars or cuDF DataFrames as well
-        try:
-            import polars as pl
-            if isinstance(metrics, pl.DataFrame):
-                df = metrics.to_pandas()
-                metrics = df
-        except ImportError:
-            pass
-
-        try:
-            import cudf
-            if isinstance(metrics, cudf.DataFrame):
-                df = metrics.to_pandas()
-            else:
-                df = metrics
-        except ImportError:
-            df = metrics
+    df = read_metrics(metrics)
 
     for col in ("tsse_score", "n_unique"):
         if col not in df.columns:

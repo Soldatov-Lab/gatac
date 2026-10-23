@@ -41,6 +41,7 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 
+from .._readers import read_bed
 from ..io.fragments import FragmentFile
 
 if TYPE_CHECKING:
@@ -759,9 +760,7 @@ def _peaks_from_input(peaks, adata) -> pd.DataFrame:
     if peaks is None:
         names = pd.Series(adata.var_names.astype(str))
     elif isinstance(peaks, (str, Path)):
-        df = pd.read_csv(peaks, sep="\t", header=None, usecols=[0, 1, 2], comment="#",
-                         names=["chrom", "start", "end"], dtype={0: str})
-        return df
+        return read_bed(peaks)
     elif isinstance(peaks, pd.DataFrame):
         return peaks[["chrom", "start", "end"]].copy()
     else:

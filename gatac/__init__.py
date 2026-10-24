@@ -20,6 +20,11 @@ import sys
 if not sys.stderr.isatty():
     os.environ.setdefault("TQDM_DISABLE", "1")
 
+# libcudf means to default KvikIO to POSIX reads, but opens the first file
+# before applying that, so each process probes cuFile/GPUDirect Storage once
+# (seconds on nodes without it). Apply libcudf's intended default up front.
+os.environ.setdefault("KVIKIO_COMPAT_MODE", "ON")
+
 from . import io
 from . import pp
 from . import dr

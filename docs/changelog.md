@@ -73,9 +73,9 @@
   and lengths, barcode ids and counts (now uint32) as byte-stream split
   integers: PBMC 5k is 369 MB instead of 417 MB (29.2 bits per fragment
   instead of 33.0), converted as fast and read back identical. Every reader
-  still gives `end` and a uint16 `count`, and files that store `end` are
-  read as before. DuckDB 2.0 is now required: earlier versions cannot read
-  byte-stream split integers, which `FragmentFile.register` relies on.
+  still gives `end` and a uint16 `count`. DuckDB 2.0 is now required:
+  earlier versions cannot read byte-stream split integers, which
+  `FragmentFile.register` relies on.
 
 - Per-barcode fragment counts (`io.FragmentFile.barcode_counts` with `chroms`
   or `mito_chroms`, behind `compute_metrics`, `make_tile_matrix`,

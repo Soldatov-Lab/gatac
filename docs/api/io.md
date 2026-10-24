@@ -146,8 +146,6 @@ fragments (`row_group_size`), the unit GATAC streams in.
 `length` and `count` are uint32 although they fit 16 bits: cuDF (26.02)
 fails to decode byte-stream split on uint16, and the two zero bytes take
 almost no space. DuckDB reads byte-stream split integers from version 2.0.
-Files written before lengths were stored hold `end` (and a uint16 `count`)
-and are read the same way.
 ```
 
 ### Reading a file outside GATAC

@@ -16,13 +16,11 @@ ordered by decreasing fragment count. Chromosome names are in the footer
 
 Files keep the order of the input fragments and are written with ZSTD,
 delta-encoded starts, and fragment lengths (``end - start``), barcode ids and
-counts as byte-stream-split integers. Files that store ``end`` instead of
-``length`` (and ``count`` as uint16), as written before, are read the same
-way: readers always return ``end`` and a uint16 ``count``. Reading them never
-builds a string column on the
-GPU: barcodes and chromosomes are joined by integer lookups instead of string
-merges, which is where most of the time of the fragment-streaming functions
-went on deep libraries.
+counts as byte-stream-split integers; readers return ``end`` and a uint16
+``count``. Reading them never builds a string column on the GPU: barcodes
+and chromosomes are joined by integer lookups instead of string merges,
+which is where most of the time of the fragment-streaming functions went on
+deep libraries.
 """
 from __future__ import annotations
 
@@ -72,9 +70,6 @@ FILE_SCHEMA = pa.schema([
 
 # Stored column behind each logical fragment column
 _STORED_NAME = {"chrom": "chrom_id", "barcode": "barcode_id"}
-# Fragment columns of a file written before lengths were stored: ``end``,
-# and ``count`` as uint16. Both layouts are read.
-_END_COLUMNS = ("chrom_id", "start", "end", "barcode_id", "count")
 
 
 class FragmentFile:
@@ -128,8 +123,6 @@ class FragmentFile:
             )
         self.chroms: List[str] = json.loads(kv[b"gatac.chroms"])
         self.n_barcodes = int(kv[b"gatac.n_barcodes"])
-        # Files written before lengths were stored hold ``end`` instead
-        self._stores_length = "length" in pf.schema_arrow.names
         self._barcodes = None
         self._barcode_index = None
 
@@ -249,7 +242,7 @@ class FragmentFile:
         """Stored columns to read for the ``logical`` fragment columns."""
         stored = []
         for c in logical:
-            if c == "end" and self._stores_length:
+            if c == "end":
                 stored += ["start", "length"]
             else:
                 stored.append(_STORED_NAME.get(c, c))
@@ -257,7 +250,7 @@ class FragmentFile:
 
     def _fragment_column(self, df: cudf.DataFrame, c: str) -> cp.ndarray:
         """``start``, ``end`` or ``count`` of a batch read with :meth:`_stored_columns`."""
-        if c == "end" and self._stores_length:
+        if c == "end":
             return df["start"].values + df["length"].values
         if c == "count":
             return df["count"].values.astype(cp.uint16, copy=False)
@@ -400,10 +393,10 @@ class FragmentFile:
             "barcode_id": pa.array(np.arange(len(self.barcodes)), pa.uint32()),
             "barcode": pa.array(self.barcodes, pa.string()),
         }))
-        end = '(f.start + f.length)::UINTEGER' if self._stores_length else 'f."end"'
         con.execute(f"""
             CREATE OR REPLACE TEMP VIEW {name} AS
-            SELECT c.chrom, f.start, {end} AS "end", b.barcode, f.count::USMALLINT AS count
+            SELECT c.chrom, f.start, (f.start + f.length)::UINTEGER AS "end", b.barcode,
+                   f.count::USMALLINT AS count
             FROM read_parquet('{self.path}') f
             JOIN {name}_chroms c USING (chrom_id)
             JOIN {name}_barcodes b USING (barcode_id)
@@ -417,13 +410,11 @@ class FragmentFile:
         pf = pq.ParquetFile(self.path)
         chrom_names = pa.array(self.chroms, pa.string())
         barcode_names = pa.array(self.barcodes, pa.string())
-        stored = list(FILE_SCHEMA.names[:5]) if self._stores_length else list(_END_COLUMNS)
-        for b in pf.iter_batches(batch_size=batch_size, columns=stored):
-            end = pc.add(b.column("start"), b.column("length")) if self._stores_length else b.column("end")
+        for b in pf.iter_batches(batch_size=batch_size, columns=list(FILE_SCHEMA.names[:5])):
             yield pa.table([
                 chrom_names.take(b.column("chrom_id")),
                 b.column("start"),
-                end,
+                pc.add(b.column("start"), b.column("length")),
                 barcode_names.take(b.column("barcode_id")),
                 b.column("count").cast(pa.uint16()),
             ], schema=NAMED_SCHEMA)

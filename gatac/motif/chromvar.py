@@ -868,8 +868,10 @@ def compute_deviations(
     The algorithm:
     - For each cell, computes observed motif accessibility
     - Computes expected accessibility based on overall peak accessibility and cell depth
-    - For background peaks, computes deviation
-    - Z-score normalizes: (observed_dev - mean_bg_dev) / std_bg_dev
+    - For each background iteration, replaces every motif peak by its
+      background peak and computes the same deviation
+    - Z-score normalizes: (observed_dev - mean_bg_dev) / std_bg_dev, with the
+      sample standard deviation over iterations
 
     Parameters
     ----------
@@ -987,6 +989,7 @@ def compute_deviations(
         
         # Pre-transfer bg_peaks to GPU once (small: n_peaks × n_bg_peaks int32)
         bg_peaks_gpu = cp.asarray(adata.varm["bg_peaks"])
+        bg_motif_match = cp.empty_like(motif_match_dense)
         
         # Process cells in batches
         for cell_start in tqdm(
@@ -1025,15 +1028,14 @@ def compute_deviations(
             for bg_iter in range(n_bg_peaks):
                 bg_peak_idx = bg_peaks_gpu[:, bg_iter]
                 
-                # Use dense indexing (much more memory efficient than sparse fancy indexing)
-                bg_motif_match = motif_match_dense[bg_peak_idx, :]
+                # As in chromVAR, every motif peak i is replaced by its
+                # background peak bg[i]: X[:, bg] @ M equals X @ S, where row q
+                # of S sums the match rows of the peaks whose background is q
+                bg_motif_match.fill(0)
+                cp.add.at(bg_motif_match, bg_peak_idx, motif_match_dense)
                 
-                # Compute observed: X @ bg_motif_match
                 observed = X_chunk_gpu @ bg_motif_match
-                
-                # Compute var_match for background
-                exp_var_reindexed = expectation_var.flatten()[bg_peak_idx]
-                var_match_bg = (exp_var_reindexed @ bg_motif_match).reshape(1, -1)
+                var_match_bg = (expectation_var @ bg_motif_match).reshape(1, -1)
                 
                 # Fused deviation computation
                 bg_dev_iter = _fused_deviation_kernel(
@@ -1053,7 +1055,8 @@ def compute_deviations(
             # Transfer final statistics to CPU (only once per cell batch)
             obs_dev[cell_start:cell_end, :] = cp.asnumpy(obs_dev_chunk)
             mean_bg_dev[cell_start:cell_end, :] = cp.asnumpy(bg_mean_gpu).astype(np.float32)
-            bg_var_gpu = bg_m2_gpu / n_bg_peaks
+            # Sample variance, as R's sd()
+            bg_var_gpu = bg_m2_gpu / max(n_bg_peaks - 1, 1)
             std_bg_dev[cell_start:cell_end, :] = cp.asnumpy(cp.sqrt(bg_var_gpu)).astype(np.float32)
             
             # Cleanup
@@ -1062,7 +1065,7 @@ def compute_deviations(
             pinned_mempool.free_all_blocks()
         
         # Cleanup dense motif matrix and bg_peaks
-        del motif_match_dense, var_match_all, bg_peaks_gpu
+        del motif_match_dense, var_match_all, bg_peaks_gpu, bg_motif_match
         
         # Z-score normalization using fused GPU kernel
         # Transfer back to GPU for final computation, then back to CPU

@@ -169,6 +169,14 @@
   as `tobias.footprint` already did: chromosomes named `1`, `2`, ... were read
   as integers and matched no fragment.
 - The `peak.markers` example filtered its pandas result with Polars syntax.
+- `motif.compute_deviations` samples background peaks as chromVAR does:
+  each background iteration replaces every motif peak by its background peak.
+  It summed the counts of the peaks whose background peak matched the motif
+  instead, which is a different set because background peaks repeat. The
+  spread of the background deviations is now the sample standard deviation,
+  as R's `sd()`. Given R's motif matches and background peaks, the z-scores
+  equal R chromVAR's up to float32 rounding (correlation 1.000000, max
+  difference 0.002, was 0.975); same speed.
 - `motif.enrichment` matches the same regions as SnapATAC2's
   `motif_enrichment` again, so fold changes and p-values agree to rounding: it
   turns `pvalue` into a score threshold with SnapATAC2's score distribution

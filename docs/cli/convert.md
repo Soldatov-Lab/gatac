@@ -2,8 +2,9 @@
 
 Convert raw ATAC-seq fragment files from TSV.GZ to Parquet format.  Uses
 DuckDB for parallel decompression and Parquet row-group sizing tuned for
-efficient GPU streaming.  Files are written with ZSTD and delta-encoded
-coordinates, with chromosomes and barcodes stored as integer ids (below).
+efficient GPU streaming.  Files are written with ZSTD, delta-encoded starts
+and byte-stream split lengths, barcode ids and counts, with chromosomes and
+barcodes stored as integer ids (below).
 Given `.parquet` inputs, it writes them back to fragments TSV.GZ
 ([Back to TSV](#back-to-tsv)).
 
@@ -56,8 +57,8 @@ Compressed with gzip (`.tsv.gz`) or uncompressed (`.tsv`) are both supported.
 
 ## Output
 
-Columns: `chrom_id`, `start`, `end`, `barcode_id`, `count`, plus the
-per-barcode table `bc_name`, `bc_n_unique`, `bc_n_total`.
+Columns: `chrom_id`, `start`, `length` (`end - start`), `barcode_id`,
+`count`, plus the per-barcode table `bc_name`, `bc_n_unique`, `bc_n_total`.
 
 Row *i* of the `bc_*` columns describes barcode id *i* (its full original
 name, number of fragments and read count); they are null after the last
@@ -66,7 +67,7 @@ names are stored in the file footer (`gatac.chroms`). GATAC joins cells and
 chromosomes by integer lookups, so these files stream several times faster on
 the GPU than names in every row. To read a file outside GATAC, use
 `gatac.io.FragmentFile` (e.g. `FragmentFile(path).register(duckdb_con)` gives
-a DuckDB view with `chrom`, `start`, `end`, `barcode`, `count`). See
+a DuckDB (2.0 or later) view with `chrom`, `start`, `end`, `barcode`, `count`). See
 [Parquet fragment format](../api/io.md#parquet-fragment-format) for how the format works.
 
 ---

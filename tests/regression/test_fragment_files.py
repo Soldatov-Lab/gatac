@@ -21,6 +21,7 @@ pytest.importorskip("cudf")
 
 import duckdb  # noqa: E402
 import pyarrow as pa  # noqa: E402
+import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
@@ -111,6 +112,60 @@ def test_file_layout(data):
     assert names.to_arrow().to_pylist() == list(ff.barcodes)
 
 
+def test_stored_columns_and_encodings(data):
+    """Lengths, not ends; barcode ids, lengths and counts byte-stream split."""
+    pf = pq.ParquetFile(data["path"])
+    schema = pf.schema_arrow
+    assert schema.names[:5] == ["chrom_id", "start", "length", "barcode_id", "count"]
+    assert schema.field("length").type == pa.uint32() and schema.field("count").type == pa.uint32()
+    rg = pf.metadata.row_group(0)
+    enc = {rg.column(i).path_in_schema: set(rg.column(i).encodings) for i in range(rg.num_columns)}
+    for c in ("length", "barcode_id", "count"):
+        assert "BYTE_STREAM_SPLIT" in enc[c], (c, enc[c])
+    assert "DELTA_BINARY_PACKED" in enc["start"]
+
+
+def _end_layout(path, out):
+    """The same fragments in the layout written before lengths were stored."""
+    pf = pq.ParquetFile(path)
+    t = pf.read()
+    end = pc.add(t["start"], t["length"])
+    t = (t.drop_columns(["length"]).add_column(2, "end", end)
+         .set_column(4, "count", t["count"].cast(pa.uint16())))
+    pq.write_table(t.replace_schema_metadata(pf.metadata.metadata), out,
+                   row_group_size=pf.metadata.row_group(0).num_rows, compression="zstd",
+                   use_dictionary=["chrom_id", "barcode_id", "count"],
+                   column_encoding={"start": "DELTA_BINARY_PACKED", "end": "DELTA_BINARY_PACKED",
+                                    "bc_name": "DELTA_LENGTH_BYTE_ARRAY"}, write_page_index=True)
+    return out
+
+
+def test_end_layout_reads_the_same(data, tmp_path):
+    """Files that store end (and a uint16 count) read exactly like the new ones."""
+    new, old = FragmentFile(data["path"]), FragmentFile(_end_layout(data["path"], tmp_path / "old.parquet"))
+    assert not old._stores_length and new._stores_length
+    a, b = pa.concat_tables(new.iter_arrow()), pa.concat_tables(old.iter_arrow())
+    assert a.equals(b) and a.schema.field("count").type == pa.uint16()
+    cols = ["chrom", "start", "end", "count", "barcode"]
+    x = pd.concat([d.to_pandas() for d in new.iter_batches(cols, row_groups_per_batch=4)], ignore_index=True)
+    y = pd.concat([d.to_pandas() for d in old.iter_batches(cols, row_groups_per_batch=4)], ignore_index=True)
+    pd.testing.assert_frame_equal(x, y)
+    assert x["end"].dtype == np.uint32 and x["count"].dtype == np.uint16
+    pd.testing.assert_frame_equal(new.read_categorical().to_pandas(), old.read_categorical().to_pandas())
+    pd.testing.assert_frame_equal(new.read_categorical(["end", "count"]).to_pandas(),
+                                  old.read_categorical(["end", "count"]).to_pandas())
+    for kw in ({"chroms": ["chr1", "chrM"], "mito_chroms": ["chrM"]}, {}):
+        pd.testing.assert_frame_equal(new.barcode_counts(**kw), old.barcode_counts(**kw))
+
+
+def test_end_before_start_is_rejected(tmp_path):
+    t = pa.table({"chrom": ["chr1", "chr1"], "start": pa.array([100, 500], pa.uint32()),
+                  "end": pa.array([200, 400], pa.uint32()), "barcode": ["A", "A"],
+                  "count": pa.array([1, 1], pa.uint16())})
+    with pytest.raises(ValueError, match="ends before it starts"):
+        ga.io.fragments.write_fragments(lambda: iter([t]), tmp_path / "bad.parquet")
+
+
 @pytest.mark.parametrize("chroms", [None, ["chr2", "chrM"]])
 def test_barcode_counts(data, chroms):
     df = data["df"]
@@ -147,9 +202,11 @@ def test_empty_selection_yields_nothing(data):
     assert list(ff.iter_batches(cells=[])) == []
 
 
-def test_register_duckdb_view(data):
+@pytest.mark.parametrize("layout", ["length", "end"])
+def test_register_duckdb_view(data, tmp_path, layout):
+    path = data["path"] if layout == "length" else _end_layout(data["path"], tmp_path / "old.parquet")
     con = duckdb.connect()
-    FragmentFile(data["path"]).register(con)
+    FragmentFile(path).register(con)
     got = con.sql("SELECT * FROM fragments ORDER BY chrom, start, \"end\", barcode").df()
     exp = data["df"].sort_values(["chrom", "start", "end", "barcode"]).reset_index(drop=True)
     pd.testing.assert_frame_equal(got, exp, check_dtype=False)

@@ -43,8 +43,9 @@ the names once, inside the same file:
 :file: ../_static/fragment_layout.svg
 ```
 
-- **Fragment columns.** `chrom_id`, `start`, `end`, `barcode_id`, `count`,
-  one row per fragment, in the order of the input file.
+- **Fragment columns.** `chrom_id`, `start`, `length` (`end - start`),
+  `barcode_id`, `count`, one row per fragment, in the order of the input
+  file. Every reader gives back `end`.
 - **Barcode table.** The `bc_name`, `bc_n_unique` and `bc_n_total` columns
   sit next to the fragment columns: row *i* describes barcode id *i*, with its
   full original name, its number of fragments and its read count (the sum of
@@ -63,26 +64,25 @@ the names once, inside the same file:
 The barcode table also gives the fragment counts per barcode without
 reading the fragments (`FragmentFile.barcode_counts()`).
 
-The file is about 2.7× smaller than the `fragments.tsv.gz` it comes from.
-On a 50M-fragment library, each column of the text file gzipped on its own
-compares with the same data in the Parquet file:
+The file is about 2.8× smaller than the `fragments.tsv.gz` it comes from.
+On PBMC 5k (101M fragments, 477k barcodes), each column of the text file
+gzipped on its own compares with the same data in the Parquet file:
 
 | Column | `fragments.tsv.gz` (gzip) | GATAC Parquet |
 |---|---|---|
-| chromosome | 0.4 MB | < 0.01 MB |
-| start | 122.5 MB | 44.3 MB |
-| end | 134.6 MB | 66.9 MB |
-| barcode | 200.7 MB | 88.3 MB |
-| count | 14.2 MB | 10.1 MB |
-| **Whole file** | **557 MB** | **210 MB** |
+| chromosome | 0.9 MB | < 0.01 MB |
+| start | 145.9 MB | 52.8 MB |
+| end (as `length`) | 214.1 MB | 114.5 MB |
+| barcode | 458.1 MB | 170.0 MB |
+| count | 37.1 MB | 31.5 MB |
+| **Whole file** | **1,042 MB** | **369 MB** |
 
-The gzip columns add up to 472 MB: gzip loses the other 85 MB to the rows
+The gzip columns add up to 856 MB: gzip loses the other 186 MB to the rows
 interleaving the columns, which a column store does not pay. The barcode
-names, once per barcode, take 1.2 MB of the 88.3 MB; the rest is the
-`barcode_id` of every fragment. The ids and counts are dictionary-encoded,
-and the sorted coordinates delta-encode to a few bits before ZSTD compression
-(see [Encoding](#encoding)). `end` stays larger than `start` because the rows
-are sorted by `start`, so consecutive `end` values vary more.
+names, once per barcode, take 1.9 MB of the 170.0 MB; the rest is the
+`barcode_id` of every fragment. `chrom_id` is dictionary-encoded, the sorted
+starts delta-encode to a few bits, and lengths, barcode ids and counts are
+byte-stream split, all before ZSTD compression (see [Encoding](#encoding)).
 
 ```{note}
 Ids are per file: chromosomes are numbered in the order they first appear in
@@ -121,22 +121,39 @@ categoricals from the ids and needs about a quarter of the GPU memory.
 ### Encoding
 
 Each column in the [schematic](#file-layout) gives its encoding and type:
-*dict* is Parquet dictionary encoding, *delta* is `DELTA_BINARY_PACKED`, and
-*delta lengths* is `DELTA_LENGTH_BYTE_ARRAY` (delta-encoded string lengths,
-then the strings back to back).
+*dict* is Parquet dictionary encoding, *delta* is `DELTA_BINARY_PACKED`,
+*split* is `BYTE_STREAM_SPLIT` (byte *k* of every value stored together),
+and *delta lengths* is `DELTA_LENGTH_BYTE_ARRAY` (delta-encoded string
+lengths, then the strings back to back).
 
 Fragments are sorted by position in a `fragments.tsv.gz`, so consecutive
-`start` and `end` values differ by little and delta-encode to a few bits.
-The barcode table is sorted by decreasing fragment count, so its counts
-delta-encode the same way. Pages are compressed with ZSTD and written as
-data page v1, which cuDF's chunked reader requires; the footer is not
-compressed. Row groups hold 1,000,000 fragments
-(`row_group_size`), the unit GATAC streams in.
+`start` values differ by little and delta-encode to a few bits. The
+fragment length, a few hundred bases, carries the rest of the coordinates:
+it costs fewer bits than the `end`, whose consecutive values vary more.
+Barcode ids are numbered by decreasing fragment count, so the ids of the
+cells, which hold most fragments, are small, and their high bytes almost
+always 0; lengths and counts too. Byte-stream split puts those bytes
+together, where ZSTD all but removes them, which brings the three columns
+within a few percent of their entropy: dictionary encoding packs every id
+into as many bits as the largest one needs, and ZSTD cannot recover that
+from values that do not start on a byte. The barcode table is sorted by
+decreasing fragment count, so its counts delta-encode the same way. Pages
+are compressed with ZSTD and written as data page v1, which cuDF's chunked
+reader requires; the footer is not compressed. Row groups hold 1,000,000
+fragments (`row_group_size`), the unit GATAC streams in.
+
+```{note}
+`length` and `count` are uint32 although they fit 16 bits: cuDF (26.02)
+fails to decode byte-stream split on uint16, and the two zero bytes take
+almost no space. DuckDB reads byte-stream split integers from version 2.0.
+Files written before lengths were stored hold `end` (and a uint16 `count`)
+and are read the same way.
+```
 
 ### Reading a file outside GATAC
 
 {class}`gatac.io.FragmentFile` gives the fragments back with names. As a
-DuckDB view with the usual columns:
+DuckDB (2.0 or later) view with the usual columns:
 
 ```python
 import duckdb
@@ -152,10 +169,13 @@ columns, and {func}`gatac.io.to_tsv` writes the fragments back to a
 `fragments.tsv.gz` in file order, BGZF-compressed so `tabix` can index it.
 Barcodes keep any prefix added at conversion.
 
-Without GATAC, any Parquet reader gets the ids and the tables:
+Without GATAC, any Parquet reader that decodes byte-stream split
+integers (pyarrow, Polars, cuDF, DuckDB 2.0 or later) gets the ids and the
+tables:
 
 ```python
 import json
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 pf = pq.ParquetFile("pbmc.parquet")
@@ -163,5 +183,6 @@ meta = pf.metadata.metadata
 chroms = json.loads(meta[b"gatac.chroms"])           # chrom_id -> name
 n_barcodes = int(meta[b"gatac.n_barcodes"])
 barcodes = pf.read(columns=["bc_name"])["bc_name"][:n_barcodes]  # barcode_id -> name
-frags = pf.read(columns=["chrom_id", "start", "end", "barcode_id", "count"])
+frags = pf.read(columns=["chrom_id", "start", "length", "barcode_id", "count"])
+end = pc.add(frags["start"], frags["length"])
 ```

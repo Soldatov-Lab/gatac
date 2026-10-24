@@ -30,7 +30,8 @@ def make_parquet(
     Chromosomes and barcodes are stored as integer ids, with an in-file
     barcode table (full original names, fragment and read counts per
     barcode); see :class:`gatac.io.FragmentFile`. Files are written with
-    ZSTD and delta-encoded coordinates, keeping the input row order. The
+    ZSTD, delta-encoded starts and byte-stream split lengths, barcode ids
+    and counts, keeping the input row order. The
     TSV is parsed once by DuckDB into a temporary Parquet next to the
     output (about the size of the gzipped TSV), which is then streamed to
     the writer, so files larger than RAM are fine.

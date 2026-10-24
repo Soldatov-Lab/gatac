@@ -5,8 +5,8 @@ writer behind :func:`gatac.io.make_parquet`.
 Chromosomes and barcodes are integer ids, and the lookup tables travel inside
 the same file::
 
-    chrom_id (uint16)  start (uint32)  end (uint32)  barcode_id (uint32)  count (uint16)
-    bc_name (string)   bc_n_unique (uint32)          bc_n_total (uint32)
+    chrom_id (uint16)  start (uint32)  length (uint32)  barcode_id (uint32)  count (uint32)
+    bc_name (string)   bc_n_unique (uint32)             bc_n_total (uint32)
 
 The ``bc_*`` columns are a per-barcode table aligned on the row number: row
 ``i`` holds barcode id ``i`` (its full original name, its number of fragments
@@ -14,8 +14,12 @@ and its read count) and they are null after the last barcode. Barcode ids are
 ordered by decreasing fragment count. Chromosome names are in the footer
 (``gatac.chroms``), indexed by ``chrom_id``.
 
-Files keep the order of the input fragments and are written with ZSTD and
-delta-encoded coordinates. Reading them never builds a string column on the
+Files keep the order of the input fragments and are written with ZSTD,
+delta-encoded starts, and fragment lengths (``end - start``), barcode ids and
+counts as byte-stream-split integers. Files that store ``end`` instead of
+``length`` (and ``count`` as uint16), as written before, are read the same
+way: readers always return ``end`` and a uint16 ``count``. Reading them never
+builds a string column on the
 GPU: barcodes and chromosomes are joined by integer lookups instead of string
 merges, which is where most of the time of the fragment-streaming functions
 went on deep libraries.
@@ -58,9 +62,9 @@ NAMED_SCHEMA = pa.schema([
 FILE_SCHEMA = pa.schema([
     ("chrom_id", pa.uint16()),
     ("start", pa.uint32()),
-    ("end", pa.uint32()),
+    ("length", pa.uint32()),
     ("barcode_id", pa.uint32()),
-    ("count", pa.uint16()),
+    ("count", pa.uint32()),
     ("bc_name", pa.string()),
     ("bc_n_unique", pa.uint32()),
     ("bc_n_total", pa.uint32()),
@@ -68,6 +72,9 @@ FILE_SCHEMA = pa.schema([
 
 # Stored column behind each logical fragment column
 _STORED_NAME = {"chrom": "chrom_id", "barcode": "barcode_id"}
+# Fragment columns of a file written before lengths were stored: ``end``,
+# and ``count`` as uint16. Both layouts are read.
+_END_COLUMNS = ("chrom_id", "start", "end", "barcode_id", "count")
 
 
 class FragmentFile:
@@ -121,6 +128,8 @@ class FragmentFile:
             )
         self.chroms: List[str] = json.loads(kv[b"gatac.chroms"])
         self.n_barcodes = int(kv[b"gatac.n_barcodes"])
+        # Files written before lengths were stored hold ``end`` instead
+        self._stores_length = "length" in pf.schema_arrow.names
         self._barcodes = None
         self._barcode_index = None
 
@@ -236,6 +245,24 @@ class FragmentFile:
         for i in range(0, n, row_groups_per_batch):
             yield list(range(i, min(i + row_groups_per_batch, n)))
 
+    def _stored_columns(self, logical: Sequence[str]) -> List[str]:
+        """Stored columns to read for the ``logical`` fragment columns."""
+        stored = []
+        for c in logical:
+            if c == "end" and self._stores_length:
+                stored += ["start", "length"]
+            else:
+                stored.append(_STORED_NAME.get(c, c))
+        return list(dict.fromkeys(stored))
+
+    def _fragment_column(self, df: cudf.DataFrame, c: str) -> cp.ndarray:
+        """``start``, ``end`` or ``count`` of a batch read with :meth:`_stored_columns`."""
+        if c == "end" and self._stores_length:
+            return df["start"].values + df["length"].values
+        if c == "count":
+            return df["count"].values.astype(cp.uint16, copy=False)
+        return df[c].values
+
     def iter_batches(
         self,
         columns: Sequence[str] = ("chrom", "start", "end"),
@@ -285,7 +312,7 @@ class FragmentFile:
                    if (c == "chrom" and need_chrom) or (c == "barcode" and need_barcode)
                    or (c in ("start", "end", "count") and c in columns)]
 
-        read_cols = [_STORED_NAME.get(c, c) for c in logical]
+        read_cols = self._stored_columns(logical)
         chrom_lut = cell_lut = None
         if need_chrom:
             if chroms is None:
@@ -314,7 +341,7 @@ class FragmentFile:
                     out["chrom"] = chrom
             for c in ("start", "end", "count"):
                 if c in columns:
-                    out[c] = df[c].values
+                    out[c] = self._fragment_column(df, c)
             if cells is not None:
                 cell = cell_lut[df["barcode_id"].values]
                 keep = cell >= 0 if keep is None else keep & (cell >= 0)
@@ -343,16 +370,20 @@ class FragmentFile:
         """
         columns = list(columns) if columns is not None else list(FRAGMENT_COLUMNS)
         with cudf.option_context("io.parquet.low_memory", low_memory):
-            df = cudf.read_parquet(self.path, columns=[_STORED_NAME.get(c, c) for c in columns])
+            df = cudf.read_parquet(self.path, columns=self._stored_columns(columns))
         out = {}
-        for c in columns:
+        # end first: it is built from start, which is then popped
+        for c in sorted(columns, key=lambda c: c != "end"):
             if c == "chrom":
                 out[c] = _categorical_from_ids(df.pop("chrom_id").values, np.asarray(self.chroms, dtype=object))
             elif c == "barcode":
                 out[c] = _categorical_from_ids(df.pop("barcode_id").values, self.barcodes)
             else:
-                out[c] = df.pop(c)
-        return cudf.DataFrame(out)
+                out[c] = cudf.Series(self._fragment_column(df, c))
+                if c != "end":
+                    df.pop(c)
+        del df
+        return cudf.DataFrame({c: out[c] for c in columns})
 
     def register(self, con: duckdb.DuckDBPyConnection, name: str = "fragments") -> None:
         """
@@ -369,9 +400,10 @@ class FragmentFile:
             "barcode_id": pa.array(np.arange(len(self.barcodes)), pa.uint32()),
             "barcode": pa.array(self.barcodes, pa.string()),
         }))
+        end = '(f.start + f.length)::UINTEGER' if self._stores_length else 'f."end"'
         con.execute(f"""
             CREATE OR REPLACE TEMP VIEW {name} AS
-            SELECT c.chrom, f.start, f."end", b.barcode, f.count
+            SELECT c.chrom, f.start, {end} AS "end", b.barcode, f.count::USMALLINT AS count
             FROM read_parquet('{self.path}') f
             JOIN {name}_chroms c USING (chrom_id)
             JOIN {name}_barcodes b USING (barcode_id)
@@ -385,13 +417,15 @@ class FragmentFile:
         pf = pq.ParquetFile(self.path)
         chrom_names = pa.array(self.chroms, pa.string())
         barcode_names = pa.array(self.barcodes, pa.string())
-        for b in pf.iter_batches(batch_size=batch_size, columns=list(FILE_SCHEMA.names[:5])):
+        stored = list(FILE_SCHEMA.names[:5]) if self._stores_length else list(_END_COLUMNS)
+        for b in pf.iter_batches(batch_size=batch_size, columns=stored):
+            end = pc.add(b.column("start"), b.column("length")) if self._stores_length else b.column("end")
             yield pa.table([
                 chrom_names.take(b.column("chrom_id")),
                 b.column("start"),
-                b.column("end"),
+                end,
                 barcode_names.take(b.column("barcode_id")),
-                b.column("count"),
+                b.column("count").cast(pa.uint16()),
             ], schema=NAMED_SCHEMA)
 
     def to_tsv(
@@ -644,13 +678,20 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
 
     writer = pq.ParquetWriter(
         output_path, FILE_SCHEMA,
-        use_dictionary=["chrom_id", "barcode_id", "count"],
-        column_encoding={"start": "DELTA_BINARY_PACKED", "end": "DELTA_BINARY_PACKED",
+        use_dictionary=["chrom_id"],
+        column_encoding={"start": "DELTA_BINARY_PACKED", "length": "BYTE_STREAM_SPLIT",
+                         "barcode_id": "BYTE_STREAM_SPLIT", "count": "BYTE_STREAM_SPLIT",
                          "bc_name": "DELTA_LENGTH_BYTE_ARRAY", "bc_n_unique": "DELTA_BINARY_PACKED",
                          "bc_n_total": "DELTA_BINARY_PACKED"},
         # Data page v1: cuDF's chunked (low_memory) reader fails on v2 data pages.
         # bc_name is not DELTA_BYTE_ARRAY: with the page index, cuDF (26.02)
         # reads those strings back as NUL bytes.
+        # Byte-stream split stores byte k of every value together: the high
+        # bytes of barcode ids (by decreasing frequency), lengths and counts
+        # are almost always 0 and ZSTD all but removes them, which brings
+        # these columns close to their entropy where dictionary encoding
+        # does not. cuDF (26.02) fails to decode it on uint16, so length and
+        # count are uint32. DuckDB reads it from 2.0.
         compression="zstd",
         write_page_index=True,
         dictionary_pagesize_limit=64 << 20,
@@ -672,9 +713,9 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
             yield pa.table([
                 pa.array(chrom_id, pa.uint16()),
                 chunk["start"].cast(pa.uint32()),
-                chunk["end"].cast(pa.uint32()),
+                _lengths(chunk),
                 pa.array(barcode_id, pa.uint32()),
-                chunk["count"].cast(pa.uint16()),
+                chunk["count"].cast(pa.uint16()).cast(pa.uint32()),
                 pa.concat_arrays([names.slice(lo, hi - lo), pa.nulls(pad, pa.string())]),
                 pa.concat_arrays([n_unique.slice(lo, hi - lo), pa.nulls(pad, pa.uint32())]),
                 pa.concat_arrays([n_total.slice(lo, hi - lo), pa.nulls(pad, pa.uint32())]),
@@ -700,6 +741,15 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
             "gatac.n_barcodes": str(n_bc),
         })
     logger.debug(f"Wrote {n:,} fragments, {n_bc:,} barcodes")
+
+
+def _lengths(chunk: pa.Table) -> pa.ChunkedArray:
+    """Fragment lengths ``end - start`` of a named chunk, as uint32."""
+    start, end = chunk["start"].cast(pa.uint32()), chunk["end"].cast(pa.uint32())
+    try:
+        return pc.subtract_checked(end, start)
+    except pa.ArrowInvalid:
+        raise ValueError("A fragment ends before it starts (end < start)") from None
 
 
 def _encode(values: pa.ChunkedArray, pos: dict, names: list) -> np.ndarray:

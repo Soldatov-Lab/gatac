@@ -13,7 +13,8 @@
   comparison.
 - Parquet fragment format written by `make_parquet` / `gatac convert`:
   chromosome and barcode ids with the barcode table (original names, fragment
-  and read counts) inside the file, ZSTD and delta-encoded coordinates. All
+  and read counts) inside the file, ZSTD, delta-encoded starts and fragment
+  lengths, barcode ids and counts as byte-stream split integers. All
   fragment readers go through the new `io.FragmentFile` and join cells and
   chromosomes by integer lookups.
   On a 484M-fragment library (RTX 5070): `compute_metrics` 51 s -> 9 s,
@@ -67,6 +68,14 @@
   p-value of 1.0 rather than being reported as non-significant.
 
 ### Changed
+
+- Fragment files store the fragment length (`end - start`) instead of `end`,
+  and lengths, barcode ids and counts (now uint32) as byte-stream split
+  integers: PBMC 5k is 369 MB instead of 417 MB (29.2 bits per fragment
+  instead of 33.0), converted as fast and read back identical. Every reader
+  still gives `end` and a uint16 `count`, and files that store `end` are
+  read as before. DuckDB 2.0 is now required: earlier versions cannot read
+  byte-stream split integers, which `FragmentFile.register` relies on.
 
 - Per-barcode fragment counts (`io.FragmentFile.barcode_counts` with `chroms`
   or `mito_chroms`, behind `compute_metrics`, `make_tile_matrix`,

@@ -33,7 +33,7 @@ gatac gene <input.parquet> -g <annotations.gtf>
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-g`, `--gtf` | **required** | GTF (or GFF3) gene annotation file |
-| `-o`, `--output` | `<input>_gene.h5ad` | Output h5ad path |
+| `-o`, `--output` | `<input>_gene_matrix.h5ad` | Output h5ad path |
 | `--id-type` | `gene` | Aggregation level: `gene` or `transcript` |
 | `--upstream` | `2000` | Promoter extension upstream of TSS (bp) |
 | `--downstream` | `0` | Extension downstream of TSS (bp) |

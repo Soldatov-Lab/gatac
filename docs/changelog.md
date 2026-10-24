@@ -69,6 +69,24 @@
 
 ### Changed
 
+- `make_gene_matrix` finds the transcript domains of each insertion with one
+  binary search: the domain starts and ends cut each chromosome into segments
+  that every domain covers a contiguous run of. It checked the last 100
+  domains starting before every insertion, which also missed a long domain
+  once more than 100 others started inside it. PBMC 5k: 19.3 s -> 6.5 s
+  (SnapATAC2 34 s), same GPU memory.
+- `make_gene_matrix` returns the matrix without writing it when
+  `output_path` is None, as `make_tile_matrix` does; it used to write
+  `<input>_gene_matrix.h5ad`. `gatac gene` still writes there by default.
+- `make_gene_matrix` names and counts genes as SnapATAC2's
+  `make_gene_matrix` does: by gene name, so genes sharing a name (5S_rRNA,
+  Y_RNA, ...) are one column holding, per cell, the count of the most
+  accessible of their transcripts, and columns come in order of first
+  appearance in the annotation. They were one column per gene ID, named
+  `<name>_<id>` when names repeated, sorted by ID. With
+  `id_type="transcript"` the columns are named by transcript ID. On PBMC 5k
+  the matrix now equals SnapATAC2's entry for entry (60,606 genes; was 61,806,
+  1,277 of them in 77 repeated names).
 - Fragment files store the fragment length (`end - start`) instead of `end`,
   and lengths, barcode ids and counts (now uint32) as byte-stream split
   integers: PBMC 5k is 369 MB instead of 417 MB (29.2 bits per fragment

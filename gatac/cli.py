@@ -293,10 +293,16 @@ def gene_command(args):
         sys.exit(1)
 
     try:
+        output_path = args.output
+        if output_path is None:
+            output_path = input_path.with_suffix('').with_name(
+                input_path.stem + '_gene_matrix.h5ad'
+            )
+
         make_gene_matrix(
             input_parquet=input_path,
             gene_anno=gtf_path,
-            output_path=args.output,
+            output_path=output_path,
             id_type=args.id_type,
             upstream=args.upstream,
             downstream=args.downstream,

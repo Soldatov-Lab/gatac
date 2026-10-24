@@ -91,8 +91,11 @@ def load_gene_annotation(
     Returns
     -------
     pd.DataFrame
-        DataFrame with columns: ['chrom', 'start', 'end', 'name', 'id', 'strand']
-        where start/end define the regulatory domain.
+        One row per transcript with columns ['chrom', 'start', 'end', 'name',
+        'id', 'gene_name', 'strand', 'feature', 'order'], where start/end
+        define the regulatory domain, 'feature' is what the transcript counts
+        for (its gene name for ``id_type="gene"``, as SnapATAC2 keys genes by
+        name; its transcript ID otherwise) and 'order' its row in the file.
     """
     logger.info(f"Loading gene annotation from {gtf_path}")
 
@@ -109,6 +112,7 @@ def load_gene_annotation(
     # Set name/id based on id_type, and drop rows with missing name or id
     level = "gene" if id_type == "gene" else "transcript"
     df["name"], df["id"] = df[f"{level}_name"], df[f"{level}_id"]
+    df["order"] = np.arange(len(df))
     df = df[df["name"].notna() & df["id"].notna()]
 
     # Compute regulatory domain
@@ -139,6 +143,8 @@ def load_gene_annotation(
         "id": df["id"].to_numpy(),
         "gene_name": df["gene_name"].to_numpy(),
         "strand": df["strand"].to_numpy(),
+        "feature": df["name" if id_type == "gene" else "id"].to_numpy(),
+        "order": df["order"].to_numpy(),
     })
 
     # Deduplicate by (chrom, start, end, id) - transcripts with same region
@@ -281,23 +287,17 @@ def create_gene_matrix_gpu(
     gene_df = gene_df.reset_index(drop=True)
     gene_df['gene_idx'] = cp.arange(len(gene_df))
     
-    # Check if we should aggregate by gene_name (SnapATAC2 default for id_type='gene')
-    # If the user requested transcript-level (id_type='transcript'), we don't aggregate.
-    # We can detect this by checking if 'id' and 'gene_name' are different for any row,
-    # or more simply, if gene_regions has 'transcript_id' info but was filtered.
-    # Actually, load_gene_annotation already sets 'id' and 'name' appropriately.
-    # Consistency with SnapATAC2: if id_type='gene', we take MAX across transcripts.
-    # If id_type='transcript', 'id' is transcript_id.
-    
-    # Create feature mapping
-    # By default, use 'id' as the unique feature identifier
-    unique_features = gene_df[['id']].drop_duplicates().sort_values('id').reset_index(drop=True)
+    # Features as SnapATAC2 makes them: one per gene name (genes sharing a
+    # name are one feature) or per transcript ID, in order of first
+    # appearance in the annotation
+    unique_features = (gene_df.groupby('feature').agg({'order': 'min'}).reset_index()
+                       .sort_values('order').reset_index(drop=True)[['feature']])
     unique_features['final_feature_idx'] = cp.arange(len(unique_features))
     n_final_features = len(unique_features)
     
     # Build gene_idx -> final_feature_idx mapping
-    gene_to_final = gene_df[['gene_idx', 'id']].merge(
-        unique_features, on='id', how='left'
+    gene_to_final = gene_df[['gene_idx', 'feature']].merge(
+        unique_features, on='feature', how='left'
     )
     
     logger.debug(f"Computing matrix: {n_cells} cells × {n_final_features} features")
@@ -328,14 +328,13 @@ def create_gene_matrix_gpu(
         if not in_chrom.any():
             continue
         gene_data = chrom_gene_data[chrom]
-        transcript_counts = _find_fragment_gene_overlaps_streaming(
+        transcript_counts = _count_fragment_gene_overlaps(
             fragments_df['start'].values[in_chrom],
             fragments_df['end'].values[in_chrom],
             frag_cells[in_chrom],
             gene_data['starts'],
             gene_data['ends'],
             gene_data['indices'],
-            chunk_size=200_000,  # Smaller chunks for memory efficiency
         )
         if len(transcript_counts) == 0:
             continue
@@ -372,18 +371,20 @@ def create_gene_matrix_gpu(
     else:
         matrix = matrix.astype(np.uint8)
 
-    # Prepare gene metadata (unique features): chrom, names and strand of the
-    # feature's first transcript in annotation order, and the span of its
+    # Prepare gene metadata (unique features): chrom, names, ID and strand of
+    # the feature's first transcript in the annotation, and the span of its
     # transcripts' domains on that chromosome, the region whose fragments
     # count for it. (groupby.first picked an arbitrary transcript.)
-    first = gene_df.groupby('id').agg({'gene_idx': 'min'}).reset_index()
-    gene_metadata = gene_df[['gene_idx', 'chrom', 'name', 'strand', 'gene_name']].merge(first, on='gene_idx')
-    span = (gene_df[['id', 'chrom', 'start', 'end']]
-            .merge(gene_metadata[['id', 'chrom']], on=['id', 'chrom'])
-            .groupby('id').agg({'start': 'min', 'end': 'max'}).reset_index())
-    gene_metadata = gene_metadata.merge(span, on='id').merge(unique_features, on='id', how='left')
+    first = gene_df.groupby('feature').agg({'order': 'min'}).reset_index()
+    gene_metadata = gene_df[['order', 'feature', 'chrom', 'name', 'id', 'strand', 'gene_name']].merge(
+        first, on=['feature', 'order'])
+    span = (gene_df[['feature', 'chrom', 'start', 'end']]
+            .merge(gene_metadata[['feature', 'chrom']], on=['feature', 'chrom'])
+            .groupby('feature').agg({'start': 'min', 'end': 'max'}).reset_index())
+    gene_metadata = gene_metadata.merge(span, on='feature').merge(unique_features, on='feature', how='left')
     gene_metadata = gene_metadata.sort_values('final_feature_idx').reset_index(drop=True)
-    gene_metadata = gene_metadata[['chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name', 'final_feature_idx']]
+    gene_metadata = gene_metadata[['feature', 'chrom', 'start', 'end', 'name', 'id', 'strand', 'gene_name',
+                                   'final_feature_idx']]
     gene_metadata = gene_metadata.rename(columns={'final_feature_idx': 'gene_idx'})
 
     logger.debug(f"Matrix: {n_cells} cells × {n_final_features} features, nnz: {matrix.nnz:,}")
@@ -401,98 +402,106 @@ def create_gene_matrix_gpu(
     return matrix, cell_metadata, gene_metadata
 
 
-def _find_fragment_gene_overlaps_streaming(
+def _expand_segments(
+    seg: cp.ndarray,
+    cov_ptr: cp.ndarray,
+    cov_transcript: cp.ndarray,
+) -> Tuple[cp.ndarray, cp.ndarray]:
+    """Row and transcript of every (row, transcript covering ``seg[row]``) pair."""
+    n = cov_ptr[seg + 1] - cov_ptr[seg]
+    ends = cp.cumsum(n)
+    total = int(ends[-1]) if len(ends) else 0
+    k = cp.arange(total, dtype=cp.int64)
+    row = cp.searchsorted(ends, k, side='right')
+    return row, cov_transcript[cov_ptr[seg[row]] + k - (ends - n)[row]]
+
+
+def _count_fragment_gene_overlaps(
     frag_starts: cp.ndarray,
     frag_ends: cp.ndarray,
     cell_indices: cp.ndarray,
     gene_starts: cp.ndarray,
     gene_ends: cp.ndarray,
     gene_indices: cp.ndarray,
-    chunk_size: int = 500_000,
+    chunk_size: int = 5_000_000,
 ) -> cudf.DataFrame:
     """
-    Find all (cell, gene) overlaps using streaming 2D window approach.
-    
-    For each insertion (start and end-1), finds overlapping gene regions using
-    searchsorted to find an anchor point, then looks backward through a window
-    of candidate genes and validates overlaps. A fragment counts once for a
-    gene that both of its insertions fall in.
+    Paired-insertion counts per (cell, transcript domain) on one chromosome.
+
+    The domain starts and ends cut the chromosome into segments, each covered
+    by a fixed set of domains, and every domain covers a contiguous run of
+    them. An insertion (the fragment start, and its end - 1) finds its segment
+    with one binary search; the fragments are counted per cell and segment,
+    and each count goes to the domains covering the segment. A fragment counts
+    once for a domain that holds both its insertions: the end insertion's
+    segment adds only the domains that miss the start's. Fragments are taken
+    ``chunk_size`` at a time.
 
     Returns aggregated (cell_idx, gene_idx, count) DataFrame.
     """
-    n_fragments = len(frag_starts)
-    n_genes = len(gene_starts)
-    
-    if n_fragments == 0 or n_genes == 0:
-        return cudf.DataFrame({'cell_idx': cp.array([], dtype=cp.int32),
-                               'gene_idx': cp.array([], dtype=cp.int32),
-                               'count': cp.array([], dtype=cp.int32)})
-    
-    all_pairs_cells = []
-    all_pairs_genes = []
+    empty = cudf.DataFrame({'cell_idx': cp.array([], dtype=cp.int32),
+                            'gene_idx': cp.array([], dtype=cp.int32),
+                            'count': cp.array([], dtype=cp.int32)})
+    if len(frag_starts) == 0 or len(gene_starts) == 0:
+        return empty
 
-    # Small window - SnapATAC2 uses 100
-    max_check = 100
-    offsets = cp.arange(max_check, dtype=cp.int32)
+    # Segments [bounds[i], bounds[i + 1]); domain t covers segments
+    # first[t] .. last[t] - 1, listed per segment in cov_transcript
+    gene_starts = cp.asarray(gene_starts, dtype=cp.int64)
+    gene_ends = cp.asarray(gene_ends, dtype=cp.int64)
+    bounds = cp.unique(cp.concatenate([gene_starts, gene_ends]))
+    n_seg = len(bounds) - 1
+    first = cp.searchsorted(bounds, gene_starts)
+    last = cp.searchsorted(bounds, gene_ends)
+    span = last - first
+    span_end = cp.cumsum(span)
+    k = cp.arange(int(span_end[-1]), dtype=cp.int64)
+    transcript = cp.searchsorted(span_end, k, side='right')
+    seg = first[transcript] + k - (span_end - span)[transcript]
+    order = cp.argsort(seg)
+    cov_transcript = transcript[order]
+    cov_ptr = cp.searchsorted(seg[order], cp.arange(n_seg + 1))
+    del transcript, seg, order, k
 
-    for chunk_start in range(0, n_fragments, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, n_fragments)
+    def segment_of(pos):
+        s = cp.searchsorted(bounds, pos, side='right') - 1
+        return cp.where((s >= 0) & (s < n_seg), s, -1)
 
-        starts = frag_starts[chunk_start:chunk_end]
-        ends = frag_ends[chunk_start:chunk_end] - 1  # Convert to insertion position
-        cells = cell_indices[chunk_start:chunk_end]
-        n_frag = len(starts)
+    gene_indices = cp.asarray(gene_indices)
+    counts = []
+    for lo in range(0, len(frag_starts), chunk_size):
+        hi = min(lo + chunk_size, len(frag_starts))
+        cells = cp.asarray(cell_indices[lo:hi], dtype=cp.int64)
+        s1 = segment_of(cp.asarray(frag_starts[lo:hi], dtype=cp.int64))
+        s2 = segment_of(cp.asarray(frag_ends[lo:hi], dtype=cp.int64) - 1)
 
-        # Both insertions
-        positions = cp.concatenate([starts, ends])
-        pos_cells = cp.concatenate([cells, cells])
+        # The domains holding the start insertion
+        hit = s1 >= 0
+        key, n = cp.unique(cells[hit] * n_seg + s1[hit], return_counts=True)
+        row, t = _expand_segments(key % n_seg, cov_ptr, cov_transcript)
+        cell_parts, t_parts, n_parts = [(key // n_seg)[row]], [t], [n[row]]
 
-        # searchsorted on gene_starts: index of first gene with start > position
-        right_idx = cp.searchsorted(gene_starts, positions, side='right')
-        
-        # Create 2D candidate indices: (n_pos, max_check)
-        # candidate[i,j] = right_idx[i] - 1 - j
-        cand_idx = right_idx[:, None] - 1 - offsets[None, :]  # (n_pos, max_check)
-        
-        # Clip to valid range and mark invalid
-        valid = (cand_idx >= 0) & (cand_idx < n_genes)
-        cand_idx_safe = cp.clip(cand_idx, 0, n_genes - 1)
-        
-        # Look up gene ends for candidates
-        cand_ends = gene_ends[cand_idx_safe]
-        
-        # Overlap: gene_start <= pos (guaranteed by searchsorted) AND gene_end > pos
-        overlaps = valid & (cand_ends > positions[:, None])
-        # A gene the end insertion falls in also holds the start insertion
-        # exactly when it starts at or before it (start <= end - 1 < gene_end,
-        # and such a gene is in the start's window too): count the fragment
-        # once, from its start
-        overlaps[n_frag:] &= ((gene_starts[cand_idx_safe[n_frag:]] > starts[:, None])
-                              | (ends < starts)[:, None])
+        # The domains holding the end insertion and not the start one
+        hit = (s2 >= 0) & (s2 != s1)
+        key, n = cp.unique((cells[hit] * (n_seg + 1) + s1[hit] + 1) * n_seg + s2[hit],
+                           return_counts=True)
+        row, t = _expand_segments(key % n_seg, cov_ptr, cov_transcript)
+        start_seg = ((key // n_seg) % (n_seg + 1) - 1)[row]
+        keep = (first[t] > start_seg) | (last[t] <= start_seg)
+        cell_parts.append((key // n_seg // (n_seg + 1))[row][keep])
+        t_parts.append(t[keep])
+        n_parts.append(n[row][keep])
+        del cells, s1, s2, hit, key, n, row, t, start_seg, keep
 
-        # Extract overlapping pairs
-        row_idx, col_idx = cp.where(overlaps)
-        if len(row_idx) > 0:
-            all_pairs_cells.append(pos_cells[row_idx])
-            all_pairs_genes.append(gene_indices[cand_idx_safe[row_idx, col_idx]])
+        counts.append(cudf.DataFrame({
+            'cell_idx': cp.concatenate(cell_parts).astype(cp.int32),
+            'gene_idx': gene_indices[cp.concatenate(t_parts)].astype(cp.int32),
+            'count': cp.concatenate(n_parts).astype(cp.int32),
+        }).groupby(['cell_idx', 'gene_idx']).sum().reset_index())
 
-        del positions, pos_cells, right_idx, cand_idx, cand_idx_safe, cand_ends, overlaps
-
-    if len(all_pairs_cells) == 0:
-        return cudf.DataFrame({'cell_idx': cp.array([], dtype=cp.int32),
-                               'gene_idx': cp.array([], dtype=cp.int32),
-                               'count': cp.array([], dtype=cp.int32)})
-
-    # Count per (cell, gene); each (fragment, gene) pair is already listed once
-    pairs_df = cudf.DataFrame({
-        'cell_idx': cp.concatenate(all_pairs_cells),
-        'gene_idx': cp.concatenate(all_pairs_genes),
-    })
-    counts = pairs_df.groupby(['cell_idx', 'gene_idx']).size().reset_index(name='count')
-
-    del all_pairs_cells, all_pairs_genes, pairs_df
-
-    return counts
+    if len(counts) == 1:
+        return counts[0]
+    return cudf.concat(counts, ignore_index=True).groupby(['cell_idx', 'gene_idx']).sum().reset_index()
 
 
 def gene_matrix_to_anndata(
@@ -524,13 +533,8 @@ def gene_matrix_to_anndata(
     obs.index = obs['barcode'].values
 
     var = gene_metadata.to_pandas()
-    # Use gene name as index (with ID as backup for duplicates)
-    var.index = var['name'].values
-    # Handle duplicate gene names by appending ID
-    if var.index.duplicated().any():
-        dup_mask = var.index.duplicated(keep=False)
-        var.loc[dup_mask, 'index'] = var.loc[dup_mask, 'name'] + '_' + var.loc[dup_mask, 'id']
-        var.index = var['index'].fillna(var['name']).values
+    # Gene names, or transcript IDs, as SnapATAC2 names its features
+    var.index = var.pop('feature').values
 
     adata = sc.AnnData(X=matrix, obs=obs, var=var)
     logger.debug(f"Created AnnData: {adata.shape[0]} cells × {adata.shape[1]} genes")
@@ -574,9 +578,13 @@ def make_gene_matrix(
     gene_anno : str or Path
         Path to GTF/GFF gene annotation file.
     output_path : str or Path, optional
-        Path for output .h5ad file. If None, uses input filename.
+        Path for output .h5ad file. If None, the matrix is only returned.
     id_type : str
         "gene" or "transcript" - which feature type to use (default: "gene").
+        As in SnapATAC2, genes are named and counted by gene name: genes
+        sharing a name are one column, counting a cell's fragments in the
+        most accessible of their transcripts. Transcripts are named by
+        transcript ID.
     upstream : int
         Base pairs upstream of TSS to include (default: 2000).
     downstream : int
@@ -632,11 +640,7 @@ def make_gene_matrix(
     input_parquet = Path(input_parquet)
     gene_anno = Path(gene_anno)
     
-    if output_path is None:
-        output_path = input_parquet.with_suffix('').with_name(
-            input_parquet.stem + '_gene_matrix.h5ad'
-        )
-    else:
+    if output_path is not None:
         output_path = Path(output_path)
 
     # Load gene annotation
@@ -703,9 +707,12 @@ def make_gene_matrix(
     if barcode_prefix:
         adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
 
-    # Save
-    adata.write_h5ad(str(output_path))
     total_time = time.perf_counter() - start_time
-    logger.info(f"Created {output_path.name}: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes ({total_time:.1f}s)")
+    if output_path is not None:
+        adata.write_h5ad(str(output_path))
+        total_time = time.perf_counter() - start_time
+        logger.info(f"Created {output_path.name}: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes ({total_time:.1f}s)")
+    else:
+        logger.info(f"Gene matrix: {adata.shape[0]:,} cells × {adata.shape[1]:,} genes ({total_time:.1f}s)")
 
     return adata

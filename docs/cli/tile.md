@@ -31,7 +31,7 @@ gatac tile <input.parquet|input.h5ad|input.h5> -g <genome|chr_sizes>
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-g`, `--genome` | **required** | Genome name (`hg38`, `mm10`, …) or path to a 2-column TSV of `chrom\tsize` |
-| `-o`, `--output` | `<input>_tile.h5ad` | Output h5ad path |
+| `-o`, `--output` | `<input>_tile_matrix.h5ad` | Output h5ad path |
 | `-t`, `--tile-size` | `5000` | Tile / bin size in base pairs |
 | `-m`, `--min-fragments` | `100` | Minimum unique fragments per barcode |
 | `-e`, `--exclude-chroms` | `chrM chrY M Y` | Chromosomes to exclude (space-separated) |

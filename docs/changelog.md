@@ -169,6 +169,16 @@
   as `tobias.footprint` already did: chromosomes named `1`, `2`, ... were read
   as integers and matched no fragment.
 - The `peak.markers` example filtered its pandas result with Polars syntax.
+- `motif.enrichment` matches the same regions as SnapATAC2's
+  `motif_enrichment` again, so fold changes and p-values agree to rounding: it
+  turns `pvalue` into a score threshold with SnapATAC2's score distribution
+  and gives zero probabilities SnapATAC2's 1e-4 pseudocount. It had been
+  using the right-tail threshold and 1e-10 floor written for chromVAR's
+  motifmatchr parity, which keep fewer sites of motifs with few distinct
+  scores; on PBMC 5k, 230 of 1,165 cisBP motifs matched other regions and
+  the fold-change correlation fell to 0.978. `motif.scan` and
+  `presence_matrix` are unchanged. The thresholds are computed on all
+  allocated cores (1,165 motifs in about 2 s on 6).
 
 - `peak.merge` gives SnapATAC2's `merge_peaks` peaks: among equally
   significant overlapping peaks it keeps the last in position order, as

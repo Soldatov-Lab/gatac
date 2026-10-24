@@ -9,8 +9,10 @@ enrichment but with CUDA acceleration.
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, Optional, Union
@@ -329,7 +331,7 @@ class DNAMotif:
     def to_log_odds(
         self, 
         bg_probs: tuple[float, float, float, float] = (0.25, 0.25, 0.25, 0.25),
-        mode: Literal["gatac", "motifmatchr"] = "gatac",
+        mode: Literal["gatac", "motifmatchr", "snapatac2"] = "gatac",
         pseudocount: float = 0.8,
     ) -> np.ndarray:
         """
@@ -339,8 +341,10 @@ class DNAMotif:
         ----------
         bg_probs : tuple
             Background nucleotide probabilities (A, C, G, T)
-        mode : {"gatac", "motifmatchr"}, default "gatac"
+        mode : {"gatac", "motifmatchr", "snapatac2"}, default "gatac"
             - "gatac": Natural log-odds with minimal pseudocount
+            - "snapatac2": Natural log-odds after SnapATAC2's pseudocount:
+              zero probabilities become 1e-4 and each row is renormalised
             - "motifmatchr": Log2-odds matching MOODS/motifmatchr scoring.
               When raw counts (``pfm``) are available, applies a
               MOODS-compatible pseudocount:
@@ -372,6 +376,13 @@ class DNAMotif:
             log_odds = np.log2(prob / even)
             adj = np.log2(bg) - np.log2(even)
             return log_odds + adj
+        elif mode == "snapatac2":
+            # Zeros were floored at 1e-10 on construction, then divided by a
+            # row sum that can be just under 1; SnapATAC2 sets them to 1e-4
+            # instead (DNAMotif::add_pseudocount)
+            prob = np.where(self.pwm < 1e-9, 1e-4, self.pwm)
+            prob = prob / prob.sum(axis=1, keepdims=True)
+            return np.log(prob / bg)
         else:
             # Original GATAC mode: simple natural log-odds
             return np.log(self.pwm / bg)
@@ -759,6 +770,77 @@ def _compute_score_threshold(
     """
     bg = np.array(bg_probs, dtype=np.float64)
     return _compute_score_threshold_jit(pwm_log_odds, bg, pvalue, precision)
+
+
+@njit(cache=True, nogil=True)
+def _snapatac2_score_threshold_jit(
+    pwm_log_odds: np.ndarray,
+    bg: np.ndarray,
+    pvalue: float,
+) -> float:
+    """
+    Score threshold as SnapATAC2 2.9 computes it (``ScoreCDF`` in
+    snapatac2-core/src/motif.rs).
+
+    The score distribution is built position by position on a grid of at
+    most 200,000 bins of width >= 1e-5 spanning the reachable scores, each
+    bin standing for its midpoint. The threshold is the score at which the
+    CDF reaches ``1 - pvalue``, interpolated linearly between the two
+    neighbouring points of the CDF once runs of equal values are reduced to
+    their first and last point. When the scores are coarse (few distinct
+    values) the interpolation lands below the next score up, so a match
+    needs a lower score than :func:`_compute_score_threshold_jit` asks for.
+    """
+    accum = np.ones(1)
+    lowest = 0.0
+    step = 0.0
+    for pos in range(pwm_log_odds.shape[0]):
+        row = pwm_log_odds[pos]
+        occupied = np.flatnonzero(accum)
+        lo = (occupied[0] + 0.5) * step + lowest + row.min()
+        hi = (occupied[-1] + 0.5) * step + lowest + row.max()
+        if lo >= hi:
+            continue
+        num_bins = int(min(np.ceil((hi - lo) / 1e-5), 200000.0))
+        new_step = (hi - lo) / num_bins
+        new_accum = np.zeros(num_bins)
+        for i in occupied:
+            score = (i + 0.5) * step + lowest
+            for j in range(4):
+                idx = int(np.floor((score + row[j] - lo) / new_step))
+                new_accum[min(max(idx, 0), num_bins - 1)] += accum[i] * bg[j]
+        accum = new_accum
+        lowest = lo
+        step = new_step
+
+    cdf = np.cumsum(accum)
+    n = cdf.shape[0]
+    keep = np.zeros(n, dtype=np.bool_)
+    for i in range(n):
+        keep[i] = i == 0 or i == n - 1 or cdf[i] != cdf[i - 1] or cdf[i] != cdf[i + 1]
+    points = np.flatnonzero(keep)
+    scores = (points + 0.5) * step + lowest
+    cdf = cdf[points]
+
+    p = 1.0 - pvalue
+    i = np.searchsorted(cdf, p)
+    if i == 0:
+        return scores[0]
+    if i >= cdf.shape[0]:
+        return scores[-1]
+    w = (p - cdf[i - 1]) / (cdf[i] - cdf[i - 1])
+    return (1.0 - w) * scores[i - 1] + w * scores[i]
+
+
+def _snapatac2_score_thresholds(
+    pwm_list: list[np.ndarray],
+    bg: np.ndarray,
+    pvalue: float,
+) -> np.ndarray:
+    """:func:`_snapatac2_score_threshold_jit` for each motif, one thread per allocated core."""
+    with ThreadPoolExecutor(max(1, len(os.sched_getaffinity(0)))) as ex:
+        thresholds = ex.map(lambda pwm: _snapatac2_score_threshold_jit(pwm, bg, pvalue), pwm_list)
+        return np.fromiter(thresholds, dtype=np.float64, count=len(pwm_list))
 
 
 def _scan_motif_gpu(
@@ -1282,7 +1364,11 @@ def enrichment(
         Statistical test method. If None, uses "hypergeometric" when
         background is None (subset testing), else "binomial".
     pvalue : float, default 1e-5
-        P-value threshold for motif matching
+        P-value threshold for motif matching. It is turned into a score
+        threshold, and zero probabilities into scores, as in
+        ``snapatac2.tl.motif_enrichment``, so both report the same matches.
+        For motifs with few distinct scores, such as near-deterministic
+        sites, that threshold also admits sites one base off the consensus.
     check_rc : bool, default True
         Whether to check both strands (forward and reverse complement)
     bg_probs : {"auto", "subject", "even"} or tuple, default (0.25, 0.25, 0.25, 0.25)
@@ -1376,16 +1462,14 @@ def enrichment(
     
     resolved_bg_probs = _resolve_bg_probs(bg_probs, sequences)
 
-    # OPTIMIZATION: Precompute all thresholds using Numba JIT
+    # Scores and thresholds as snap.tl.motif_enrichment computes them, so the
+    # same motifs match the same regions
     logger.info("Precomputing score thresholds for all motifs...")
     
-    pwm_list = [motif.to_log_odds(resolved_bg_probs) for motif in motifs]
+    pwm_list = [motif.to_log_odds(resolved_bg_probs, mode="snapatac2") for motif in motifs]
     bg_array = np.array(resolved_bg_probs, dtype=np.float64)
     
-    # Compute thresholds using JIT-compiled function (parallelizable)
-    thresholds = np.empty(len(motifs), dtype=np.float64)
-    for i, pwm in enumerate(pwm_list):
-        thresholds[i] = _compute_score_threshold_jit(pwm, bg_array, pvalue, 1e-4)
+    thresholds = _snapatac2_score_thresholds(pwm_list, bg_array, pvalue)
     
     logger.info(f"Scanning {len(motifs)} motifs across {len(all_regions)} regions...")
     

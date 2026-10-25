@@ -79,6 +79,20 @@ def test_chunked_matches_resident(selected, name):
 
 
 @pytest.mark.parametrize("name", list(EMBEDDINGS))
+def test_chunked_reads_int64_indices(selected, name):
+    """scipy stores int64 indices once nnz passes the int32 range; the chunks must read them as such."""
+    fn, key = EMBEDDINGS[name]
+    ref = selected.copy()
+    fn(ref, features=None)
+    X = selected.X.tocsr()
+    X.indices, X.indptr = X.indices.astype(np.int64), X.indptr.astype(np.int64)
+    selected.X = X
+    # no feature subset: slicing would hand the chunks int32 indices again
+    fn(selected, features=None, chunk_size=50)
+    assert _abs_corr(selected.obsm[key], ref.obsm[key]).min() > 0.9999
+
+
+@pytest.mark.parametrize("name", list(EMBEDDINGS))
 def test_cell_without_signal_raises(selected, name):
     """A cell with nothing in the selected features raises instead of becoming a degenerate row."""
     fn, _ = EMBEDDINGS[name]

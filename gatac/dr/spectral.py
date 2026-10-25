@@ -338,7 +338,8 @@ def _spectral_chunked(
         n_rows = end - start
 
         d_data = cp.asarray(X_cpu.data[data_s:data_e])
-        d_indices = cp.asarray(X_cpu.indices[data_s:data_e])
+        # the kernel reads int32; scipy stores int64 indices once nnz needs them
+        d_indices = cp.asarray(X_cpu.indices[data_s:data_e], dtype=cp.int32)
         d_indptr = cp.asarray(
             (X_cpu.indptr[start : end + 1] - data_s).astype(np.int32)
         )

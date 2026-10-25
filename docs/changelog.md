@@ -180,6 +180,10 @@
 
 ### Fixed
 
+- `dr.spectral` streaming the matrix in chunks (any `chunk_size`, and by
+  default on large datasets) read int64 indices as int32, which scipy uses
+  once the number of non-zeros exceeds the int32 range, and gave most entries
+  the wrong IDF weight. The embedding now matches SnapATAC2's.
 - `make_tile_matrix`, `make_gene_matrix` and `make_gene_score_matrix` accept
   a pandas `metrics` DataFrame (raised `TypeError`).
 - BED inputs (`peak.make_matrix(peak_file=)`, `detect_doublets(repeat_filter=)`)

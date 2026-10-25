@@ -134,12 +134,14 @@ def make_parquet_batch(
     separator: str = '\t',
     barcode_prefix: Optional[str | Sequence[str]] = None,
     row_group_size: int = 1_000_000,
+    file_prefix: Optional[str | Sequence[str]] = None,
 ) -> list[Path]:
     """
     Convert multiple ATAC fragment TSV.GZ files to Parquet in parallel.
 
     Each file is processed in a separate worker process, so DuckDB can
-    use all available CPU cores across files simultaneously.
+    use all available CPU cores across files simultaneously. Files are
+    started largest first, so that the largest do not run alone at the end.
 
     Parameters
     ----------
@@ -158,6 +160,11 @@ def make_parquet_batch(
         per input file.
     row_group_size : int
         Row-group size forwarded to :func:`make_parquet`.
+    file_prefix : str or list of str, optional
+        Prepended to each output file name: one for all files, or one per
+        input file. Cell Ranger names every sample's file
+        ``atac_fragments.tsv.gz``, so with *output_dir* the outputs collide
+        unless each gets its own prefix.
 
     Returns
     -------
@@ -166,6 +173,8 @@ def make_parquet_batch(
 
     Raises
     ------
+    ValueError
+        If two inputs would be written to the same output path.
     Exception
         Re-raises the first worker exception encountered so the caller
         can handle it.
@@ -183,24 +192,45 @@ def make_parquet_batch(
     ...     ["sampleA.tsv.gz", "sampleB.tsv.gz"],
     ...     barcode_prefix=["A_", "B_"],
     ... )
+    >>> # Cell Ranger outputs, all named atac_fragments.tsv.gz: prefix the
+    >>> # output files and the barcodes with the sample
+    >>> paths = ga.io.make_parquet_batch(
+    ...     ["A/outs/atac_fragments.tsv.gz", "B/outs/atac_fragments.tsv.gz"],
+    ...     output_dir="parquet/",
+    ...     file_prefix=["A_", "B_"],
+    ...     barcode_prefix=["A_", "B_"],
+    ... )
     """
     input_paths = [Path(p) for p in input_paths]
-    if isinstance(barcode_prefix, str) or barcode_prefix is None:
-        prefixes = [barcode_prefix] * len(input_paths)
-    else:
-        prefixes = list(barcode_prefix)
-        if len(prefixes) != len(input_paths):
-            raise ValueError(f"{len(prefixes)} barcode prefixes for {len(input_paths)} input files")
 
+    def per_file(value, what):
+        if isinstance(value, str) or value is None:
+            return [value or ""] * len(input_paths)
+        values = list(value)
+        if len(values) != len(input_paths):
+            raise ValueError(f"{len(values)} {what} for {len(input_paths)} input files")
+        return values
+
+    prefixes = [p or None for p in per_file(barcode_prefix, "barcode prefixes")]
+    file_prefixes = per_file(file_prefix, "file prefixes")
+
+    # Next to each input unless output_dir is given, as make_parquet does
+    output_paths = [
+        (Path(output_dir) if output_dir is not None else p.parent)
+        / (fp + p.with_suffix('').with_suffix('.parquet').name)
+        for p, fp in zip(input_paths, file_prefixes)
+    ]
+    seen: dict[Path, Path] = {}
+    for inp, out in zip(input_paths, output_paths):
+        key = out.resolve()
+        if key in seen:
+            raise ValueError(
+                f"{seen[key]} and {inp} would both be written to {out}; "
+                "give each file its own file_prefix"
+            )
+        seen[key] = inp
     if output_dir is not None:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_paths: list[Optional[Path]] = [
-            output_dir / p.with_suffix('').with_suffix('.parquet').name
-            for p in input_paths
-        ]
-    else:
-        output_paths = [None] * len(input_paths)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     n_workers = min(
         len(input_paths),
@@ -211,19 +241,23 @@ def make_parquet_batch(
         f"Converting {len(input_paths)} file(s) with {n_workers} worker(s)"
     )
 
+    # Largest first, so that the largest files do not run alone at the end
+    sizes = [os.path.getsize(p) for p in input_paths]
+    order = sorted(range(len(input_paths)), key=lambda i: -sizes[i])
+
     results: list[Optional[Path]] = [None] * len(input_paths)
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
         future_to_idx = {
             executor.submit(
                 make_parquet,
-                inp,
-                out,
+                input_paths[i],
+                output_paths[i],
                 separator,
-                prefix,
+                prefixes[i],
                 row_group_size,
             ): i
-            for i, (inp, out, prefix) in enumerate(zip(input_paths, output_paths, prefixes))
+            for i in order
         }
         for future in as_completed(future_to_idx):
             i = future_to_idx[future]

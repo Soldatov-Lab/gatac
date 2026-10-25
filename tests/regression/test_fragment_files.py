@@ -200,6 +200,21 @@ def test_batch_prefixes_and_no_partial_file(data, tmp_path):
     assert not target.exists() and not list(tmp_path.glob("bad.parquet*"))
 
 
+def test_batch_same_file_names(data, tmp_path):
+    # Cell Ranger names every sample's file atac_fragments.tsv.gz
+    inputs = []
+    for sample in ("A", "B"):
+        (tmp_path / sample).mkdir()
+        inputs.append(tmp_path / sample / "atac_fragments.tsv.gz")
+        shutil.copy(data["tsv"], inputs[-1])
+    with pytest.raises(ValueError, match="file_prefix"):
+        ga.io.make_parquet_batch(inputs, output_dir=tmp_path / "out", workers=2)
+    assert not (tmp_path / "out").exists()
+    outs = ga.io.make_parquet_batch(inputs, output_dir=tmp_path / "out", workers=2,
+                                    file_prefix=["A_", "B_"])
+    assert [p.name for p in outs] == ["A_atac_fragments.parquet", "B_atac_fragments.parquet"]
+    assert all(p.exists() for p in outs)
+
 
 def test_to_tsv_round_trip(data, tmp_path):
     cols = list(data["df"].columns)
@@ -266,6 +281,7 @@ def test_filter_with_metrics(data):
     counts = ff.barcode_counts().set_index("barcode").loc[exp.index]
     assert ff.n_barcodes == len(exp)
     assert np.array_equal(counts["n_unique"], exp["size"]) and np.array_equal(counts["n_total"], exp["sum"])
+
 
 
 def _adata_equal(a, b):

@@ -25,6 +25,12 @@
   the next row group while the writer compresses the current one; on PBMC 5k
   (101M fragments, 6 cores) it takes 28 s and `filter_fragments` 13 s.
 - `make_parquet_batch` accepts one barcode prefix per input file.
+- `make_parquet_batch(file_prefix=...)` prefixes the output file names, one
+  prefix for all files or one per file. Inputs that would be written to the
+  same output path (Cell Ranger names every sample's file
+  `atac_fragments.tsv.gz`) now raise instead of overwriting each other.
+  Files are started largest first, so that the largest do not run alone at
+  the end.
 - `io.to_tsv` / `io.FragmentFile.to_tsv` write a Parquet fragment file back to
   a `fragments.tsv.gz` in file order, BGZF-compressed (tabix-indexable);
   `gatac convert` does the same for `.parquet` inputs. An existing output,

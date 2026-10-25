@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, List, Union
+from typing import Optional, List, Sequence, Union
 
 import cudf
 import cupy as cp
@@ -18,7 +19,7 @@ import cupyx
 import numpy as np
 import pandas as pd
 
-from ._utils import cleanup_gpu_memory
+from ._utils import async_memory_pool, cleanup_gpu_memory
 from .._readers import read_gtf
 from ..io.fragments import FragmentFile
 
@@ -85,7 +86,7 @@ def _load_tss_from_gtf(gtf_path: str | Path) -> pd.DataFrame:
 
 
 def compute_metrics(
-    parquet_path: str | Path,
+    parquet_path: str | Path | Sequence[str | Path],
     tss_source: Union[str, Path, pd.DataFrame],
     window_size: int = 2000,
     smooth_window: int = 11,
@@ -93,6 +94,7 @@ def compute_metrics(
     chrom_sizes: dict[str, int] | None = None,
     exclude_chroms: list[str] | None = ['chrM', 'M'],
     row_groups_per_batch: int = 64,
+    workers: int = 4,
 ) -> cudf.DataFrame:
     """
     Compute TSS enrichment scores using GPU-accelerated streaming via row groups.
@@ -102,8 +104,10 @@ def compute_metrics(
 
     Parameters
     ----------
-    parquet_path : str or Path
-        Path to the parquet file containing ATAC fragments.
+    parquet_path : str, Path or list of them
+        Fragment parquet file(s). With several files the TSS table is
+        loaded once, the files are processed a few at a time, and their
+        rows are concatenated in the order given.
     tss_source : str, Path, or DataFrame
         Either a path to a GTF file (the TSS table is loaded internally)
         or a pre-built pandas, cuDF or Polars DataFrame of TSS positions
@@ -121,6 +125,8 @@ def compute_metrics(
         Chromosomes to exclude from TSS enrichment calculation (default: ["chrM", "M"])
     row_groups_per_batch : int
         Number of parquet row groups to process in each GPU batch (default: 64)
+    workers : int
+        Number of files processed at once (default: 4).
 
     Returns
     -------
@@ -139,6 +145,8 @@ def compute_metrics(
     ... )
     >>> metrics.columns.tolist()
     ['barcode', 'tsse_score', 'n_unique', 'duplicate_fraction', 'mito_fraction']
+    >>> # Several samples: the GTF is read once
+    >>> metrics = ga.pp.compute_metrics(["s1.parquet", "s2.parquet"], "GRCh38.gtf.gz")
     """
     # Resolve TSS source: accept either a GTF path or a pre-loaded DataFrame.
     if isinstance(tss_source, (str, os.PathLike)):
@@ -153,7 +161,34 @@ def compute_metrics(
             f"not {type(tss_source).__name__}"
         )
 
-    logger.info(f"Computing metrics (streaming mode, row_groups_per_batch={row_groups_per_batch})")
+    single = isinstance(parquet_path, (str, os.PathLike))
+    paths = [parquet_path] if single else list(parquet_path)
+    # Several files at once from threads, so that one file's reads overlap
+    # another's kernels, under a stream-ordered memory pool. Largest first,
+    # so that they do not run alone at the end.
+    order = sorted(range(len(paths)), key=lambda i: -os.path.getsize(paths[i]))
+    with async_memory_pool(), ThreadPoolExecutor(max(1, min(len(paths), workers))) as pool:
+        futures = {
+            i: pool.submit(
+                _compute_metrics_file, paths[i], tss_df, window_size, smooth_window,
+                min_unique_frags, chrom_sizes, exclude_chroms, row_groups_per_batch,
+            )
+            for i in order
+        }
+        results = [futures[i].result() for i in range(len(paths))]
+    cleanup_gpu_memory()
+    if single:
+        return results[0]
+    return cudf.concat(results, ignore_index=True)
+
+
+def _compute_metrics_file(
+    parquet_path, tss_df, window_size, smooth_window, min_unique_frags,
+    chrom_sizes, exclude_chroms, row_groups_per_batch,
+) -> cudf.DataFrame:
+    """:func:`compute_metrics` of one fragment file."""
+    logger.info(f"Computing metrics of {Path(parquet_path).name} "
+                f"(streaming mode, row_groups_per_batch={row_groups_per_batch})")
     fragments = FragmentFile(parquet_path)
 
     # =========================================================================
@@ -257,9 +292,7 @@ def compute_metrics(
         if (i // row_groups_per_batch + 1) % 5 == 0 or total_processed == num_row_groups:
             logger.info(f"  Processed row groups {total_processed}/{num_row_groups}")
         
-        # Clean up
         del chunk_df
-        cleanup_gpu_memory()
 
     logger.info(f"Completed TSSe computation")
     

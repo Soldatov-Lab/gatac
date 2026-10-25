@@ -364,6 +364,16 @@ def test_metrics_independent_of_batching(data):
         pd.testing.assert_frame_equal(r, res[0], check_dtype=False)
 
 
+def test_metrics_several_files(data, tmp_path):
+    """A list of files gives each file's rows, in the order given."""
+    tss = pd.DataFrame({"chrom": ["chr1", "chr2"], "tss": [200_000, 400_000], "strand": ["+", "-"]})
+    small = ga.pp.filter_fragments(data["path"], tmp_path / "small.parquet", metrics=pd.DataFrame(
+        {"barcode": _cells(data, 20)}), chrom_sizes=CHROM_SIZES)
+    one = [ga.pp.compute_metrics(p, tss, min_unique_frags=50).to_pandas() for p in (small, data["path"])]
+    both = ga.pp.compute_metrics([small, data["path"]], tss, min_unique_frags=50, workers=2).to_pandas()
+    pd.testing.assert_frame_equal(both, pd.concat(one, ignore_index=True))
+
+
 def test_doublets_run(data):
     sizes = {c: CHROM_SIZES[c] for c in ("chr1", "chr2", "chr3")}
     res = ga.pp.detect_doublets(data["path"], sizes, min_fragments=50)

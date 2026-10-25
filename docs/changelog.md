@@ -82,6 +82,10 @@
   stream-ordered memory pool unless another memory resource is set. It
   decoded every fragment's barcode to a string and wrote the files one at a
   time on one CPU thread.
+- `compute_metrics` takes a list of fragment files: the TSS table is loaded
+  once and several files are processed at once, under the same memory pool,
+  and their rows are concatenated in the order given. It no longer runs a
+  garbage collection after every batch.
 - `make_gene_matrix` finds the transcript domains of each insertion with one
   binary search: the domain starts and ends cut each chromosome into segments
   that every domain covers a contiguous run of. It checked the last 100

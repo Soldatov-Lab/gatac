@@ -86,6 +86,13 @@
   once and several files are processed at once, under the same memory pool,
   and their rows are concatenated in the order given. It no longer runs a
   garbage collection after every batch.
+- `select_features_multi` reads only the sparse arrays of each h5ad, selects
+  the features on the GPU, and writes the selected columns of each file
+  straight into the output file, so the combined matrix is never held in
+  memory. The index arrays get one dtype, int32 unless the matrix needs
+  int64, as scipy would pick, so the matrix loads without copying its
+  indices. The input is taken as binary when every file is, not only the
+  first.
 - `make_gene_matrix` finds the transcript domains of each insertion with one
   binary search: the domain starts and ends cut each chromosome into segments
   that every domain covers a contiguous run of. It checked the last 100

@@ -3,7 +3,6 @@ GPU-accelerated feature selection for ATAC-seq tile matrices.
 """
 from __future__ import annotations
 
-import gc
 import logging
 from pathlib import Path
 from typing import Optional, Literal
@@ -308,8 +307,9 @@ def select_features_multi(
     """
 
     import anndata as ad
+    import h5py
     import pandas as pd
-    import scanpy as sc
+    from anndata.experimental import read_elem
     from tqdm import tqdm
 
     input_paths = [Path(p) for p in input_paths]
@@ -320,60 +320,48 @@ def select_features_multi(
 
     logger.info(f"Processing {len(input_paths)} h5ad files")
 
-    # Get reference var from first file
-    first_adata = sc.read_h5ad(str(input_paths[0]))
-    n_vars = first_adata.n_vars
-    var_df = first_adata.var.copy()
-    del first_adata
-    cp.get_default_memory_pool().free_all_blocks()
+    # Only the sparse arrays of X are read, never whole AnnData objects, and
+    # the features are selected on the GPU: a remap of the column ids, whose
+    # running count of kept entries at each row start is the new indptr.
+    with h5py.File(input_paths[0], "r") as f:
+        var_df = read_elem(f["var"])
+    n_vars = len(var_df)
 
     # =========================================================================
     # PASS 1: Aggregate feature counts across all files
     # =========================================================================
     logger.info("Pass 1: Aggregating feature counts...")
-    feature_counts = cp.zeros(n_vars, dtype=cp.float32)
+    feature_counts = cp.zeros(n_vars, dtype=cp.float64)
+    feature_nnz = cp.zeros(n_vars, dtype=cp.int64)
     total_cells = 0
-    total_nnz = 0
     max_count = 0
+    is_binary = True
 
     for fpath in tqdm(input_paths, desc="Counting features"):
-        adata = sc.read_h5ad(str(fpath))
-        if adata.n_vars != n_vars:
+        indptr, indices, data, shape = _read_csr(fpath)
+        if shape[1] != n_vars:
             raise ValueError(
-                f"Feature mismatch: {fpath.name} has {adata.n_vars} features, "
+                f"Feature mismatch: {fpath.name} has {shape[1]} features, "
                 f"expected {n_vars}"
             )
-        
-        # Accumulate feature counts
-        file_counts = _compute_feature_counts_gpu(adata.X)
-        feature_counts += file_counts
-        
-        # Track max count value for dtype optimization
-        if sp.issparse(adata.X):
-            file_max = adata.X.data.max() if adata.X.nnz > 0 else 0
+        indices_gpu = cp.asarray(indices)
+        nnz = bincount(indices_gpu, minlength=n_vars)
+        feature_nnz += nnz
+        if data.dtype == bool:
+            feature_counts += nnz
+            file_max = int(data.any())
         else:
-            file_max = adata.X.max()
-        max_count = max(max_count, int(file_max))
-        
-        # Count cells and estimate nnz for preallocation
-        total_cells += adata.n_obs
-        if sp.issparse(adata.X):
-            total_nnz += adata.X.nnz
-        else:
-            total_nnz += np.count_nonzero(adata.X)
-        
-        del adata
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
+            data_gpu = cp.asarray(data)
+            feature_counts += cp.bincount(indices_gpu, weights=data_gpu.astype(cp.float64), minlength=n_vars)
+            file_max = int(data_gpu.max()) if data_gpu.size else 0
+            is_binary &= bool(cp.all((data_gpu == 0) | (data_gpu == 1)))
+            del data_gpu
+        max_count = max(max_count, file_max)
+        total_cells += shape[0]
+        del indices_gpu, nnz, indptr, indices, data
 
     logger.debug(f"Total cells: {total_cells:,}, total features: {n_vars:,}")
 
-    # Detect if matrices are binary (check first file's dtype)
-    first_adata_check = sc.read_h5ad(str(input_paths[0]))
-    is_binary = _is_binary_matrix(first_adata_check.X)
-    del first_adata_check
-    cp.get_default_memory_pool().free_all_blocks()
-    
     if is_binary:
         logger.info("Detected binary matrices - using top-N selection (ArchR approach)")
     else:
@@ -381,19 +369,21 @@ def select_features_multi(
 
     # Select features based on aggregated counts
     selected_indices = _find_most_accessible_features_gpu(
-        feature_counts,
+        feature_counts.astype(cp.float32),
         filter_lower_quantile,
         filter_upper_quantile,
         n_features,
         is_binary=is_binary
     )
     selected_indices_sorted = cp.sort(selected_indices)
-    selected_mask = cp.zeros(n_vars, dtype=bool)
-    selected_mask[selected_indices] = True
-    selected_mask_cpu = selected_mask.get()
     selected_indices_cpu = selected_indices_sorted.get()
     n_selected = len(selected_indices)
     logger.info(f"Selected {n_selected:,} features from aggregated counts")
+    # Old column id -> new one, -1 if dropped. Increasing, so every row's
+    # column ids stay sorted.
+    remap = cp.full(n_vars, -1, dtype=cp.int32)
+    remap[selected_indices_sorted] = cp.arange(n_selected, dtype=cp.int32)
+    total_nnz = int(feature_nnz[selected_indices_sorted].sum())
 
     # Determine optimal dtype based on max count value
     if binarize:
@@ -407,88 +397,17 @@ def select_features_multi(
         logger.info(f"Using int32 dtype (max_count={max_count})")
 
     # =========================================================================
-    # PASS 2: Build combined sparse matrix with selected features
+    # Metadata, and the output file without X
     # =========================================================================
-    logger.info("Pass 2: Building combined matrix...")
-
-    data_list = []
-    indices_list = []
-    indptr_list = []
     obs_list = []
-    
-    current_nnz = 0
-    total_cells_processed = 0
-
-    for fpath in tqdm(input_paths, desc="Building matrix"):
-        # Read in full, as pass 1 does: backed reads of sparse X are broken
-        # in anndata 0.10.9 with scipy 1.17
-        adata_file = sc.read_h5ad(str(fpath))
-        n_obs = adata_file.n_obs
-
-        X = adata_file.X[:, selected_indices_cpu]
-        
-        if not sp.issparse(X):
-            X = sp.csr_matrix(X)
-        elif not isinstance(X, sp.csr_matrix):
-            X = X.tocsr()
-
-        nnz = X.nnz
-        
-        # Collect matrix components with optimal dtype
-        data_list.append(X.data.astype(optimal_dtype))
-            
-        indices_list.append(X.indices.astype(np.uint32 if n_selected > 65535 else np.uint16))
-        
-        # Adjust indptr for concatenation
-        if total_cells_processed == 0:
-            indptr_list.append(X.indptr.astype(np.uint64))
-        else:
-            # Drop the first 0 to append to existing indptr
-            # Cast to uint64 BEFORE addition to prevent int32 overflow
-            chunk_indptr = X.indptr[1:].astype(np.uint64)
-            indptr_list.append(chunk_indptr + current_nnz)
-
-        # Collect obs metadata
-        obs_df = adata_file.obs.copy()
+    for fpath in input_paths:
+        with h5py.File(fpath, "r") as f:
+            obs_df = read_elem(f["obs"])
         obs_df['source_file'] = fpath.name
         obs_list.append(obs_df)
-
-        current_nnz += nnz
-        total_cells_processed += n_obs
-        
-        # Explicit cleanup per file
-        del adata_file, X, obs_df
-        gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-
-    # =========================================================================
-    # Final Assembly
-    # =========================================================================
-    logger.info("Final assembly of matrix and metadata...")
-    
-    # Concatenate sparse components
-    all_data = np.concatenate(data_list)
-    del data_list
-    all_indices = np.concatenate(indices_list)
-    del indices_list
-    all_indptr = np.concatenate(indptr_list)
-    del indptr_list
-    gc.collect()
-
-    # Build final sparse matrix
-    logger.info("Building final sparse matrix...")
-    combined_X = sp.csr_matrix(
-        (all_data, all_indices, all_indptr),
-        shape=(total_cells_processed, n_selected)
-    )
-    del all_data, all_indices, all_indptr
-    gc.collect()
-
-    # Build combined obs
     combined_obs = pd.concat(obs_list)
     del obs_list
-    gc.collect()
-    
+
     # Make barcodes unique
     combined_obs.index.name = 'barcode'
     if 'barcode' in combined_obs.columns:
@@ -522,16 +441,55 @@ def select_features_multi(
     # Build var for selected features
     combined_var = var_df.iloc[selected_indices_cpu].copy()
     combined_var['selected'] = True
-    combined_var['accessibility_count'] = feature_counts.get()[selected_indices_cpu]
-    logger.info("Building Anndata...")
-    # Create combined AnnData
-    combined_adata = ad.AnnData(
-        X=combined_X,
-        obs=combined_obs,
-        var=combined_var,
-    )
+    combined_var['accessibility_count'] = feature_counts.get()[selected_indices_cpu].astype(np.float32)
+    ad.AnnData(obs=combined_obs, var=combined_var).write_h5ad(str(output_path))
 
-    # Save
-    combined_adata.write_h5ad(str(output_path))
-    logger.info(f"Saved combined matrix ({total_cells_processed :,} cells × {n_selected:,} features) to {output_path.name}")
+    # =========================================================================
+    # PASS 2: Write the selected columns of each file into the output's X
+    # =========================================================================
+    logger.info("Pass 2: Writing combined matrix...")
+    with h5py.File(output_path, "a") as out:
+        X = out.create_group("X")
+        X.attrs.update({"encoding-type": "csr_matrix", "encoding-version": "0.1.0",
+                        "shape": np.array([total_cells, n_selected])})
+        out_data = X.create_dataset("data", shape=(total_nnz,), dtype=optimal_dtype)
+        # one index dtype for both arrays, as scipy picks it: anndata reads them
+        # as stored, and mixed dtypes make every sparse product copy the indices
+        idx_dtype = np.int32 if max(total_nnz, total_cells, n_selected) <= np.iinfo(np.int32).max else np.int64
+        out_indices = X.create_dataset("indices", shape=(total_nnz,), dtype=idx_dtype)
+        out_indptr = X.create_dataset("indptr", shape=(total_cells + 1,), dtype=idx_dtype)
+        out_indptr[0] = 0
+        row, pos = 0, 0
+        for fpath in tqdm(input_paths, desc="Building matrix"):
+            indptr, indices, data, shape = _read_csr(fpath)
+            new_col = remap[cp.asarray(indices)]
+            keep = new_col >= 0
+            kept_before = cp.zeros(len(keep) + 1, dtype=cp.int64)
+            cp.cumsum(keep, out=kept_before[1:])
+            k = int(kept_before[-1])
+            out_indptr[row + 1:row + shape[0] + 1] = (kept_before[cp.asarray(indptr[1:])] + pos).get()
+            out_indices[pos:pos + k] = new_col[keep].get()
+            data_gpu = cp.asarray(data)[keep]
+            out_data[pos:pos + k] = (data_gpu != 0 if optimal_dtype is bool else data_gpu.astype(optimal_dtype)).get()
+            row += shape[0]
+            pos += k
+            del new_col, keep, kept_before, data_gpu, indptr, indices, data
+        if pos != total_nnz:
+            raise RuntimeError(f"Wrote {pos:,} entries, expected {total_nnz:,}")
+    cp.get_default_memory_pool().free_all_blocks()
 
+    logger.info(f"Saved combined matrix ({total_cells:,} cells × {n_selected:,} features) to {output_path.name}")
+
+
+def _read_csr(path: Path):
+    """``indptr``, ``indices``, ``data`` and ``shape`` of an h5ad's X, as CSR."""
+    import h5py
+    from anndata.experimental import read_elem
+
+    with h5py.File(path, "r") as f:
+        X = f["X"]
+        if isinstance(X, h5py.Group) and X.attrs.get("encoding-type") == "csr_matrix":
+            shape = tuple(int(n) for n in X.attrs["shape"])
+            return X["indptr"][:], X["indices"][:], X["data"][:], shape
+        X = sp.csr_matrix(read_elem(X))
+    return X.indptr, X.indices, X.data, X.shape

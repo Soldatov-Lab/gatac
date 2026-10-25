@@ -284,6 +284,56 @@ def test_filter_with_metrics(data):
 
 
 
+def test_filter_writes_the_same_layout(data):
+    """The GPU writer of filter_fragments writes what make_parquet writes."""
+    out = ga.pp.filter_fragments(data["path"], data["dir"] / "filtered_layout.parquet",
+                                 min_fragments_per_cell=200, chrom_sizes=CHROM_SIZES)
+    ref, got = pq.ParquetFile(data["path"]), pq.ParquetFile(out)
+    assert got.schema_arrow == ref.schema_arrow
+
+    # cuDF names dictionary pages the v1 way, and leaves a column chunk
+    # uncompressed when ZSTD would not make it smaller
+    def encodings(col):
+        names = {"PLAIN_DICTIONARY": "RLE_DICTIONARY"}
+        return {names.get(e, e) for e in col.encodings} - {"PLAIN", "RLE"}
+
+    for i in range(ref.metadata.num_columns):
+        a, b = ref.metadata.row_group(0).column(i), got.metadata.row_group(0).column(i)
+        assert encodings(b) == encodings(a), a.path_in_schema
+        assert b.compression in ("ZSTD", "UNCOMPRESSED"), a.path_in_schema
+        assert b.has_column_index and b.has_offset_index, a.path_in_schema
+    ff = FragmentFile(out)
+    expected = pa.concat_tables(ff.iter_arrow()).to_pandas()
+    # DuckDB and cuDF's chunked reader (data page v1 only) read it
+    with duckdb.connect() as con:
+        ff.register(con)
+        assert con.execute("SELECT count(*) FROM fragments").fetchone()[0] == len(expected)
+    got = ff.read_categorical(["chrom", "start", "end", "barcode", "count"], low_memory=True)
+    assert np.array_equal(got["start"].to_numpy(), expected["start"].to_numpy())
+
+
+def test_filter_several_files_prefix_and_no_cell(data):
+    """Files filtered at once; a file with no kept cell gives an empty file."""
+    other = data["dir"] / "other.parquet"
+    shutil.copy(data["path"], other)
+    cells = _cells(data, 20)
+    metrics = pd.DataFrame({"barcode": ["X_" + c for c in cells]})
+    outs = [data["dir"] / "f1.parquet", data["dir"] / "f2.parquet"]
+    ga.pp.filter_fragments([data["path"], other], outs, metrics=metrics,
+                           barcode_prefix="X_", chrom_sizes=CHROM_SIZES)
+    a = pa.concat_tables(FragmentFile(outs[0]).iter_arrow()).to_pandas()
+    assert set(a["barcode"]) == set(metrics["barcode"])
+    ref = data["df"]
+    assert len(a) == (ref["chrom"].isin(CHROM_SIZES) & ref["barcode"].isin(cells)).sum()
+    assert pa.concat_tables(FragmentFile(outs[1]).iter_arrow()).equals(
+        pa.concat_tables(FragmentFile(outs[0]).iter_arrow()))
+    # No cell of the metrics in this file
+    out = ga.pp.filter_fragments(data["path"], data["dir"] / "f3.parquet",
+                                 metrics=pd.DataFrame({"barcode": ["nope"]}))
+    ff = FragmentFile(out)
+    assert ff.num_rows == 0 and ff.n_barcodes == 0
+
+
 def _adata_equal(a, b):
     assert list(a.obs_names) == list(b.obs_names)
     assert list(a.var_names) == list(b.var_names)

@@ -6,6 +6,7 @@ This module provides functions to filter fragment data based on cell quality met
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Union, List
 
@@ -13,9 +14,9 @@ import cudf
 import cupy as cp
 import pandas as pd
 
-from ._utils import cleanup_gpu_memory
+from ._utils import async_memory_pool, cleanup_gpu_memory
 from .._readers import read_metrics
-from ..io.fragments import FragmentFile, write_fragments
+from ..io.fragments import FragmentFile, _write_cells
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +31,14 @@ def filter_fragments(
     barcode_prefix: Optional[str] = None,
     row_groups_per_batch: int = 64,
     chrom_sizes: Optional[Union[dict, object, str]] = None,
+    workers: int = 4,
 ) -> Union[Path, List[Path]]:
     """
     Filter ATAC fragment parquet file(s) based on cell quality metrics.
 
     Counts fragments per cell on the GPU and streams the filtered fragments
     to the output, so memory stays bounded on large files. Supports both
-    single and multiple input files.
+    single and multiple input files; several files are filtered at once.
 
     Parameters
     ----------
@@ -59,7 +61,7 @@ def filter_fragments(
     barcode_prefix : str, optional
         Prefix to add to barcodes before filtering.
     row_groups_per_batch : int, default 64
-        Number of parquet row groups to process per batch.
+        Unused; kept for backwards compatibility.
     chrom_sizes : dict, str, or genome object, optional
         Chromosome sizes for filtering. Can be:
         - String genome name (e.g., 'hg38', 'mm10') - will use built-in genome
@@ -68,6 +70,9 @@ def filter_fragments(
         Only fragments on these chromosomes will be counted. If None, all 
         chromosomes are included. This matches SnapATAC2's behavior of 
         excluding non-standard contigs (GL*, KI*).
+    workers : int, default 4
+        Number of files filtered at once. Each holds up to about 2 GB of
+        GPU memory.
 
     Returns
     -------
@@ -158,23 +163,34 @@ def filter_fragments(
             metrics_df = metrics_df[metrics_df['n_unique'] >= min_fragments_per_cell]
             logger.info(f"Retained {len(metrics_df):,} cells after min_fragments filter")
         
-        valid_barcodes = set(metrics_df[barcode_column].astype(str).values)
+        valid_barcodes = cudf.Series(metrics_df[barcode_column].astype(str).to_numpy(), dtype="str")
         logger.info(f"Total valid barcodes from metrics: {len(valid_barcodes):,}")
 
-    # Process each input file
-    for input_path, output_path in zip(input_paths, output_paths):
-        logger.info(f"Processing {input_path}")
-        _filter_single_file_streaming(
-            input_path=input_path,
-            output_path=output_path,
-            valid_barcodes=valid_barcodes,
-            min_fragments_per_cell=min_fragments_per_cell,
-            barcode_column=barcode_column,
-            barcode_prefix=barcode_prefix,
-            row_groups_per_batch=row_groups_per_batch,
-            valid_chroms=valid_chroms,
-        )
-        logger.info(f"Wrote filtered fragments to {output_path}")
+    if valid_barcodes is not None and len(valid_barcodes) == 0:
+        raise ValueError("No cells passed the filtering criteria")
+
+    # Each file is filtered and written on the GPU (cuDF reads, encodes and
+    # compresses it), a few files at a time from threads, so that one file's
+    # disk reads and writes overlap another's GPU work. Largest files first,
+    # so that they do not run alone at the end.
+    order = sorted(range(len(input_paths)), key=lambda i: -input_paths[i].stat().st_size)
+    with async_memory_pool(), ThreadPoolExecutor(min(len(input_paths), workers)) as pool:
+        futures = [
+            pool.submit(
+                _filter_single_file_streaming,
+                input_path=input_paths[i],
+                output_path=output_paths[i],
+                valid_barcodes=valid_barcodes,
+                min_fragments_per_cell=min_fragments_per_cell,
+                barcode_column=barcode_column,
+                barcode_prefix=barcode_prefix,
+                row_groups_per_batch=row_groups_per_batch,
+                valid_chroms=valid_chroms,
+            )
+            for i in order
+        ]
+        for f in futures:
+            f.result()
 
     cleanup_gpu_memory()
     
@@ -186,7 +202,7 @@ def filter_fragments(
 def _filter_single_file_streaming(
     input_path: Path,
     output_path: Path,
-    valid_barcodes: Optional[set] = None,
+    valid_barcodes: Optional[cudf.Series] = None,
     min_fragments_per_cell: int = 100,
     barcode_column: str = "barcode",
     barcode_prefix: Optional[str] = None,
@@ -205,8 +221,9 @@ def _filter_single_file_streaming(
         Input parquet file path.
     output_path : Path
         Output parquet file path.
-    valid_barcodes : set, optional
-        Pre-computed set of valid barcodes. If None, will compute from data.
+    valid_barcodes : cudf.Series, optional
+        Barcodes of the cells to keep. If None, cells are selected by
+        ``min_fragments_per_cell``.
     min_fragments_per_cell : int
         Minimum fragments per cell threshold.
     barcode_column : str
@@ -215,54 +232,33 @@ def _filter_single_file_streaming(
     barcode_prefix : str, optional
         Prefix to add to barcodes.
     row_groups_per_batch : int
-        Unused; kept for backwards compatibility (filtering streams on the
-        CPU in row-group-sized Arrow batches).
+        Unused; kept for backwards compatibility.
     valid_chroms : set, optional
         Set of valid chromosome names. Fragments on other chromosomes
         will not be counted toward min_fragments_per_cell threshold.
     """
-    import pyarrow as pa
-    import pyarrow.compute as pc
-
+    logger.info(f"Processing {input_path}")
     fragments = FragmentFile(input_path)
     chroms = sorted(valid_chroms) if valid_chroms is not None else None
 
     # Counts on the kept chromosomes select the cells, and those of the kept
-    # cells are the output's barcode table: the writer needs no counting pass
-    logger.info("Computing fragment counts per cell")
-    counts = fragments.barcode_counts(chroms=chroms)
-    if barcode_prefix:
-        counts['barcode'] = barcode_prefix + counts['barcode']
+    # cells are the output's barcode table: the writer needs no counting pass.
+    # Barcode names are matched on the GPU; only the kept ones reach the host.
+    counts = fragments._id_counts(chroms=chroms)
     if valid_barcodes is None:
-        valid_barcodes = set(counts.loc[counts['n_unique'] >= min_fragments_per_cell, 'barcode'])
-        logger.info(f"Found {len(valid_barcodes):,} cells with >= {min_fragments_per_cell} fragments")
+        keep = (counts["n_unique"] >= min_fragments_per_cell).to_numpy()
+    names = fragments._gpu_barcodes().take(cp.asarray(counts["barcode_id"].to_numpy()))
+    if barcode_prefix:
+        names = barcode_prefix + names
+    if valid_barcodes is not None:
+        keep = names.isin(valid_barcodes).values_host
+    cells = counts[keep].copy()
+    cells["barcode"] = names[cp.asarray(keep)].to_arrow().to_numpy(zero_copy_only=False)
+    if valid_barcodes is None:
+        logger.info(f"Found {len(cells):,} cells with >= {min_fragments_per_cell} fragments")
+        if len(cells) == 0:
+            raise ValueError(f"No cells passed the filtering criteria in {input_path}")
 
-    if len(valid_barcodes) == 0:
-        raise ValueError("No cells passed the filtering criteria")
-
-    keep_barcodes = pa.array(sorted(valid_barcodes), pa.string())
-    keep_chroms = pa.array(chroms, pa.string()) if chroms is not None else None
-
-    # Second pass: filter and stream write
-    logger.info("Filtering and writing output (streaming)")
-    totals = {'in': 0, 'out': 0}
-
-    def batches():
-        totals['in'] = totals['out'] = 0
-        for t in fragments.iter_arrow():
-            totals['in'] += t.num_rows
-            if barcode_prefix:
-                t = t.set_column(3, 'barcode', pc.binary_join_element_wise(
-                    pa.scalar(barcode_prefix), t['barcode'], ''))
-            mask = pc.is_in(t['barcode'], value_set=keep_barcodes)
-            if keep_chroms is not None:
-                mask = pc.and_(mask, pc.is_in(t['chrom'], value_set=keep_chroms))
-            t = t.filter(mask)
-            totals['out'] += t.num_rows
-            yield t
-
-    write_fragments(batches, output_path, chroms=fragments.chroms,
-                    barcode_stats=counts[counts['barcode'].isin(valid_barcodes)])
-
-    logger.info(f"Filtered {totals['in']:,} -> {totals['out']:,} fragments "
-                f"({100 * totals['out'] / totals['in']:.1f}% retained)")
+    n_in, n_out = _write_cells(fragments, output_path, cells, chroms=chroms)
+    logger.info(f"Filtered {input_path.name}: {n_in:,} -> {n_out:,} fragments "
+                f"({100 * n_out / max(n_in, 1):.1f}% retained), {len(cells):,} cells")

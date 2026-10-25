@@ -75,6 +75,13 @@
 
 ### Changed
 
+- `filter_fragments` runs on the GPU: cells are matched by barcode id instead
+  of by name, and the kept fragments are read, renumbered, encoded and
+  ZSTD-compressed by cuDF into the same file layout. Several files are
+  filtered at once (`workers`), largest first, under RMM's
+  stream-ordered memory pool unless another memory resource is set. It
+  decoded every fragment's barcode to a string and wrote the files one at a
+  time on one CPU thread.
 - `make_gene_matrix` finds the transcript domains of each insertion with one
   binary search: the domain starts and ends cut each chromosome into segments
   that every domain covers a contiguous run of. It checked the last 100

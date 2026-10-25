@@ -175,6 +175,33 @@ def _compute_feature_counts_gpu(
         return arr.sum(axis=0).astype(cp.float32)
 
 
+def _tile_stats_usable(adata) -> bool:
+    """
+    Whether var holds tile statistics that match ``adata``'s matrix: summed
+    over exactly its cells, with as many entries as it has and, when the
+    matrix is in memory, the same total. A matrix binarized, normalized or
+    subset after it was built fails one of these; a backed matrix is only
+    checked for its entry count, so its values are not read.
+    """
+    stats = adata.uns.get("tile_stats")
+    if (
+        stats is None
+        or not {"count", "n_cells"} <= set(adata.var.columns)
+        or int(stats.get("n_obs", -1)) != adata.n_obs
+    ):
+        return False
+    X = adata.X
+    if X is None:
+        return True
+    if adata.isbacked:
+        nnz = X.group["indptr"][-1] if hasattr(X, "group") else None
+        return nnz is not None and int(nnz) == int(adata.var["n_cells"].sum())
+    if not sp.issparse(X) or X.nnz != int(adata.var["n_cells"].sum()):
+        return False
+    total = X.data.sum(dtype=np.float64)
+    return bool(np.isclose(total, adata.var["count"].to_numpy(dtype=np.float64).sum(), rtol=0, atol=0.5))
+
+
 def select_features(
     adata,
     n_features: int = 500000,
@@ -190,10 +217,17 @@ def select_features(
     :cite:p:`Granja2021`.
     For count matrices: selects top N accessible features, excluding quantile tails.
 
+    A tile matrix from :func:`~gatac.pp.make_tile_matrix` or
+    :func:`~gatac.pp.scan_tiles` carries per-tile statistics in ``var``
+    (``count``, ``n_cells``); they stand for the matrix as long as every cell
+    they were summed over is kept (``uns["tile_stats"]["n_obs"]``), so the
+    matrix is not read, and a :func:`~gatac.pp.scan_tiles` result needs none.
+
     Parameters
     ----------
     adata : AnnData
-        Annotated data matrix with cells × features
+        Annotated data matrix with cells × features, or a
+        :func:`~gatac.pp.scan_tiles` result
     n_features : int
         Target number of features to select (default: 500000)
     filter_lower_quantile : float
@@ -219,8 +253,22 @@ def select_features(
 
     logger.info(f"Selecting features from {adata.shape[1]:,} total")
 
+    if _tile_stats_usable(adata):
+        logger.info("Using the tile statistics of var")
+        # every entry is 1 exactly when the counts equal the cell counts
+        is_binary = bool((adata.var["count"] == adata.var["n_cells"]).all())
+        feature_counts = cp.asarray(adata.var["count"].to_numpy(dtype=np.float64)).astype(cp.float32)
+    elif adata.X is None:
+        raise ValueError(
+            "`adata` has no X and no tile statistics ('count', 'n_cells' in var, "
+            "uns['tile_stats']); see `pp.scan_tiles`"
+        )
+    else:
+        is_binary = None
+
     # Detect if matrix is binary
-    is_binary = _is_binary_matrix(adata.X)
+    if is_binary is None:
+        is_binary = _is_binary_matrix(adata.X)
     if is_binary:
         logger.info("Detected binary matrix - using top-N selection (ArchR approach)")
     else:
@@ -228,7 +276,8 @@ def select_features(
 
     # Compute feature counts
     logger.debug("Computing feature accessibility")
-    feature_counts = _compute_feature_counts_gpu(adata.X)
+    if not _tile_stats_usable(adata):
+        feature_counts = _compute_feature_counts_gpu(adata.X)
     logger.debug(f"Count range: {float(feature_counts.min()):.0f} - {float(feature_counts.max()):.0f}")
 
     # Select features
@@ -265,231 +314,3 @@ def select_features(
     logger.info(f"Selected {n_selected:,} features")
 
     return result
-
-
-def select_features_multi(
-    input_paths: list[str | Path],
-    output_path: str | Path,
-    n_features: int = 500000,
-    filter_lower_quantile: float = 0.005,
-    filter_upper_quantile: float = 0.005,
-    binarize: bool = True,
-):
-    """
-    Streaming feature selection across multiple h5ad files.
-
-    Processes files one at a time to avoid OOM, producing a single
-    combined output with selected features from all inputs.
-
-    Parameters
-    ----------
-    input_paths : list of str or Path
-        List of paths to h5ad files
-    output_path : str or Path
-        Output path for combined h5ad file
-    n_features : int
-        Target number of features to select (default: 500000)
-    filter_lower_quantile : float
-        Lower quantile threshold for filtering (default: 0.005)
-    filter_upper_quantile : float
-        Upper quantile threshold for filtering (default: 0.005)
-    binarize : bool
-        Whether to binarize the output matrix (default: True)
-
-    Examples
-    --------
-    >>> import gatac as ga
-    >>> ga.pp.select_features_multi(
-    ...     ["sampleA.h5ad", "sampleB.h5ad"],
-    ...     output_path="combined.h5ad",
-    ...     n_features=500_000,
-    ... )
-    """
-
-    import anndata as ad
-    import h5py
-    import pandas as pd
-    from anndata.experimental import read_elem
-    from tqdm import tqdm
-
-    input_paths = [Path(p) for p in input_paths]
-    output_path = Path(output_path)
-
-    if len(input_paths) == 0:
-        raise ValueError("No input files provided")
-
-    logger.info(f"Processing {len(input_paths)} h5ad files")
-
-    # Only the sparse arrays of X are read, never whole AnnData objects, and
-    # the features are selected on the GPU: a remap of the column ids, whose
-    # running count of kept entries at each row start is the new indptr.
-    with h5py.File(input_paths[0], "r") as f:
-        var_df = read_elem(f["var"])
-    n_vars = len(var_df)
-
-    # =========================================================================
-    # PASS 1: Aggregate feature counts across all files
-    # =========================================================================
-    logger.info("Pass 1: Aggregating feature counts...")
-    feature_counts = cp.zeros(n_vars, dtype=cp.float64)
-    feature_nnz = cp.zeros(n_vars, dtype=cp.int64)
-    total_cells = 0
-    max_count = 0
-    is_binary = True
-
-    for fpath in tqdm(input_paths, desc="Counting features"):
-        indptr, indices, data, shape = _read_csr(fpath)
-        if shape[1] != n_vars:
-            raise ValueError(
-                f"Feature mismatch: {fpath.name} has {shape[1]} features, "
-                f"expected {n_vars}"
-            )
-        indices_gpu = cp.asarray(indices)
-        nnz = bincount(indices_gpu, minlength=n_vars)
-        feature_nnz += nnz
-        if data.dtype == bool:
-            feature_counts += nnz
-            file_max = int(data.any())
-        else:
-            data_gpu = cp.asarray(data)
-            feature_counts += cp.bincount(indices_gpu, weights=data_gpu.astype(cp.float64), minlength=n_vars)
-            file_max = int(data_gpu.max()) if data_gpu.size else 0
-            is_binary &= bool(cp.all((data_gpu == 0) | (data_gpu == 1)))
-            del data_gpu
-        max_count = max(max_count, file_max)
-        total_cells += shape[0]
-        del indices_gpu, nnz, indptr, indices, data
-
-    logger.debug(f"Total cells: {total_cells:,}, total features: {n_vars:,}")
-
-    if is_binary:
-        logger.info("Detected binary matrices - using top-N selection (ArchR approach)")
-    else:
-        logger.info("Detected count matrices - using quantile-filtered selection")
-
-    # Select features based on aggregated counts
-    selected_indices = _find_most_accessible_features_gpu(
-        feature_counts.astype(cp.float32),
-        filter_lower_quantile,
-        filter_upper_quantile,
-        n_features,
-        is_binary=is_binary
-    )
-    selected_indices_sorted = cp.sort(selected_indices)
-    selected_indices_cpu = selected_indices_sorted.get()
-    n_selected = len(selected_indices)
-    logger.info(f"Selected {n_selected:,} features from aggregated counts")
-    # Old column id -> new one, -1 if dropped. Increasing, so every row's
-    # column ids stay sorted.
-    remap = cp.full(n_vars, -1, dtype=cp.int32)
-    remap[selected_indices_sorted] = cp.arange(n_selected, dtype=cp.int32)
-    total_nnz = int(feature_nnz[selected_indices_sorted].sum())
-
-    # Determine optimal dtype based on max count value
-    if binarize:
-        optimal_dtype = bool
-        logger.info("Using bool dtype (binarized)")
-    elif max_count <= 65535:
-        optimal_dtype = np.uint16
-        logger.info(f"Using uint16 dtype (max_count={max_count})")
-    else:
-        optimal_dtype = np.int32
-        logger.info(f"Using int32 dtype (max_count={max_count})")
-
-    # =========================================================================
-    # Metadata, and the output file without X
-    # =========================================================================
-    obs_list = []
-    for fpath in input_paths:
-        with h5py.File(fpath, "r") as f:
-            obs_df = read_elem(f["obs"])
-        obs_df['source_file'] = fpath.name
-        obs_list.append(obs_df)
-    combined_obs = pd.concat(obs_list)
-    del obs_list
-
-    # Make barcodes unique
-    combined_obs.index.name = 'barcode'
-    if 'barcode' in combined_obs.columns:
-        combined_obs.drop(columns=['barcode'], inplace=True)
-    combined_obs.reset_index(inplace=True)
-
-    if not combined_obs['barcode'].is_unique:
-        n_dups = combined_obs['barcode'].duplicated().sum()
-        logger.warning(f"Detected {n_dups:,} duplicate barcodes. Making barcodes unique.")
-
-        # Using anndata helper for efficiency if available, or manual uniqueness
-        def make_unique(indices):
-            seen = {}
-            out = []
-            for x in indices:
-                if x in seen:
-                    seen[x] += 1
-                    out.append(f"{x}-{seen[x]}")
-                else:
-                    seen[x] = 0
-                    out.append(x)
-            return out
-        
-        combined_obs.index = make_unique(combined_obs['barcode'])
-        combined_obs.drop(columns=['barcode'], inplace=True)
-    else:
-        # Use barcodes as index and drop the column
-        combined_obs.index = combined_obs['barcode'].values
-        combined_obs.drop(columns=['barcode'], inplace=True)
-
-    # Build var for selected features
-    combined_var = var_df.iloc[selected_indices_cpu].copy()
-    combined_var['selected'] = True
-    combined_var['accessibility_count'] = feature_counts.get()[selected_indices_cpu].astype(np.float32)
-    ad.AnnData(obs=combined_obs, var=combined_var).write_h5ad(str(output_path))
-
-    # =========================================================================
-    # PASS 2: Write the selected columns of each file into the output's X
-    # =========================================================================
-    logger.info("Pass 2: Writing combined matrix...")
-    with h5py.File(output_path, "a") as out:
-        X = out.create_group("X")
-        X.attrs.update({"encoding-type": "csr_matrix", "encoding-version": "0.1.0",
-                        "shape": np.array([total_cells, n_selected])})
-        out_data = X.create_dataset("data", shape=(total_nnz,), dtype=optimal_dtype)
-        # one index dtype for both arrays, as scipy picks it: anndata reads them
-        # as stored, and mixed dtypes make every sparse product copy the indices
-        idx_dtype = np.int32 if max(total_nnz, total_cells, n_selected) <= np.iinfo(np.int32).max else np.int64
-        out_indices = X.create_dataset("indices", shape=(total_nnz,), dtype=idx_dtype)
-        out_indptr = X.create_dataset("indptr", shape=(total_cells + 1,), dtype=idx_dtype)
-        out_indptr[0] = 0
-        row, pos = 0, 0
-        for fpath in tqdm(input_paths, desc="Building matrix"):
-            indptr, indices, data, shape = _read_csr(fpath)
-            new_col = remap[cp.asarray(indices)]
-            keep = new_col >= 0
-            kept_before = cp.zeros(len(keep) + 1, dtype=cp.int64)
-            cp.cumsum(keep, out=kept_before[1:])
-            k = int(kept_before[-1])
-            out_indptr[row + 1:row + shape[0] + 1] = (kept_before[cp.asarray(indptr[1:])] + pos).get()
-            out_indices[pos:pos + k] = new_col[keep].get()
-            data_gpu = cp.asarray(data)[keep]
-            out_data[pos:pos + k] = (data_gpu != 0 if optimal_dtype is bool else data_gpu.astype(optimal_dtype)).get()
-            row += shape[0]
-            pos += k
-            del new_col, keep, kept_before, data_gpu, indptr, indices, data
-        if pos != total_nnz:
-            raise RuntimeError(f"Wrote {pos:,} entries, expected {total_nnz:,}")
-    cp.get_default_memory_pool().free_all_blocks()
-
-    logger.info(f"Saved combined matrix ({total_cells:,} cells × {n_selected:,} features) to {output_path.name}")
-
-
-def _read_csr(path: Path):
-    """``indptr``, ``indices``, ``data`` and ``shape`` of an h5ad's X, as CSR."""
-    import h5py
-    from anndata.experimental import read_elem
-
-    with h5py.File(path, "r") as f:
-        X = f["X"]
-        if isinstance(X, h5py.Group) and X.attrs.get("encoding-type") == "csr_matrix":
-            shape = tuple(int(n) for n in X.attrs["shape"])
-            return X["indptr"][:], X["indices"][:], X["data"][:], shape
-        X = sp.csr_matrix(read_elem(X))
-    return X.indptr, X.indices, X.data, X.shape

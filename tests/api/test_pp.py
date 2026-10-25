@@ -46,33 +46,6 @@ def test_select_features_ignores_quantiles_on_binary_input(tiles, world, source)
     assert count[sel].min() >= count[~sel].max()
 
 
-def test_select_features_multi_matches_in_memory_selection(split_h5ad, tmp_path):
-    """Streaming over files selects what select_features selects on all cells, and keeps every cell's row."""
-    paths, ordered = split_h5ad
-    out = tmp_path / "combined.h5ad"
-    ga.pp.select_features_multi(paths, out, n_features=300)
-    got = sc.read_h5ad(out)
-
-    ga.pp.select_features(ordered, n_features=300)
-    ref = ordered[:, ordered.var["selected"].to_numpy()]
-    assert list(got.var_names) == list(ref.var_names)
-    np.testing.assert_array_equal(got.var["accessibility_count"], ref.var["accessibility_count"])
-    assert list(got.obs_names) == list(ref.obs_names)
-    n_a = (ordered.n_obs + 1) // 2
-    assert got.obs["source_file"].tolist() == ["A_tile.h5ad"] * n_a + ["B_tile.h5ad"] * (ordered.n_obs - n_a)
-    assert got.X.dtype == bool
-    assert (got.X != (ref.X > 0)).nnz == 0
-
-
-def test_select_features_multi_output_does_not_depend_on_number_of_inputs(split_h5ad, tmp_path):
-    """One file in gives the same kind of output as several: only selected features, binarized."""
-    paths, _ = split_h5ad
-    out = tmp_path / "one.h5ad"
-    ga.pp.select_features_multi(paths[:1], out, n_features=300)
-    got = sc.read_h5ad(out)
-    assert got.n_vars == 300 and got.X.dtype == bool
-
-
 def test_combine_concatenates_files_and_rejects_duplicate_barcodes(split_h5ad, tmp_path):
     """combine stacks the files' cells in order with ``source_file``, and refuses colliding barcodes."""
     paths, ordered = split_h5ad

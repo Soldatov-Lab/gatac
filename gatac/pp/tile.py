@@ -238,19 +238,49 @@ def _iter_slabs(
         yield r0, r1, rows, cols, data
 
 
+# Per-tile statistics stored in a tile matrix's var: sums over the cells of
+# the value each cell has in the tile (0 where it has none). With
+# uns["tile_stats"]["n_obs"], the number of cells they were summed over,
+# select_features uses them in place of the matrix.
+TILE_STATS = ("n_cells", "count", "count_sq")
+
+
+def _add_tile_stats(stats: dict, cols, data, n_tiles: int, binarize: bool = False) -> None:
+    """Add the entries ``(cols, data)`` of a tile matrix to ``stats`` (numpy or cupy)."""
+    xp = cp.get_array_module(cols)
+    data = xp.ones(len(cols), dtype=xp.float64) if binarize else data.astype(xp.float64)
+    for k, w in (("n_cells", None), ("count", data), ("count_sq", data * data)):
+        add = xp.bincount(cols, weights=w, minlength=n_tiles)
+        stats[k] = add if k not in stats else stats[k] + add
+
+
+def _set_tile_stats(adata: ad.AnnData, stats: dict, n_obs: int) -> None:
+    """Store ``stats`` in ``adata.var`` (int64), summed over ``n_obs`` cells."""
+    for k in TILE_STATS:
+        v = stats.get(k)
+        v = np.zeros(adata.n_vars) if v is None else (v.get() if hasattr(v, "get") else v)
+        adata.var[k] = np.rint(v).astype(np.int64)
+    adata.uns["tile_stats"] = {"n_obs": int(n_obs)}
+
+
 def _csr_from_key_counts(
     keys: List[cp.ndarray],
     counts: List[cp.ndarray],
     n_cells: int,
     n_tiles: int,
+    stats: Optional[dict] = None,
+    binarize: bool = False,
 ) -> sp.csr_matrix:
     """
     The host CSR matrix of the per-batch (cell, tile) counts: uint16 data,
-    sorted column indices, built on the GPU a slab of cells at a time.
+    sorted column indices, built on the GPU a slab of cells at a time. The
+    tile statistics are added to ``stats`` when given.
     """
     data_parts, index_parts = [], []
     row_nnz = np.zeros(n_cells, dtype=np.int64)
     for r0, r1, rows, cols, data in _iter_slabs(keys, counts, n_cells, n_tiles):
+        if stats is not None:
+            _add_tile_stats(stats, cols, data, n_tiles, binarize)
         index_parts.append(cols.get())
         data_parts.append(data.astype(cp.uint16).get())
         row_nnz[r0:r1] = cp.bincount(rows - r0, minlength=r1 - r0).get()
@@ -631,6 +661,9 @@ def _make_tile_matrix_from_interval_matrix(
         tile_matrix.data[:] = 1
 
     adata = tile_matrix_to_anndata(tile_matrix, obs, tile_metadata)
+    stats: dict = {}
+    _add_tile_stats(stats, adata.X.indices, adata.X.data, adata.n_vars)
+    _set_tile_stats(adata, stats, adata.n_obs)
     adata.uns['tile_input_kind'] = 'interval_matrix'
     adata.uns['tile_aggregation'] = 'sum_overlapping_features'
 
@@ -960,7 +993,7 @@ def tile_matrix_to_anndata(
 
 
 def make_tile_matrix(
-    input: str | Path | ad.AnnData,
+    input: str | Path | ad.AnnData | List[str | Path],
     chrom_sizes: dict[str, int] | str,
     output_path: Optional[str | Path] = None,
     tile_size: int = 5000,
@@ -969,9 +1002,10 @@ def make_tile_matrix(
     metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     count_strategy: str = "unique",
-    barcode_prefix: Optional[str] = None,
+    barcode_prefix: Optional[str | List[str]] = None,
     low_memory: bool = False,
     row_groups_per_batch: int = 64,
+    n_features: Optional[int] = None,
 ) -> ad.AnnData:
     """
     Generate a tile matrix from fragments or interval-like feature matrices.
@@ -984,17 +1018,26 @@ def make_tile_matrix(
     ``chr1:100-200`` in ``var_names`` are detected and aggregated into fixed
     tiles by overlap.
 
+    Given a list of fragment files, one matrix of all their cells is built,
+    without per-sample matrices: :func:`~gatac.pp.scan_tiles` reads the
+    files once for per-tile statistics, the ``n_features`` most accessible
+    tiles are chosen from them (:func:`~gatac.pp.select_features`), and
+    :func:`~gatac.pp.build_tile_matrix` reads the files again to build the
+    matrix of those tiles only. Run these steps yourself to choose tiles
+    another way.
+
     Parameters
     ----------
-    input : str, Path, or AnnData
+    input : str, Path, AnnData, or list
         Fragment parquet path, interval-matrix `.h5ad` path, 10x `.h5` path,
         or an in-memory AnnData object containing interval-like features in
-        `var_names`.
+        `var_names`; or a list of fragment parquet paths.
     chrom_sizes : dict or str
         Dictionary of chromosome names and their sizes, or a genome name (e.g., 'hg38').
     output_path : str or Path, optional
         Path for output .h5ad file. If None, the function returns the AnnData
-        object without writing to disk.
+        object without writing to disk. A combined matrix is written as it
+        is built and returned opened from the file in backed mode.
     tile_size : int
         Size of genomic bins in base pairs (default: 5000)
     min_fragments_per_cell : int
@@ -1012,13 +1055,21 @@ def make_tile_matrix(
         - "count": Use PCR duplicate counts from the 'count' column
         - "binarize": Convert counts to binary (0/1) per tile
         (default: "unique")
-    barcode_prefix : str, optional
-        Prefix to add to barcodes
+    barcode_prefix : str or list of str, optional
+        Prefix to add to barcodes; for a list of files, one for all or one
+        per file. Cell names repeated across files are made unique with
+        ``-1``, ``-2``, ...
     low_memory : bool
         Use smaller batch size for Parquet reading (default: False)
     row_groups_per_batch : int
         Number of Parquet row-groups to read per GPU batch (default: 64).
         Decrease for lower GPU memory usage.
+    n_features : int, optional
+        Keep only the ``n_features`` most accessible tiles, as
+        :func:`~gatac.pp.select_features` chooses them (default: all tiles).
+        The full tile matrix is never built: the files are read once for
+        every tile's accessibility and again for the chosen tiles only.
+        Fragment input only.
 
     Returns
     -------
@@ -1041,6 +1092,13 @@ def make_tile_matrix(
     ...     "pbmc_filtered.parquet",
     ...     chrom_sizes={"chr1": 248956422, "chr2": 242193529},
     ... )
+    >>> # Several samples in one matrix, of the 500,000 most accessible tiles
+    >>> adata = ga.pp.make_tile_matrix(
+    ...     ["sample1.parquet", "sample2.parquet"],
+    ...     chrom_sizes="hg38",
+    ...     n_features=500_000,
+    ...     output_path="combined.h5ad",
+    ... )
     >>> # From a 10x .h5 (or interval-like .h5ad) input
     >>> adata = ga.pp.make_tile_matrix(
     ...     "filtered_peak_bc_matrix.h5",
@@ -1052,6 +1110,30 @@ def make_tile_matrix(
     from .genome import get_chrom_sizes
     if isinstance(chrom_sizes, str):
         chrom_sizes = get_chrom_sizes(chrom_sizes)
+
+    combined = isinstance(input, (list, tuple))
+    if combined or n_features is not None:
+        if not combined and (isinstance(input, ad.AnnData) or Path(input).suffix.lower() in {'.h5ad', '.h5'}):
+            raise ValueError(
+                "n_features applies to fragment files; call pp.select_features on the result instead"
+            )
+        from .features import select_features
+        from .tile_scan import build_tile_matrix, scan_tiles
+
+        tiles = scan_tiles(
+            input if combined else [input], chrom_sizes, tile_size=tile_size,
+            min_fragments_per_cell=min_fragments_per_cell, exclude_chroms=exclude_chroms,
+            metrics=metrics, filter_query=filter_query, count_strategy=count_strategy,
+            barcode_prefix=barcode_prefix,
+            row_groups_per_batch=min(row_groups_per_batch, 8) if low_memory else row_groups_per_batch,
+        )
+        if n_features is not None:
+            select_features(tiles, n_features=n_features)
+        return build_tile_matrix(
+            tiles, output_path=output_path,
+            features="selected" if n_features is not None else None,
+            row_groups_per_batch=min(row_groups_per_batch, 8) if low_memory else row_groups_per_batch,
+        )
 
     with async_memory_pool():
         adata = _make_tile_matrix_one(
@@ -1124,9 +1206,12 @@ def _make_tile_matrix_one(
     )
 
     # The CSR matrix, built on the GPU and copied to the host once
+    stats: dict = {}
     if keys:
         try:
-            matrix = _csr_from_key_counts(keys, counts, n_cells, n_tiles_total)
+            matrix = _csr_from_key_counts(
+                keys, counts, n_cells, n_tiles_total, stats, count_strategy == 'binarize',
+            )
         except (MemoryError, RuntimeError):
             # cupy's OutOfMemoryError and RMM's bad_alloc are MemoryErrors
             logger.warning(
@@ -1140,6 +1225,9 @@ def _make_tile_matrix_one(
                 shape=(n_cells, n_tiles_total),
             ).tocsr().astype(np.uint16)
             del key, count
+            stats = {}
+            _add_tile_stats(stats, matrix.indices, matrix.data, n_tiles_total,
+                            count_strategy == 'binarize')
         del keys, counts
     else:
         matrix = sp.csr_matrix((n_cells, n_tiles_total), dtype=np.uint16)
@@ -1148,6 +1236,7 @@ def _make_tile_matrix_one(
         matrix.data[:] = 1
 
     adata = tile_matrix_to_anndata(matrix, cell_meta_pd, tile_metadata)
+    _set_tile_stats(adata, stats, n_cells)
 
     if barcode_prefix:
         adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]

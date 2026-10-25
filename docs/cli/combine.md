@@ -37,8 +37,8 @@ gatac combine <input1.h5ad> [input2.h5ad ...] -o <output.h5ad>
 - **Duplicate barcodes**: if the same barcode appears in multiple files, a
   suffix (`_1`, `_2`, …) is appended automatically.
 - **Variable alignment**: all inputs must share the same `var` index (e.g.
-  the same set of tiles).  Use `gatac features` with multi-file mode to
-  produce aligned outputs first.
+  the same genes). For tile matrices, `gatac tile` with several fragment
+  files builds the combined matrix directly, without per-sample files.
 
 ---
 
@@ -83,15 +83,19 @@ for f in parquets/*.parquet; do
     gatac metrics "$f" -g GRCh38.gtf.gz -o "metrics/$(basename $f .parquet)_metrics.csv"
 done
 
-# 3. Build tile matrices per sample
+# 3. Keep the cells passing QC, per sample
 for f in parquets/*.parquet; do
     name=$(basename $f .parquet)
-    gatac tile "$f" -g hg38 \
-        --metrics "metrics/${name}_metrics.csv" \
-        --filter "tsse_score > 5" \
-        -o "tiles/${name}.h5ad"
+    gatac filter "$f" --metrics "metrics/${name}_metrics.csv" \
+        --filter "tsse_score > 5" -g hg38 -o "filtered/${name}.parquet"
 done
 
-# 4. Feature selection + combine
-gatac features "tiles/*.h5ad" -n 500000 -o combined.h5ad
+# 4. One tile matrix of every sample, 500,000 most accessible tiles
+gatac tile filtered/*.parquet -g hg38 -n 500000 -o combined_tiles.h5ad
+
+# 5. Gene matrices are built per sample; combine merges them
+for f in filtered/*.parquet; do
+    gatac gene "$f" -g GRCh38.gtf.gz -o "genes/$(basename $f .parquet).h5ad"
+done
+gatac combine genes/*.h5ad -o combined_genes.h5ad
 ```

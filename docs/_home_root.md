@@ -110,10 +110,11 @@ annotation.
 :::{grid-item-card} {fas}`sliders` Feature Selection
 :shadow: none
 
-GPU-accelerated selection of the most accessible genomic features across one
-or many h5ad files using streaming aggregation.
+GPU-accelerated selection of the most accessible genomic features, from a
+matrix or from the tile statistics, so that a cohort's tile matrix can be
+built with the selected tiles only.
 
-<a href="cli/features.html">→ CLI: features</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
+<a href="cli/tile.html">→ CLI: tile</a> · <a href="api/preprocessing.html#matrix-processing">→ API: pp</a>
 :::
 
 :::{grid-item-card} {fas}`project-diagram` Dimensionality Reduction

@@ -4,9 +4,8 @@ GATAC Command Line Interface.
 Usage:
     gatac convert <input.tsv.gz> [output.parquet]
     gatac convert <input.parquet> [output.tsv.gz]
-    gatac tile <input.parquet|input.h5ad|input.h5> [-o output] [-t tile_size] [-m min_frags]
+    gatac tile <input.parquet|input.h5ad|input.h5> [input2.parquet ...] [-o output] [-t tile_size] [-m min_frags] [-n n_features]
     gatac gene <input.parquet> -g <annotations.gtf> [-o output]
-    gatac features <input.h5ad> [-n n_features] [-o output]
     gatac combine <input.h5ad> [input2.h5ad ...] -o <output.h5ad>
     gatac metrics <input.parquet> -g <annotations.gtf> [-o output]
     gatac filter <input.parquet> [--metrics metrics.csv] [--filter "query"]
@@ -106,10 +105,15 @@ def tile_command(args):
     """Handle 'gatac tile' subcommand."""
     from .pp.tile import make_tile_matrix
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        logging.error(f"Input file not found: {input_path}")
+    input_paths = [Path(p) for p in args.input]
+    for p in input_paths:
+        if not p.exists():
+            logging.error(f"Input file not found: {p}")
+            sys.exit(1)
+    if len(input_paths) > 1 and args.output is None:
+        logging.error("--output is required when combining several files")
         sys.exit(1)
+    input_path = input_paths[0]
 
     # Resolve genome if it's a file
     genome_arg = args.genome
@@ -134,7 +138,7 @@ def tile_command(args):
             )
 
         make_tile_matrix(
-            input=input_path,
+            input=input_paths if len(input_paths) > 1 else input_path,
             chrom_sizes=genome_arg,
             output_path=output_path,
             tile_size=args.tile_size,
@@ -145,6 +149,7 @@ def tile_command(args):
             count_strategy=args.count_strategy,
             barcode_prefix=args.barcode_prefix,
             low_memory=args.low_memory,
+            n_features=args.n_features,
         )
     except ValueError as e:
         logging.error(str(e))
@@ -153,60 +158,6 @@ def tile_command(args):
         logging.error(f"Error creating tile matrix: {e}")
         sys.exit(1)
 
-
-
-def features_command(args):
-    """Handle 'gatac features' subcommand."""
-    import glob
-    import scanpy as sc
-    from .pp.features import select_features, select_features_multi
-
-    # Expand inputs - support glob patterns
-    input_paths = []
-    for inp in args.input:
-        if '*' in inp or '?' in inp:
-            # Glob pattern
-            expanded = sorted(glob.glob(inp))
-            if not expanded:
-                logging.warning(f"No files matched pattern: {inp}")
-            input_paths.extend(expanded)
-        else:
-            input_paths.append(inp)
-
-    # Validate inputs exist
-    input_paths = [Path(p) for p in input_paths]
-    for p in input_paths:
-        if not p.exists():
-            logging.error(f"Input file not found: {p}")
-            sys.exit(1)
-
-    if len(input_paths) == 0:
-        logging.error("No input files found")
-        sys.exit(1)
-
-    # Determine output path
-    output_path = args.output
-    if len(input_paths) > 1:
-        if output_path is None:
-            logging.error("--output is required when processing multiple files")
-            sys.exit(1)
-        # Use multi-file function
-        select_features_multi(
-            input_paths,
-            output_path=output_path,
-            n_features=args.n_features,
-            binarize=not args.no_binarize,
-        )
-    else:
-        # Single file - use regular function
-        if output_path is None:
-            output_path = input_paths[0].with_name(input_paths[0].stem + '_selected.h5ad')
-        adata = sc.read_h5ad(str(input_paths[0]))
-        select_features(
-            adata,
-            n_features=args.n_features,
-            output_path=output_path,
-        )
 
 
 def combine_command(args):
@@ -528,7 +479,9 @@ def main():
     )
     tile_parser.add_argument(
         'input',
-        help='Input fragments .parquet, interval-matrix .h5ad, or 10x .h5 file'
+        nargs='+',
+        help='Input fragments .parquet, interval-matrix .h5ad, or 10x .h5 file; '
+             'several fragment files make one combined matrix'
     )
     tile_parser.add_argument(
         '-o', '--output',
@@ -581,35 +534,14 @@ def main():
         default='unique',
         help='Counting strategy: unique (SnapATAC2-compatible), count (includes PCR duplicates), or binarize (binary 0/1)'
     )
-    tile_parser.set_defaults(func=tile_command)
-
-    # Features subcommand
-    features_parser = subparsers.add_parser(
-        'features',
-        help='GPU-accelerated feature selection',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    features_parser.add_argument(
-        'input',
-        nargs='+',
-        help='Input .h5ad file(s) or glob pattern (e.g., "path/*.h5ad")'
-    )
-    features_parser.add_argument(
+    tile_parser.add_argument(
         '-n', '--n-features',
         type=int,
-        default=500000,
-        help='Number of features to select'
+        default=None,
+        help='Keep only the N most accessible tiles, chosen on all cells, without '
+             'building the full tile matrix (fragment input; default: all tiles)'
     )
-    features_parser.add_argument(
-        '-o', '--output',
-        help='Output .h5ad file (required for multiple inputs)'
-    )
-    features_parser.add_argument(
-        '--no-binarize',
-        action='store_true',
-        help='Preserve original counts instead of binarizing (multi-file mode)'
-    )
-    features_parser.set_defaults(func=features_command)
+    tile_parser.set_defaults(func=tile_command)
 
     # Combine subcommand
     combine_parser = subparsers.add_parser(

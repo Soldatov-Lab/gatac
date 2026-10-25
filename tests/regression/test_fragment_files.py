@@ -19,6 +19,7 @@ import pytest
 pytest.importorskip("cupy")
 pytest.importorskip("cudf")
 
+import anndata as ad  # noqa: E402
 import duckdb  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
@@ -351,6 +352,75 @@ def test_tile_matrix_independent_of_batching(data, strategy):
     assert set(res[0].obs_names) <= set(data["df"]["barcode"])
     for r in res[1:]:
         _adata_equal(r, res[0])
+
+
+@pytest.fixture
+def two_samples(data, tmp_path):
+    """Two fragment files whose cells share names (one's cells are a subset of the other's)."""
+    small = ga.pp.filter_fragments(data["path"], tmp_path / "small.parquet", metrics=pd.DataFrame(
+        {"barcode": _cells(data, 20)}), chrom_sizes=CHROM_SIZES)
+    return [small, data["path"]]
+
+
+SCAN_KW = dict(chrom_sizes=CHROM_SIZES, tile_size=50_000, min_fragments_per_cell=50)
+
+
+@pytest.mark.parametrize("strategy", ["unique", "count", "binarize"])
+def test_scan_tiles_matches_the_tile_matrices(two_samples, strategy):
+    """The scan's cells are the per-file matrices' and its statistics are their column sums."""
+    one = [ga.pp.make_tile_matrix(p, count_strategy=strategy, **SCAN_KW) for p in two_samples]
+    tiles = ga.pp.scan_tiles(two_samples, count_strategy=strategy, row_groups_per_batch=1, **SCAN_KW)
+    assert tiles.X is None
+    X = sp.vstack([o.X for o in one]).tocsc().astype(np.int64)
+    np.testing.assert_array_equal(tiles.var["n_cells"], np.diff(X.indptr))
+    np.testing.assert_array_equal(tiles.var["count"], np.asarray(X.sum(axis=0)).ravel())
+    np.testing.assert_array_equal(tiles.var["count_sq"], np.asarray(X.multiply(X).sum(axis=0)).ravel())
+    assert list(tiles.var_names) == list(one[0].var_names)
+    names = [n for o in one for n in o.obs_names]
+    assert len(set(names)) < len(names) and tiles.obs_names.is_unique
+    assert list(tiles.obs["barcode"]) == names
+    np.testing.assert_array_equal(tiles.obs["n_unique"], np.concatenate([o.obs["n_unique"] for o in one]))
+    assert list(tiles.obs["source_file"]) == [p.name for p, o in zip(two_samples, one) for _ in range(o.n_obs)]
+
+
+def test_build_tile_matrix(two_samples, tmp_path):
+    """In memory or written, all tiles or the selected ones, every cell or some."""
+    one = [ga.pp.make_tile_matrix(p, **SCAN_KW) for p in two_samples]
+    full = sp.vstack([o.X for o in one]).tocsr()
+    tiles = ga.pp.scan_tiles(two_samples, **SCAN_KW)
+
+    built = ga.pp.build_tile_matrix(tiles, features=None)
+    assert (built.X != full).nnz == 0 and built.X.has_sorted_indices
+    assert list(built.obs_names) == list(tiles.obs_names)
+
+    ga.pp.select_features(tiles, n_features=40)
+    alone = ad.AnnData(full, obs=tiles.obs, var=tiles.var[["chrom", "start", "end"]].copy())
+    ga.pp.select_features(alone, n_features=40)
+    np.testing.assert_array_equal(tiles.var["selected"], alone.var["selected"])
+
+    sel = tiles.var["selected"].to_numpy()
+    built = ga.pp.build_tile_matrix(tiles)
+    assert (built.X != full[:, sel]).nnz == 0
+    written = ga.pp.build_tile_matrix(tiles, output_path=tmp_path / "c.h5ad")
+    assert written.isbacked
+    assert (written.X.to_memory() != built.X).nnz == 0
+    assert list(written.var_names) == list(built.var_names)
+    written.file.close()
+
+    # cells dropped before the build: the written matrix is cut to size
+    keep = np.arange(tiles.n_obs) % 3 != 0
+    some = tiles[keep].copy()
+    ga.pp.build_tile_matrix(some, output_path=tmp_path / "d.h5ad").file.close()
+    assert (ad.read_h5ad(tmp_path / "d.h5ad").X != full[keep][:, sel]).nnz == 0
+
+    # make_tile_matrix on a list runs the three steps
+    assert (ga.pp.make_tile_matrix(two_samples, n_features=40, **SCAN_KW).X != built.X).nnz == 0
+    every = ga.pp.make_tile_matrix(two_samples, **SCAN_KW)
+    assert (every.X != full).nnz == 0 and list(every.obs_names) == list(tiles.obs_names)
+    alone = ga.pp.make_tile_matrix(two_samples[1], n_features=40, **SCAN_KW)
+    assert alone.n_vars == 40 and alone.n_obs == one[1].n_obs
+    with pytest.raises(ValueError, match="together"):
+        ga.pp.build_tile_matrix(tiles[np.r_[0, tiles.n_obs - 1, 1]].copy())
 
 
 def test_metrics_independent_of_batching(data):

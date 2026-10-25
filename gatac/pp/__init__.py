@@ -1,8 +1,9 @@
 from .process import combine
 from .tile import make_tile_matrix
+from .tile_scan import scan_tiles, build_tile_matrix
 from .gene import make_gene_matrix
 from .genescore import make_gene_score_matrix
-from .features import select_features, select_features_multi
+from .features import select_features
 from .metrics import compute_metrics
 from .filter import filter_fragments
 from .amulet import detect_doublets
@@ -20,10 +21,11 @@ MM39 = _MM39
 
 __all__ = [
     "make_tile_matrix",
+    "scan_tiles",
+    "build_tile_matrix",
     "make_gene_matrix",
     "make_gene_score_matrix",
     "select_features",
-    "select_features_multi",
     "combine",
     "compute_metrics",
     "cleanup_gpu_memory",

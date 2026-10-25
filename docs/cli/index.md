@@ -26,7 +26,6 @@ doublets
 tile
 gene
 genescore
-features
 combine
 ```
 
@@ -89,14 +88,6 @@ Build a cell × gene activity matrix.
 :shadow: none
 
 Build an ArchR-style distance-weighted gene score matrix.
-:::
-
-:::{grid-item-card} {fas}`sliders` features
-:link: features
-:link-type: doc
-:shadow: none
-
-Select highly accessible features.
 :::
 
 :::{grid-item-card} {fas}`layer-group` combine

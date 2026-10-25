@@ -31,6 +31,17 @@
   `atac_fragments.tsv.gz`) now raise instead of overwriting each other.
   Files are started largest first, so that the largest do not run alone at
   the end.
+- `make_tile_matrix` takes a list of fragment files (`gatac tile` several
+  files, with `-n`) and builds one matrix of all their cells, of every tile
+  or of the `n_features` most accessible, without writing and reading back
+  per-sample matrices. It runs three steps, also public:
+  `pp.scan_tiles` reads the fragment files once and returns the cells and
+  tiles with per-tile statistics (`n_cells`, `count`, `count_sq`) and no
+  matrix; `select_features` chooses tiles from these statistics, as it does
+  from a matrix, or any other criterion can set `var["selected"]`; and
+  `pp.build_tile_matrix` reads the files again to build the matrix of the
+  chosen tiles only, in memory or straight into an `.h5ad`. Cells can be
+  dropped between the scan and the build.
 - `io.to_tsv` / `io.FragmentFile.to_tsv` write a Parquet fragment file back to
   a `fragments.tsv.gz` in file order, BGZF-compressed (tabix-indexable);
   `gatac convert` does the same for `.parquet` inputs. An existing output,
@@ -40,9 +51,8 @@
 - Tile matrix builder with SnapATAC2-compatible `"unique"` count strategy.
 - Gene activity matrix builder using paired-insertion counting.
 - GPU feature selection (ArchR-style quantile filtering).
-- Multi-sample streaming feature selection via `select_features_multi`.
 - Fragment filtering on a query of the cell metrics (`filter_fragments`).
-- CLI: `convert`, `metrics`, `filter`, `tile`, `gene`, `features`, `combine`.
+- CLI: `convert`, `metrics`, `filter`, `tile`, `gene`, `combine`.
 - Spectral embedding (`dr.spectral`).
 - Latent semantic indexing — GPU TF-IDF plus truncated SVD (`dr.lsi`),
   reproducing ArchR's `.computeLSI` for all three `LSIMethod` variants,
@@ -86,13 +96,6 @@
   once and several files are processed at once, under the same memory pool,
   and their rows are concatenated in the order given. It no longer runs a
   garbage collection after every batch.
-- `select_features_multi` reads only the sparse arrays of each h5ad, selects
-  the features on the GPU, and writes the selected columns of each file
-  straight into the output file, so the combined matrix is never held in
-  memory. The index arrays get one dtype, int32 unless the matrix needs
-  int64, as scipy would pick, so the matrix loads without copying its
-  indices. The input is taken as binary when every file is, not only the
-  first.
 - `make_tile_matrix` keeps each batch's tile counts on the GPU and builds the
   matrix there, a slab of cells at a time, copying it to the host once; it
   moved every batch to the host and back, then summed all of them at once.

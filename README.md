@@ -61,11 +61,8 @@ gatac genescore fragments.parquet -g annotations.gtf
 # Gene score with a custom gene model (function of distance x to the TSS)
 gatac genescore fragments.parquet -g annotations.gtf --gene-model "exp(-abs(x)/10000) + exp(-1)"
 
-# Feature selection (single file)
-gatac features tile_matrix.h5ad -n 500000
-
-# Feature selection (multi-file streaming)
-gatac features "data/*.h5ad" -o combined.h5ad -n 500000
+# One tile matrix of several samples, most accessible tiles only
+gatac tile sample1.parquet sample2.parquet -g hg38 -n 500000 -o combined.h5ad
 
 # Merge h5ad files (file-by-file)
 gatac combine sample1.h5ad sample2.h5ad -o combined.h5ad
@@ -152,11 +149,12 @@ ga.pp.filter_fragments(
 # Select features (single AnnData)
 ga.pp.select_features(adata, n_features=50000)
 
-# Select features (Multi-file streaming)
-ga.pp.select_features_multi(
-    input_paths=["sample1.h5ad", "sample2.h5ad"],
-    output_path="combined.h5ad",
-    n_features=500000
+# One tile matrix of several samples, most accessible tiles only
+ga.pp.make_tile_matrix(
+    ["sample1.parquet", "sample2.parquet"],
+    chrom_sizes="hg38",
+    n_features=500000,
+    output_path="combined.h5ad"
 )
 
 # Merge multiple AnnData files

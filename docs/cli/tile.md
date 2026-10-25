@@ -1,16 +1,25 @@
 # `gatac tile`
 
 Build a cell × genomic-tile count matrix from either an ATAC-seq fragment
-Parquet file or an interval matrix stored as `.h5ad` or 10x `.h5`. The output
+Parquet file or an interval matrix stored as `.h5ad` or 10x `.h5`. Several
+fragment files make one combined matrix of all their cells. The output
 is an **AnnData** (`.h5ad`) object compatible with Scanpy and SnapATAC2.
+
+**`gatac tile` includes the feature selection.** With `-n N`, only the `N`
+most accessible tiles are kept, and the full tile matrix is never built:
+the fragment files are read once to measure every tile's accessibility,
+the top `N` tiles are chosen, and the files are read again to build the
+matrix of those tiles only. On a large cohort, the full matrix of every
+tile can be several times larger than the selected one, too large to load;
+`-n` avoids it altogether. Without `-n`, every tile is kept.
 
 ---
 
 ## Synopsis
 
 ```
-gatac tile <input.parquet|input.h5ad|input.h5> -g <genome|chr_sizes>
-           [-o OUTPUT] [-t TILE_SIZE] [-m MIN_FRAGS]
+gatac tile <input.parquet|input.h5ad|input.h5> [input.parquet ...] -g <genome|chr_sizes>
+           [-o OUTPUT] [-t TILE_SIZE] [-m MIN_FRAGS] [-n N_FEATURES]
            [-e CHROMS ...] [--metrics METRICS] [--filter QUERY]
            [--count-strategy STRATEGY] [--barcode-prefix PREFIX]
            [--low-memory]
@@ -24,16 +33,17 @@ gatac tile <input.parquet|input.h5ad|input.h5> -g <genome|chr_sizes>
 
 | Argument | Description |
 |----------|-------------|
-| `input` | Path to a fragment `.parquet`, interval-matrix `.h5ad`, or 10x `.h5` file |
+| `input` | Path to a fragment `.parquet`, interval-matrix `.h5ad`, or 10x `.h5` file; or several fragment `.parquet` files |
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-g`, `--genome` | **required** | Genome name (`hg38`, `mm10`, …) or path to a 2-column TSV of `chrom\tsize` |
-| `-o`, `--output` | `<input>_tile_matrix.h5ad` | Output h5ad path |
+| `-o`, `--output` | `<input>_tile_matrix.h5ad` | Output h5ad path (required for several inputs) |
 | `-t`, `--tile-size` | `5000` | Tile / bin size in base pairs |
 | `-m`, `--min-fragments` | `100` | Minimum unique fragments per barcode |
+| `-n`, `--n-features` | all tiles | Keep only the N most accessible tiles, without building the full matrix (fragment input); see [Feature selection](#feature-selection) |
 | `-e`, `--exclude-chroms` | `chrM chrY M Y` | Chromosomes to exclude (space-separated) |
 | `--metrics` | — | Metrics CSV for quality-based cell filtering |
 | `--filter` | — | Pandas `DataFrame.query` string applied to metrics |
@@ -56,6 +66,28 @@ For `.h5ad` and 10x `.h5` inputs, GATAC detects interval-like features from
 features are aggregated into fixed tiles by overlap. In that mode,
 `unique` and `count` both preserve the original matrix values, while
 `binarize` clips the final tile matrix to `0/1`.
+
+---
+
+## Feature selection
+
+`-n N` keeps the `N` most accessible tiles, chosen as
+{func}`gatac.pp.select_features` chooses them:
+
+- **counts** (`unique`, `count`): tiles ranked by their total count over all
+  cells, after dropping empty tiles and the 0.5 % least and most accessible
+  (SnapATAC2's quantile filter);
+- **binary** (`binarize`): tiles ranked by the number of cells with signal
+  (ArchR's top-N).
+
+The selection is made on all cells of all input files together. The tile
+size (`-t`) sets the genome binning first, and `-n` then picks among those
+tiles: 5 kb tiles cover hg38 in about 600,000 tiles, 500 bp tiles in about
+6 million.
+
+The output keeps, for every tile, the statistics the selection used
+(`n_cells`, `count`, `count_sq` in `var`), so another selection can be made
+later from `var` without reading the matrix.
 
 ---
 
@@ -110,6 +142,32 @@ gatac tile pbmc.parquet -g hg38 \
 gatac tile pbmc.parquet -g hg38 --count-strategy binarize
 ```
 
+### Top 500,000 tiles of 5 kb (SnapATAC2's default)
+
+```bash
+gatac tile pbmc.parquet -g hg38 -t 5000 -n 500000 -o pbmc_tile_5kb_top500k.h5ad
+```
+
+### Top 25,000 tiles of 500 bp, binarized (ArchR's iterative LSI default)
+
+```bash
+gatac tile pbmc.parquet -g hg38 -t 500 -n 25000 \
+    --count-strategy binarize -o pbmc_tile_500bp_top25k.h5ad
+```
+
+### Several samples in one matrix
+
+```bash
+gatac tile sample1.parquet sample2.parquet sample3.parquet -g hg38 \
+    -t 5000 -n 50000 -o combined.h5ad
+```
+
+The tiles are chosen on the cells of all samples together, and no
+per-sample matrix is written. Cell names repeated across files are made
+unique (`-1`, `-2`, ...); `--barcode-prefix` prefixes them all. Filter the
+cells of each sample first (`gatac filter`), since `--metrics` applies the
+same table to every file.
+
 ### Low-memory mode for constrained GPUs
 
 ```bash
@@ -134,6 +192,24 @@ adata = ga.pp.make_tile_matrix(
     count_strategy="unique",
 )
 adata.write_h5ad("pbmc_tile.h5ad")
+
+# Top 500,000 tiles of 5 kb, without building the full matrix
+adata = ga.pp.make_tile_matrix("pbmc.parquet", chrom_sizes="hg38",
+                               tile_size=5000, n_features=500_000)
+
+# Several samples, without per-sample matrices
+adata = ga.pp.make_tile_matrix(
+    ["sample1.parquet", "sample2.parquet"],
+    chrom_sizes="hg38",
+    tile_size=5000,
+    n_features=50_000,
+    output_path="combined.h5ad",
+)
+
+# Or step by step, to choose the tiles another way
+tiles = ga.pp.scan_tiles(["sample1.parquet", "sample2.parquet"], chrom_sizes="hg38")
+ga.pp.select_features(tiles, n_features=500_000)     # or set tiles.var["selected"]
+adata = ga.pp.build_tile_matrix(tiles, output_path="combined.h5ad")
 ```
 
 ---
@@ -144,4 +220,5 @@ adata.write_h5ad("pbmc_tile.h5ad")
 |------|---------|
 | `adata.X` | Sparse cell × tile count matrix (`scipy.sparse.csr_matrix`) |
 | `adata.obs` | Barcode metadata (barcode string as index) |
-| `adata.var` | Tile metadata: `chrom`, `start`, `end` |
+| `adata.var` | Tile metadata: `chrom`, `start`, `end`; tile statistics over all cells: `n_cells`, `count`, `count_sq`; with `-n`, `selected` and `accessibility_count` |
+| `adata.uns["tile_stats"]` | Number of cells the statistics were summed over |

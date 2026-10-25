@@ -36,8 +36,14 @@ compatible with SnapATAC2's count strategy {cite:p}`Zhang2024`), gene activity o
 — either SnapATAC2-style paired-insertion counts (`make_gene_matrix`) or
 ArchR-style distance-weighted gene scores (`make_gene_score_matrix`, a port of
 `addGeneScoreMatrix` {cite:p}`Granja2021`) — and operations on existing `.h5ad` files: combining
-samples (`combine`) and selecting the most accessible genomic features across
-one or many matrices (`select_features`, `select_features_multi`).
+samples (`combine`) and selecting the most accessible genomic features
+(`select_features`).
+
+Given a list of fragment files, `make_tile_matrix` builds one tile matrix of
+all of them without writing per-sample matrices: `scan_tiles` reads the
+files once for per-tile statistics, `select_features` chooses tiles from
+them, and `build_tile_matrix` reads the files again to build the matrix of
+the chosen tiles only. Call these yourself to choose tiles another way.
 
 ```{eval-rst}
 .. autosummary::
@@ -45,9 +51,10 @@ one or many matrices (`select_features`, `select_features_multi`).
    :nosignatures:
 
    make_tile_matrix
+   scan_tiles
+   build_tile_matrix
    make_gene_matrix
    make_gene_score_matrix
    select_features
-   select_features_multi
    combine
 ```

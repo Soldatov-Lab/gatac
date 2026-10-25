@@ -92,6 +92,26 @@ def test_chunked_reads_int64_indices(selected, name):
     assert _abs_corr(selected.obsm[key], ref.obsm[key]).min() > 0.9999
 
 
+@pytest.mark.parametrize("on_gpu", [1.0, 0.5, 0.0])
+def test_spectral_chunks_on_gpu_or_streamed(selected, monkeypatch, on_gpu):
+    """Chunks kept on the GPU, streamed from host memory, or both, give the in-memory result
+    and leave ``adata.X`` as it was."""
+    import functools
+    import sys
+    from gatac.dr._stream import StreamedCounts
+
+    ref = selected.copy()
+    ga.dr.spectral(ref, N_COMPS, features=None)
+    X = selected.X.copy()
+    nbytes = X.nnz * (X.data.itemsize + 4)
+    free = __import__("cupy").cuda.Device().mem_info[0]
+    monkeypatch.setattr(sys.modules["gatac.dr.spectral"], "StreamedCounts",
+                        functools.partial(StreamedCounts, memory_fraction=on_gpu * nbytes / free))
+    ga.dr.spectral(selected, N_COMPS, features=None, chunk_size=37)
+    assert _abs_corr(selected.obsm["X_spectral"], ref.obsm["X_spectral"]).min() > 0.9999
+    assert selected.X.dtype == X.dtype and (selected.X != X).nnz == 0
+
+
 @pytest.mark.parametrize("name", list(EMBEDDINGS))
 def test_cell_without_signal_raises(selected, name):
     """A cell with nothing in the selected features raises instead of becoming a degenerate row."""

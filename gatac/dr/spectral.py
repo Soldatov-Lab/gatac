@@ -23,11 +23,12 @@ the moment of normalisation.  Only the ``data`` array is converted to
 (IDF weighting, row normalisation, Lanczos eigsh) runs in float32.
 
 The default (full-GPU) path loads the matrix to the GPU as-is and converts
-only the ``data`` array.  For datasets that still exceed GPU memory, the
-``chunk_size`` parameter activates a *chunked* code-path: the matrix stays
-on the CPU but IDF weighting, L2 normalisation, and degree scaling are
-performed on the GPU via a fused CUDA kernel (one row-chunk at a time).
-Only one chunk resides on the GPU during each Lanczos matvec.
+only the ``data`` array.  For larger datasets, the ``chunk_size`` parameter
+activates a *chunked* code-path: the count matrix is used as it is, in row
+chunks, and the IDF weighting, L2 normalisation and degree scaling are
+applied to the vectors of each product instead of the matrix. Chunks stay
+on the GPU while they fit in half of its free memory; the others are
+streamed from page-locked host memory at every product.
 """
 
 from __future__ import annotations
@@ -44,12 +45,12 @@ from anndata import AnnData
 
 from .._cupy_compat import bincount
 from ._gpu import (
-    ChunkedMatrix,
     _launch_1d,
     _row_norms_sq_kernel,
     _scale_rows_kernel,
     _to_gpu_csr,
 )
+from ._stream import StreamedCounts
 from .lsi import _pinned_signs, _spmv
 
 logger = logging.getLogger(__name__)
@@ -260,38 +261,19 @@ def _spectral_mf(
 
 
 # ---------------------------------------------------------------------------
-# Chunked spectral — GPU-accelerated TF-IDF + row-chunk streaming for eigsh
+# Chunked spectral — the count matrix streamed as it is, normalized on vectors
 # ---------------------------------------------------------------------------
-
-
-def _idf_gpu_chunked(
-    X_cpu: sp.csr_matrix,
-    chunk_size: int,
-) -> cp.ndarray:
-    """
-    Compute IDF weights on the GPU using chunked bincount over column indices.
-
-    Only the ``indices`` slice of each chunk is transferred to the GPU;
-    no data values are needed.  Peak extra GPU memory is O(n_features).
-    """
-    n, n_features = X_cpu.shape
-    df = cp.zeros(n_features, dtype=cp.float32)
-
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        idx_s = int(X_cpu.indptr[start])
-        idx_e = int(X_cpu.indptr[end])
-        d_indices = cp.asarray(X_cpu.indices[idx_s:idx_e])
-        df += bincount(d_indices, minlength=n_features)
-        del d_indices
-        cp.get_default_memory_pool().free_all_blocks()
-
-    if cp.all(df == df[0]):
-        return cp.ones(n_features, dtype=cp.float32)
-
-    df = cp.where(df == 0, cp.float32(1.0), df)
-    df = cp.where(df == n, cp.float32(n - 1), df)
-    return cp.log(cp.float32(n) / df)
+#
+# With C the raw count matrix, w the IDF weights and r_i the norm of row i of
+# C diag(w), the normalized rows are x_i = c_i w / r_i, and with the degrees
+# d_i = x_i . sum_k x_k - 1 the scaled matrix is Y = diag(a) C diag(w),
+# a_i = 1 / (r_i sqrt(d_i)). Every normalization is a row or column scaling,
+# so it is applied to the vectors and C is used unchanged:
+#
+#     Y u = a * C (w * u)        Yt v = w * Ct (a * v)
+#     A v = a * C (w^2 * Ct (a * v)) - v / d
+#
+# so the matrix is never rewritten, on the host or the GPU.
 
 
 def _spectral_chunked(
@@ -304,132 +286,61 @@ def _spectral_chunked(
     """
     Chunked spectral embedding for large datasets.
 
-    The full matrix stays on the CPU; row-chunks are transferred to the
-    GPU for IDF + L2 normalisation (via a fused CUDA kernel), degree
-    scaling, and Lanczos matvec.  This trades throughput for reduced peak
-    GPU memory (≈ 1 chunk instead of the full matrix).
+    The count matrix stays as it is in host memory; its row chunks are kept
+    on the GPU while they fit in half of its free memory, and the others
+    are streamed at every product (see :class:`gatac.dr._stream.StreamedCounts`).
     """
     n_cells, n_features = X_cpu.shape
-    n_chunks = (n_cells + chunk_size - 1) // chunk_size
-    logger.info(
-        f"Chunked mode: {n_cells:,} cells in {n_chunks} chunks "
-        f"of ≤ {chunk_size:,}"
-    )
+    C = StreamedCounts(X_cpu, chunk_size)
+    try:
+        # ---- IDF weights: from the column entry counts, or caller-supplied ----
+        if feature_weights is not None:
+            w = cp.asarray(feature_weights, dtype=cp.float32)
+        else:
+            df = C.col_nnz().astype(cp.float32)
+            if bool(cp.all(df == df[0])):
+                w = cp.ones(n_features, dtype=cp.float32)
+            else:
+                df = cp.where(df == 0, cp.float32(1.0), df)
+                df = cp.where(df == n_cells, cp.float32(n_cells - 1), df)
+                w = cp.log(cp.float32(n_cells) / df).astype(cp.float32)
+        logger.info("IDF weights computed.")
 
-    # ---- Ensure CSR with float32 data (convert only the data array) ----
-    X_cpu = X_cpu.tocsr()
-    if X_cpu.dtype != np.float32:
-        X_cpu.data = X_cpu.data.astype(np.float32, copy=False)
+        # ---- L2 row norms of C diag(w), column sums and degrees ----
+        r = cp.sqrt(C.row_sq_norms(w))
+        rinv = (cp.float32(1.0) / cp.where(r == 0, cp.float32(1.0), r)).astype(cp.float32)
+        del r
+        col_sum = w * C.rdot(rinv)
+        degree = rinv * C.dot(w * col_sum) - cp.float32(1.0)
+        n_zero = int(cp.sum(degree <= 0))
+        if n_zero > 0:
+            raise ValueError(
+                f"{n_zero} cell(s) have degree ≤ 0. "
+                "Filter empty cells before running spectral embedding."
+            )
+        logger.info("Degree computation done.")
 
-    # ---- IDF weights: GPU-accelerated chunked bincount or caller-supplied ----
-    if feature_weights is not None:
-        idf_gpu = cp.asarray(feature_weights, dtype=cp.float32)
-    else:
-        idf_gpu = _idf_gpu_chunked(X_cpu, chunk_size)
-        logger.info("IDF weights computed (GPU, chunked bincount).")
+        a = (rinv / cp.sqrt(degree)).astype(cp.float32)
+        dinv = (cp.float32(1.0) / degree).astype(cp.float32)
+        w2 = (w * w).astype(cp.float32)
+        del rinv, col_sum, degree
 
-    # ---- Phase 1: IDF + L2 normalisation ----
-    col_sum = cp.zeros(n_features, dtype=cp.float32)
+        # ---- eigsh over A v = a * C (w^2 * Ct (a * v)) - v / d ----
+        def matvec(v):
+            shp = v.shape
+            vf = v.ravel()
+            y = a * C.dot(w2 * C.rdot(a * vf)) - dinv * vf
+            return y.reshape(shp)
 
-    for start in range(0, n_cells, chunk_size):
-        end = min(start + chunk_size, n_cells)
-        data_s = int(X_cpu.indptr[start])
-        data_e = int(X_cpu.indptr[end])
-        n_rows = end - start
-
-        d_data = cp.asarray(X_cpu.data[data_s:data_e])
-        # the kernel reads int32; scipy stores int64 indices once nnz needs them
-        d_indices = cp.asarray(X_cpu.indices[data_s:data_e], dtype=cp.int32)
-        d_indptr = cp.asarray(
-            (X_cpu.indptr[start : end + 1] - data_s).astype(np.int32)
-        )
-
-        _launch_1d(
-            _idf_l2_normalize_kernel, n_rows,
-            d_data, d_indices, d_indptr, idf_gpu, np.int32(n_rows),
-        )
-
-        col_sum += cp.bincount(
-            d_indices.astype(cp.intp), weights=d_data, minlength=n_features,
-        ).astype(cp.float32)
-
-        X_cpu.data[data_s:data_e] = cp.asnumpy(d_data)
-
-        del d_data, d_indices, d_indptr
-        cp.get_default_memory_pool().free_all_blocks()
-
-    del idf_gpu
-    logger.info("IDF + L2 normalisation done (GPU-accelerated).")
-
-    # ---- Phase 2: Degree computation ----
-    col_sum_cpu = cp.asnumpy(col_sum)
-    del col_sum
-    cp.get_default_memory_pool().free_all_blocks()
-
-    degree = np.asarray(
-        X_cpu.dot(col_sum_cpu.reshape(-1, 1)), dtype=np.float32
-    ).ravel() - np.float32(1.0)
-    del col_sum_cpu
-
-    n_zero = int(np.sum(degree <= 0))
-    if n_zero > 0:
-        raise ValueError(
-            f"{n_zero} cell(s) have degree ≤ 0. "
-            "Filter empty cells before running spectral embedding."
-        )
-    logger.info("Degree computation done.")
-
-    # ---- Phase 3: GPU-accelerated degree scaling ----
-    sqrt_dinv = np.sqrt(np.float32(1.0) / degree).astype(np.float32)
-
-    for start in range(0, n_cells, chunk_size):
-        end = min(start + chunk_size, n_cells)
-        data_s = int(X_cpu.indptr[start])
-        data_e = int(X_cpu.indptr[end])
-        n_rows = end - start
-
-        d_data = cp.asarray(X_cpu.data[data_s:data_e])
-        d_indptr = cp.asarray(
-            (X_cpu.indptr[start : end + 1] - data_s).astype(np.int32)
-        )
-        d_scale = cp.asarray(sqrt_dinv[start:end])
-
-        _launch_1d(
-            _scale_rows_kernel, n_rows,
-            d_data, d_indptr, d_scale, np.int32(n_rows),
-        )
-
-        X_cpu.data[data_s:data_e] = cp.asnumpy(d_data)
-
-        del d_data, d_indptr, d_scale
-        cp.get_default_memory_pool().free_all_blocks()
-
-    del sqrt_dinv
-    logger.info("Degree scaling done (GPU-accelerated).")
-
-    # ---- Phase 4: eigsh over a streamed operator ----
-    # ChunkedMatrix pins the row chunks and pre-fetches chunk i+1 on a
-    # non-blocking stream while the GPU computes with chunk i, so only one
-    # chunk (plus the prefetch) occupies VRAM per matvec.
-    store = ChunkedMatrix(X_cpu, chunk_size)
-    del X_cpu
-
-    degree_inv_gpu = cp.asarray(np.float32(1.0) / degree, dtype=cp.float32)
-    del degree
-
-    # A v = X (Xᵀ v) − D⁻¹ v
-    A = store.gram_operator(diag_shift=degree_inv_gpu)
-
-    rng = cp.random.RandomState(seed=random_state)
-    v0 = rng.rand(n_cells).astype(cp.float32)
-
-    # Larger Krylov subspace → fewer matvec calls (each expensive due to PCIe).
-    ncv = min(n_cells - 1, max(4 * n_comps + 1, n_comps + 60))
-
-    logger.info(
-        f"Starting eigsh (chunked double-buffered matvec, ncv={ncv}) ..."
-    )
-    evals, evecs = cusla.eigsh(A, k=n_comps, ncv=ncv, which="LM", v0=v0)
+        A = cusla.LinearOperator(shape=(n_cells, n_cells), matvec=matvec, dtype=cp.float32)
+        rng = cp.random.RandomState(seed=random_state)
+        v0 = rng.rand(n_cells).astype(cp.float32)
+        # Larger Krylov subspace -> fewer matvec calls (each a pass over the matrix).
+        ncv = min(n_cells - 1, max(4 * n_comps + 1, n_comps + 60))
+        logger.info(f"Starting eigsh (chunked matvec, ncv={ncv}) ...")
+        evals, evecs = cusla.eigsh(A, k=n_comps, ncv=ncv, which="LM", v0=v0)
+    finally:
+        C.close()
 
     ix = cp.argsort(evals)[::-1]
     return evals[ix], evecs[:, ix]
@@ -495,12 +406,12 @@ def spectral(
         eigenvalues in ``adata.uns["spectral_eigenvalue"]``.
         If False, return ``(eigenvalues, eigenvectors)`` as numpy arrays.
     chunk_size
-        When set, process the matrix in row-batches of this many cells
-        instead of loading the full matrix into GPU memory at once.  Only
-        one chunk resides on the GPU at a time during each Lanczos
-        iteration, trading throughput for reduced peak GPU memory.
-        Recommended values: 20 000 – 50 000.  ``None`` (default) loads the
-        full matrix to the GPU (fastest, but requires enough VRAM).
+        When set, use the matrix in row chunks of this many cells. Chunks
+        are kept on the GPU while they fit in half of its free memory, and
+        the others are streamed from host memory at every Lanczos product,
+        so any matrix that fits in host memory can be embedded; the matrix
+        itself is not modified. ``None`` (default) loads the full matrix to
+        the GPU, or uses chunks of 50,000 cells above 100,000 cells.
         The chunked products are not run-to-run reproducible in the last
         bits, whatever ``deterministic`` says.
     deterministic
@@ -523,10 +434,12 @@ def spectral(
     of the matrix the deterministic product needs. A matrix already on the GPU
     is copied first rather than normalized in place.
 
-    When ``chunk_size`` is set, peak GPU memory is roughly one chunk. The full
-    matrix stays on the CPU, row chunks are streamed to the GPU for each eigsh
-    matvec, and throughput is lower because each matvec requires two passes
-    over the streamed chunks.
+    When ``chunk_size`` is set, the count matrix is used as it is: its values
+    and int32 column indices, about 6 bytes per entry for counts stored as
+    uint16. Chunks take at most half of the GPU's free memory; each Lanczos
+    product reads the matrix twice, and the chunks that did not fit are
+    copied from host memory both times, so it runs at the speed of the host
+    to GPU link.
 
     The algorithm:
 
@@ -548,7 +461,7 @@ def spectral(
     >>> adata.obsm["X_spectral"].shape
     (n_cells, n_effective_comps)
 
-    For large datasets that cause GPU OOM:
+    For large datasets that do not fit on the GPU:
 
     >>> gatac.dr.spectral(adata, chunk_size=30_000)
     """
@@ -600,7 +513,7 @@ def spectral(
         X_cpu = X
 
         # Pre-slice feature_weights if provided; IDF otherwise computed on GPU
-        # inside _spectral_chunked via chunked bincount.
+        # inside _spectral_chunked from the column entry counts.
         fw = None
         if feature_weights is not None:
             fw = np.asarray(feature_weights, dtype=np.float32)

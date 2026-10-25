@@ -102,6 +102,13 @@
   The tile table is built once per genome and tile size, and no garbage
   collection runs between batches. It runs under the stream-ordered memory
   pool.
+- `dr.spectral` in chunks uses the count matrix as it is: the IDF weights,
+  row norms and degrees scale the vectors of each product instead of the
+  matrix, which is never rewritten. Chunks stay on the GPU while they fit in
+  half of its free memory, the others are streamed from page-locked host
+  memory, and the kernels read the rows through the matrix's own `indptr`;
+  the per-chunk float copies, the host round trips of the normalization and
+  the CPU degree computation are gone.
 - `make_gene_matrix` finds the transcript domains of each insertion with one
   binary search: the domain starts and ends cut each chromosome into segments
   that every domain covers a contiguous run of. It checked the last 100
@@ -213,6 +220,9 @@
 
 ### Fixed
 
+- `dr.spectral` in chunks (any `chunk_size`, and by default on large
+  datasets) replaced `adata.X` with the normalized float32 matrix when no
+  feature subset was taken (`features=None`).
 - `dr.spectral` streaming the matrix in chunks (any `chunk_size`, and by
   default on large datasets) read int64 indices as int32, which scipy uses
   once the number of non-zeros exceeds the int32 range, and gave most entries

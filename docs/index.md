@@ -4,6 +4,7 @@
 :maxdepth: 1
 
 installation
+overview
 tutorials/index
 changelog
 contributing

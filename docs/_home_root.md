@@ -27,7 +27,12 @@ that far exceed available GPU RAM.
 ```{button-link} api/io.html#parquet-fragment-format
 :color: primary
 :outline:
-Inside the Parquet file
+Parquet format
+```
+```{button-link} overview.html
+:color: success
+:outline:
+Pipeline overview
 ```
 :::
 

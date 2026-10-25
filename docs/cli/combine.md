@@ -74,6 +74,9 @@ ga.pp.combine(
 
 ## Recommended workflow for multi-sample studies
 
+The [Overview](../overview.md) shows how these steps connect, through
+clustering and peak calling.
+
 ```bash
 # 1. Convert fragments
 gatac convert "samples/*.tsv.gz" --output-dir parquets/

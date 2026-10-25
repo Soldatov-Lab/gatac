@@ -93,6 +93,12 @@
   int64, as scipy would pick, so the matrix loads without copying its
   indices. The input is taken as binary when every file is, not only the
   first.
+- `make_tile_matrix` keeps each batch's tile counts on the GPU and builds the
+  matrix there, a slab of cells at a time, copying it to the host once; it
+  moved every batch to the host and back, then summed all of them at once.
+  The tile table is built once per genome and tile size, and no garbage
+  collection runs between batches. It runs under the stream-ordered memory
+  pool.
 - `make_gene_matrix` finds the transcript domains of each insertion with one
   binary search: the domain starts and ends cut each chromosome into segments
   that every domain covers a contiguous run of. It checked the last 100

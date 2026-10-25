@@ -3,12 +3,13 @@ GPU-accelerated tile matrix generation from ATAC fragment data.
 
 Memory strategy: stream Parquet row-groups in batches so the full
 fragment file never needs to reside in GPU memory.  Within each batch,
-tile insertions are computed for *all* chromosomes at once (one groupby
-instead of ~25), then COO triplets are accumulated on the host.  The
-final CSR matrix is assembled with SciPy.
+tile insertions are computed for *all* chromosomes at once and summed per
+(cell, tile); the sums stay on the GPU, where the CSR matrix is built
+once at the end and copied to the host.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import time
 import gc
@@ -25,6 +26,7 @@ import scipy.sparse as sp
 
 from .._readers import read_metrics
 from ..io.fragments import FragmentFile
+from ._utils import async_memory_pool, cleanup_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -78,20 +80,21 @@ def _process_batch_on_gpu(
     return rows, cols, data
 
 
-def _tile_counts_gpu(
+def _insertions_gpu(
     cell_idx: cp.ndarray,
     tile_offset: cp.ndarray,
     start: cp.ndarray,
     end: cp.ndarray,
     count: Optional[cp.ndarray],
     tile_size: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """
-    Per (cell, tile) insertion counts for one batch of fragments.
+    One (cell, tile, count) triplet per Tn5 insertion of a batch of fragments.
 
     ``tile_offset`` is the global index of the first tile of each fragment's
     chromosome. ``count`` None counts each fragment once (``"unique"``).
-    Returns the COO components on the host.
+    A fragment whose two ends fall in different tiles gives one triplet per
+    tile; one within a tile gives a single triplet.
     """
     end = end.astype(cp.int32)
     n = len(cell_idx)
@@ -123,6 +126,24 @@ def _tile_counts_gpu(
         all_data[n:] = count[cross_idx]
 
     del cell_idx, tile_s, tile_e, count, cross_idx
+    return all_rows, all_cols, all_data
+
+
+def _tile_counts_gpu(
+    cell_idx: cp.ndarray,
+    tile_offset: cp.ndarray,
+    start: cp.ndarray,
+    end: cp.ndarray,
+    count: Optional[cp.ndarray],
+    tile_size: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per (cell, tile) insertion counts for one batch of fragments, as COO
+    components on the host. See :func:`_insertions_gpu` for the arguments.
+    """
+    all_rows, all_cols, all_data = _insertions_gpu(
+        cell_idx, tile_offset, start, end, count, tile_size,
+    )
 
     # Aggregate per (cell, tile) on GPU
     insertions = cudf.DataFrame({
@@ -148,6 +169,117 @@ def _tile_counts_gpu(
     cp.get_default_memory_pool().free_all_blocks()
 
     return rows, cols, data
+
+
+def _tile_key_counts_gpu(
+    cell_idx: cp.ndarray,
+    tile_offset: cp.ndarray,
+    start: cp.ndarray,
+    end: cp.ndarray,
+    count: Optional[cp.ndarray],
+    tile_size: int,
+    n_tiles: int,
+) -> Tuple[cp.ndarray, cp.ndarray]:
+    """
+    Per (cell, tile) insertion counts for one batch of fragments, kept on the
+    GPU as sorted int64 keys ``cell * n_tiles + tile`` and int32 counts.
+    """
+    rows, cols, data = _insertions_gpu(cell_idx, tile_offset, start, end, count, tile_size)
+    key = rows.astype(cp.int64) * n_tiles + cols
+    del rows, cols
+    agg = (
+        cudf.DataFrame({"key": key, "count": data.astype(cp.int32)})
+        .groupby("key", sort=True)["count"]
+        .sum()
+    )
+    return agg.index.values, agg.values.astype(cp.int32, copy=False)
+
+
+def _iter_slabs(
+    keys: List[cp.ndarray],
+    counts: List[cp.ndarray],
+    n_cells: int,
+    n_tiles: int,
+    slab_entries: int = 1 << 25,
+):
+    """
+    Sum the per-batch counts of each (cell, tile) key, a slab of cells at a
+    time, and yield ``(r0, r1, rows, cols, data)`` on the GPU: the summed
+    entries of rows ``r0:r1``, sorted by row then column, ``rows`` absolute.
+
+    A (cell, tile) pair can appear in several batches, hence the second sum.
+    Each slab holds about ``slab_entries`` batch entries, a slice of every
+    batch's sorted keys, so that the sum never holds all the batches'
+    entries twice over.
+    """
+    total = sum(len(k) for k in keys)
+    n_slabs = max(1, -(-total // slab_entries))
+    bounds = np.linspace(0, n_cells, n_slabs + 1).astype(np.int64)
+    cuts = [cp.searchsorted(k, cp.asarray(bounds * n_tiles)).get() for k in keys]
+    for s in range(n_slabs):
+        r0, r1 = int(bounds[s]), int(bounds[s + 1])
+        key = cp.concatenate([k[c[s]:c[s + 1]] for k, c in zip(keys, cuts)])
+        if len(key) == 0:
+            continue
+        agg = (
+            cudf.DataFrame({
+                "key": key,
+                "count": cp.concatenate([v[c[s]:c[s + 1]] for v, c in zip(counts, cuts)]),
+            })
+            .groupby("key", sort=True)["count"]
+            .sum()
+        )
+        del key
+        key = agg.index.values
+        rows = key // n_tiles
+        cols = (key - rows * n_tiles).astype(cp.int32)
+        data = agg.values.astype(cp.int32, copy=False)
+        del agg, key
+        yield r0, r1, rows, cols, data
+
+
+def _csr_from_key_counts(
+    keys: List[cp.ndarray],
+    counts: List[cp.ndarray],
+    n_cells: int,
+    n_tiles: int,
+) -> sp.csr_matrix:
+    """
+    The host CSR matrix of the per-batch (cell, tile) counts: uint16 data,
+    sorted column indices, built on the GPU a slab of cells at a time.
+    """
+    data_parts, index_parts = [], []
+    row_nnz = np.zeros(n_cells, dtype=np.int64)
+    for r0, r1, rows, cols, data in _iter_slabs(keys, counts, n_cells, n_tiles):
+        index_parts.append(cols.get())
+        data_parts.append(data.astype(cp.uint16).get())
+        row_nnz[r0:r1] = cp.bincount(rows - r0, minlength=r1 - r0).get()
+    if not data_parts:
+        return sp.csr_matrix((n_cells, n_tiles), dtype=np.uint16)
+    nnz = int(row_nnz.sum())
+    # one index dtype for both arrays, as scipy picks it
+    idx_dtype = np.int32 if max(nnz, n_tiles) <= np.iinfo(np.int32).max else np.int64
+    indptr = np.zeros(n_cells + 1, dtype=idx_dtype)
+    np.cumsum(row_nnz, out=indptr[1:])
+    return sp.csr_matrix(
+        (np.concatenate(data_parts), np.concatenate(index_parts).astype(idx_dtype, copy=False), indptr),
+        shape=(n_cells, n_tiles),
+    )
+
+
+@functools.lru_cache(maxsize=4)
+def _cached_tile_metadata(
+    included_chroms: Tuple[str, ...],
+    sizes: Tuple[int, ...],
+    tile_size: int,
+) -> Tuple[pd.DataFrame, cudf.DataFrame, int]:
+    """:func:`_build_tile_metadata_and_offsets`, built once per genome and tile size.
+
+    Callers must not modify the returned tables.
+    """
+    return _build_tile_metadata_and_offsets(
+        list(included_chroms), dict(zip(included_chroms, sizes)), tile_size,
+    )
 
 
 def _build_tile_metadata_and_offsets(
@@ -199,6 +331,89 @@ def _build_tile_metadata_and_offsets(
         'tile_offset': np.array(list(offsets.values()), dtype=np.int32),
     })
     return tile_metadata, chrom_offset_df, offset
+
+
+def _included_chroms(chrom_sizes: dict, exclude_chroms) -> Tuple[List[str], List[str]]:
+    """All chromosomes of ``chrom_sizes``, sorted, and those not excluded."""
+    all_chroms = sorted(chrom_sizes.keys())
+    if not exclude_chroms:
+        return all_chroms, all_chroms
+    if isinstance(exclude_chroms, str):
+        exclude_chroms = [exclude_chroms]
+    return all_chroms, [c for c in all_chroms if c not in exclude_chroms]
+
+
+def _tile_cells(
+    fragments: FragmentFile,
+    all_chroms: List[str],
+    cell_meta_extra: Optional[pd.DataFrame],
+    min_fragments_per_cell: int,
+) -> pd.DataFrame:
+    """
+    The cells of one fragment file, sorted by barcode: those with at least
+    ``min_fragments_per_cell`` unique fragments on ``all_chroms``, among the
+    metrics' barcodes when given, with ``n_unique`` and the metrics' other
+    columns.
+    """
+    barcode_counts = fragments.barcode_counts(chroms=all_chroms)[['barcode', 'n_unique']]
+    if cell_meta_extra is not None:
+        # Restrict to candidate barcodes
+        barcode_counts = barcode_counts[
+            barcode_counts['barcode'].isin(set(cell_meta_extra['barcode']))
+        ]
+    barcode_counts = barcode_counts[barcode_counts['n_unique'] >= int(min_fragments_per_cell)]
+    if len(barcode_counts) == 0:
+        raise ValueError(
+            f"No cells passed the min_fragments_per_cell filter in {fragments.path.name}."
+        )
+    cells = barcode_counts.sort_values('barcode').reset_index(drop=True)
+    if cell_meta_extra is not None:
+        # Merge extra columns from provided metrics
+        extra_cols = [c for c in cell_meta_extra.columns if c not in ('barcode', 'n_unique')]
+        if extra_cols:
+            cells = cells.merge(cell_meta_extra[['barcode'] + extra_cols], on='barcode', how='left')
+    return cells
+
+
+def _stream_key_counts(
+    fragments: FragmentFile,
+    cells: List[str],
+    included_chroms: List[str],
+    tile_offsets: cp.ndarray,
+    n_tiles: int,
+    tile_size: int,
+    count_strategy: str,
+    row_groups_per_batch: int,
+) -> Tuple[List[cp.ndarray], List[cp.ndarray]]:
+    """
+    Per (cell, tile) counts of each batch of row groups, kept on the GPU,
+    the cell being the index in ``cells``. See :func:`_tile_key_counts_gpu`.
+    """
+    effective_strategy = 'unique' if count_strategy == 'binarize' else count_strategy
+    frag_columns = ['chrom', 'start', 'end']
+    if effective_strategy == 'count':
+        frag_columns.append('count')
+
+    keys: list[cp.ndarray] = []
+    counts: list[cp.ndarray] = []
+    for batch in fragments.iter_batches(
+        frag_columns, row_groups_per_batch, chroms=included_chroms, cells=cells,
+    ):
+        if len(batch) == 0:
+            continue
+        key, count = _tile_key_counts_gpu(
+            batch['cell'].values,
+            tile_offsets[batch['chrom'].values],
+            batch['start'].values,
+            batch['end'].values,
+            batch['count'].values if effective_strategy == 'count' else None,
+            tile_size,
+            n_tiles,
+        )
+        del batch
+        keys.append(key)
+        counts.append(count)
+    return keys, counts
 
 
 def _cleanup_gpu():
@@ -838,6 +1053,33 @@ def make_tile_matrix(
     if isinstance(chrom_sizes, str):
         chrom_sizes = get_chrom_sizes(chrom_sizes)
 
+    with async_memory_pool():
+        adata = _make_tile_matrix_one(
+            input, output_path, chrom_sizes=chrom_sizes, tile_size=tile_size,
+            min_fragments_per_cell=min_fragments_per_cell, exclude_chroms=exclude_chroms,
+            metrics=metrics, filter_query=filter_query, count_strategy=count_strategy,
+            barcode_prefix=barcode_prefix, low_memory=low_memory,
+            row_groups_per_batch=row_groups_per_batch,
+        )
+    cleanup_gpu_memory()
+    return adata
+
+
+def _make_tile_matrix_one(
+    input: str | Path | ad.AnnData,
+    output_path: Optional[str | Path],
+    chrom_sizes: dict[str, int],
+    tile_size: int,
+    min_fragments_per_cell: int,
+    exclude_chroms: Optional[list],
+    metrics,
+    filter_query: Optional[str],
+    count_strategy: str,
+    barcode_prefix: Optional[str],
+    low_memory: bool,
+    row_groups_per_batch: int,
+) -> ad.AnnData:
+    """:func:`make_tile_matrix` of one input."""
     input_is_adata = isinstance(input, ad.AnnData)
     input_path = None if input_is_adata else Path(input)
     resolved_output_path = Path(output_path) if output_path is not None else None
@@ -862,165 +1104,48 @@ def make_tile_matrix(
     if low_memory:
         row_groups_per_batch = min(row_groups_per_batch, 8)
 
-    # ------------------------------------------------------------------ #
-    # 1. Chromosome setup                                                  #
-    # ------------------------------------------------------------------ #
-    all_chroms = sorted(chrom_sizes.keys())
-    if exclude_chroms:
-        if isinstance(exclude_chroms, str):
-            exclude_chroms = [exclude_chroms]
-        included_chroms = [c for c in all_chroms if c not in exclude_chroms]
-    else:
-        included_chroms = all_chroms
-
-    all_chroms_set = set(all_chroms)
-    included_chroms_set = set(included_chroms)
-
-    # ------------------------------------------------------------------ #
-    # 2. Tile metadata & chrom-offset lookup                               #
-    # ------------------------------------------------------------------ #
-    tile_metadata, chrom_offset_df, n_tiles_total = (
-        _build_tile_metadata_and_offsets(included_chroms, chrom_sizes, tile_size)
+    all_chroms, included_chroms = _included_chroms(chrom_sizes, exclude_chroms)
+    tile_metadata, chrom_offset_df, n_tiles_total = _cached_tile_metadata(
+        tuple(included_chroms), tuple(chrom_sizes[c] for c in included_chroms), tile_size,
     )
-    logger.debug(
-        f"Created {n_tiles_total:,} tiles across {len(included_chroms)} chromosomes"
-    )
-
-    # ------------------------------------------------------------------ #
-    # 3. Fragment file                                                     #
-    # ------------------------------------------------------------------ #
     fragments = FragmentFile(input_path)
-
-    # ------------------------------------------------------------------ #
-    # 4. Count barcodes                                                    #
-    # ------------------------------------------------------------------ #
-    barcode_counts = fragments.barcode_counts(chroms=all_chroms)[['barcode', 'n_unique']]
-
-    cell_meta_extra = _load_metrics_dataframe(metrics, filter_query)
-    if cell_meta_extra is not None:
-        # Restrict to candidate barcodes
-        barcode_counts = barcode_counts[
-            barcode_counts['barcode'].isin(set(cell_meta_extra['barcode']))
-        ]
-
-    barcode_counts = barcode_counts[barcode_counts['n_unique'] >= int(min_fragments_per_cell)]
-    valid_barcodes = sorted(barcode_counts['barcode'].values)
-    n_unique_map = dict(zip(barcode_counts['barcode'], barcode_counts['n_unique']))
-    n_cells = len(valid_barcodes)
-    if n_cells == 0:
-        raise ValueError("No cells passed the min_fragments_per_cell filter.")
+    cell_meta_pd = _tile_cells(
+        fragments, all_chroms, _load_metrics_dataframe(metrics, filter_query),
+        min_fragments_per_cell,
+    )
+    n_cells = len(cell_meta_pd)
     logger.debug(f"Retained {n_cells:,} cells")
 
-    # ------------------------------------------------------------------ #
-    # 5. Stream row groups: build tile COO                                 #
-    # ------------------------------------------------------------------ #
-    effective_strategy = (
-        'unique' if count_strategy == 'binarize' else count_strategy
+    # Per (cell, tile) counts of each batch, kept on the GPU
+    keys, counts = _stream_key_counts(
+        fragments, list(cell_meta_pd['barcode']), included_chroms,
+        chrom_offset_df['tile_offset'].values, n_tiles_total, tile_size,
+        count_strategy, row_groups_per_batch,
     )
-    # Tile offset of each included chromosome (built in `included_chroms` order)
-    tile_offsets = chrom_offset_df['tile_offset'].values
 
-    host_rows: list[np.ndarray] = []
-    host_cols: list[np.ndarray] = []
-    host_data: list[np.ndarray] = []
-
-    frag_columns = ['chrom', 'start', 'end']
-    if effective_strategy == 'count':
-        frag_columns.append('count')
-
-    for batch in fragments.iter_batches(
-        frag_columns, row_groups_per_batch, chroms=included_chroms, cells=valid_barcodes,
-    ):
-        if len(batch) == 0:
-            del batch
-            _cleanup_gpu()
-            continue
-
-        rows, cols, data = _tile_counts_gpu(
-            batch['cell'].values,
-            tile_offsets[batch['chrom'].values],
-            batch['start'].values,
-            batch['end'].values,
-            batch['count'].values if effective_strategy == 'count' else None,
-            tile_size,
-        )
-        del batch
-        _cleanup_gpu()
-
-        if len(rows) > 0:
-            host_rows.append(rows)
-            host_cols.append(cols)
-            host_data.append(data)
-
-    # ------------------------------------------------------------------ #
-    # 6. Assemble sparse matrix (GPU COO → CSR for speed)                  #
-    # ------------------------------------------------------------------ #
-    if host_rows:
-        all_rows = np.concatenate(host_rows)
-        all_cols = np.concatenate(host_cols)
-        all_data = np.concatenate(host_data).astype(np.float32)
-        del host_rows, host_cols, host_data
-
-        # Build COO → CSR on GPU (avoids expensive CPU sort)
+    # The CSR matrix, built on the GPU and copied to the host once
+    if keys:
         try:
-            coo_gpu = cusp.coo_matrix(
-                (
-                    cp.asarray(all_data),
-                    (cp.asarray(all_rows), cp.asarray(all_cols)),
-                ),
-                shape=(n_cells, n_tiles_total),
-            )
-            csr_gpu = coo_gpu.tocsr()
-            del coo_gpu
-            matrix = sp.csr_matrix(
-                (
-                    csr_gpu.data.get().astype(np.uint16),
-                    csr_gpu.indices.get(),
-                    csr_gpu.indptr.get(),
-                ),
-                shape=csr_gpu.shape,
-            )
-            del csr_gpu
-            _cleanup_gpu()
+            matrix = _csr_from_key_counts(keys, counts, n_cells, n_tiles_total)
         except (MemoryError, RuntimeError):
-            warning_msg = (
+            # cupy's OutOfMemoryError and RMM's bad_alloc are MemoryErrors
+            logger.warning(
                 "GPU OOM during sparse matrix assembly. "
                 "Falling back to CPU assembly (this may be slow)."
             )
-            logger.warning(warning_msg)
-            # Fall back to CPU if GPU OOM during assembly
-            _cleanup_gpu()
+            key = np.concatenate([k.get() for k in keys])
+            count = np.concatenate([c.get() for c in counts])
             matrix = sp.coo_matrix(
-                (all_data, (all_rows, all_cols)),
+                (count, (key // n_tiles_total, key % n_tiles_total)),
                 shape=(n_cells, n_tiles_total),
-                dtype=np.float32,
-            ).tocsr()
-        del all_rows, all_cols, all_data
+            ).tocsr().astype(np.uint16)
+            del key, count
+        del keys, counts
     else:
-        matrix = sp.csr_matrix((n_cells, n_tiles_total), dtype=np.float32)
+        matrix = sp.csr_matrix((n_cells, n_tiles_total), dtype=np.uint16)
 
     if count_strategy == 'binarize':
-        matrix.data[:] = 1.0
-
-    # ------------------------------------------------------------------ #
-    # 7. Build cell metadata & AnnData                                     #
-    # ------------------------------------------------------------------ #
-    cell_meta_pd = pd.DataFrame({
-        'barcode': valid_barcodes,
-        'n_unique': [n_unique_map[bc] for bc in valid_barcodes],
-    })
-
-    if cell_meta_extra is not None:
-        # Merge extra columns from provided metrics
-        extra_cols = [
-            c for c in cell_meta_extra.columns
-            if c not in ('barcode', 'n_unique')
-        ]
-        if extra_cols:
-            cell_meta_pd = cell_meta_pd.merge(
-                cell_meta_extra[['barcode'] + extra_cols],
-                on='barcode', how='left',
-            )
+        matrix.data[:] = 1
 
     adata = tile_matrix_to_anndata(matrix, cell_meta_pd, tile_metadata)
 

@@ -115,6 +115,12 @@
   domains starting before every insertion, which also missed a long domain
   once more than 100 others started inside it. PBMC 5k: 19.3 s -> 6.5 s
   (SnapATAC2 34 s), same GPU memory.
+- `make_gene_matrix` takes each chromosome's fragments as one slice of the
+  fragments grouped by chromosome; it masked the whole file once per
+  chromosome, after sorting it by barcode. The annotation is parsed once per
+  file and options, the counts are cast to their dtype and the matrix is
+  sorted on the GPU, and it runs under the stream-ordered memory pool. The
+  output is unchanged.
 - `make_gene_matrix` returns the matrix without writing it when
   `output_path` is None, as `make_tile_matrix` does; it used to write
   `<input>_gene_matrix.h5ad`. `gatac gene` still writes there by default.

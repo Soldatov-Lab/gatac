@@ -5,6 +5,7 @@ Implements paired-insertion counting strategy matching SnapATAC2.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import time
 import gc
@@ -19,6 +20,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from .._readers import read_gtf, read_metrics
+from ._utils import async_memory_pool
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +159,15 @@ def load_gene_annotation(
     return result
 
 
+@functools.lru_cache(maxsize=4)
+def _cached_gene_annotation(gtf_path: str, mtime_ns: int, **kwargs) -> pd.DataFrame:
+    """:func:`load_gene_annotation`, parsed once per file version and options.
+
+    Callers must not modify the returned table.
+    """
+    return load_gene_annotation(gtf_path, **kwargs)
+
+
 def create_gene_matrix_gpu(
     fragments_df: cudf.DataFrame,
     gene_regions: pd.DataFrame,
@@ -271,16 +282,30 @@ def create_gene_matrix_gpu(
     fetch_chroms = [c for c in valid_chroms if c in chrom_cats]
     fragments_df = fragments_df[fragments_df['chrom'].isin(fetch_chroms)]
 
-    # Get unique barcodes and create mapping
-    unique_barcodes = fragments_df['barcode'].unique().reset_index(drop=True)
-    n_cells = len(unique_barcodes)
+    # Cells sorted by barcode
+    barcode_codes = fragments_df['barcode'].cat.codes.values
+    barcode_list = sorted(barcode_cats[c] for c in cp.unique(barcode_codes).get().tolist())
+    n_cells = len(barcode_list)
     logger.debug(f"Retained {n_cells} cells")
 
     # Cell index of each fragment, through the categorical codes of its barcode
-    barcode_list = unique_barcodes.to_arrow().to_pylist()
     code_to_cell = np.full(len(barcode_cats), -1, dtype=np.int32)
     code_to_cell[[barcode_cat_pos[b] for b in barcode_list]] = np.arange(n_cells, dtype=np.int32)
-    frag_cells = cp.asarray(code_to_cell)[fragments_df['barcode'].cat.codes.values]
+    frag_cells = cp.asarray(code_to_cell)[barcode_codes]
+    del barcode_codes
+
+    # Fragments grouped by chromosome, each chromosome a contiguous slice
+    chrom_codes = fragments_df['chrom'].cat.codes.values.astype(cp.int32)
+    by_chrom = cp.argsort(chrom_codes)
+    chrom_codes = chrom_codes[by_chrom]
+    frag_starts = fragments_df['start'].values[by_chrom]
+    frag_ends = fragments_df['end'].values[by_chrom]
+    frag_cells = frag_cells[by_chrom]
+    del by_chrom, fragments_df
+    chrom_bounds = cp.searchsorted(
+        chrom_codes, cp.arange(len(chrom_cats) + 1, dtype=cp.int32)).get()
+    del chrom_codes
+    chrom_code = {c: i for i, c in enumerate(chrom_cats)}
 
     # Filter and prepare gene data
     gene_df = gene_df[gene_df['chrom'].isin(valid_chroms)]
@@ -322,16 +347,16 @@ def create_gene_matrix_gpu(
     # features with transcripts on several.
     chrom_feature_counts = []
     for chrom in valid_chroms:
-        if chrom not in chrom_gene_data or chrom not in chrom_cats:
+        if chrom not in chrom_gene_data or chrom not in chrom_code:
             continue
-        in_chrom = (fragments_df['chrom'] == chrom).values
-        if not in_chrom.any():
+        lo, hi = chrom_bounds[chrom_code[chrom]], chrom_bounds[chrom_code[chrom] + 1]
+        if lo == hi:
             continue
         gene_data = chrom_gene_data[chrom]
         transcript_counts = _count_fragment_gene_overlaps(
-            fragments_df['start'].values[in_chrom],
-            fragments_df['end'].values[in_chrom],
-            frag_cells[in_chrom],
+            frag_starts[lo:hi],
+            frag_ends[lo:hi],
+            frag_cells[lo:hi],
             gene_data['starts'],
             gene_data['ends'],
             gene_data['indices'],
@@ -344,32 +369,32 @@ def create_gene_matrix_gpu(
         )
         del transcript_counts
 
-    # CSR from the (cell, feature) pairs sorted on the GPU
+    # CSR from the (cell, feature) pairs, sorted as int64 keys
+    # cell * n_features + feature on the GPU, in the smallest count dtype
     if chrom_feature_counts:
         feature_counts = cudf.concat(chrom_feature_counts, ignore_index=True)
         del chrom_feature_counts
-        feature_counts = (feature_counts.groupby(['cell_idx', 'final_feature_idx'])['count'].max()
-                          .reset_index().sort_values(['cell_idx', 'final_feature_idx']))
-        max_count_overall = int(feature_counts['count'].max())
-        cells = feature_counts['cell_idx'].values
+        key = (feature_counts['cell_idx'].values.astype(cp.int64) * n_final_features
+               + feature_counts['final_feature_idx'].values)
+        agg = (cudf.DataFrame({'key': key, 'count': feature_counts['count'].values})
+               .groupby('key', sort=True)['count'].max())
+        del feature_counts, key
+        key, counts = agg.index.values, agg.values
+        del agg
+        cells = key // n_final_features
+        matrix_dtype = optimize_sparse_matrix_dtype(int(counts.max()))
         indptr = cp.searchsorted(cells, cp.arange(n_cells + 1, dtype=cells.dtype))
+        # one index dtype for both arrays, as scipy picks it
+        idx_dtype = np.int32 if max(len(key), n_final_features) <= np.iinfo(np.int32).max else np.int64
         matrix = sp.csr_matrix(
-            (feature_counts['count'].values.astype(cp.int32).get(),
-             feature_counts['final_feature_idx'].values.get(),
-             indptr.get()),
+            (counts.astype(matrix_dtype).get(),
+             (key - cells * n_final_features).astype(idx_dtype).get(),
+             indptr.astype(idx_dtype).get()),
             shape=(n_cells, n_final_features),
         )
-        del feature_counts, cells, indptr
+        del key, counts, cells, indptr
     else:
-        max_count_overall = 0
-        matrix = sp.csr_matrix((n_cells, n_final_features), dtype=np.int32)
-
-    # Optimize dtype based on actual max value
-    if max_count_overall > 0:
-        matrix_dtype = optimize_sparse_matrix_dtype(max_count_overall)
-        matrix = matrix.astype(matrix_dtype)
-    else:
-        matrix = matrix.astype(np.uint8)
+        matrix = sp.csr_matrix((n_cells, n_final_features), dtype=np.uint8)
 
     # Prepare gene metadata (unique features): chrom, names, ID and strand of
     # the feature's first transcript in the annotation, and the span of its
@@ -644,8 +669,9 @@ def make_gene_matrix(
         output_path = Path(output_path)
 
     # Load gene annotation
-    gene_regions = load_gene_annotation(
-        gtf_path=gene_anno,
+    gene_regions = _cached_gene_annotation(
+        str(gene_anno.resolve()),
+        gene_anno.stat().st_mtime_ns,
         id_type=id_type,
         upstream=upstream,
         downstream=downstream,
@@ -667,13 +693,8 @@ def make_gene_matrix(
 
     def _read_and_process(use_low_mem: bool, exclude: Optional[List[str]] = None):
         df = read_fragments_parquet(input_parquet, low_memory=use_low_mem)
-        
-        df_sorted = df.sort_values('barcode')
-        del df
-        _cleanup_memory()
-
         matrix, cell_metadata, gene_metadata = create_gene_matrix_gpu(
-            fragments_df=df_sorted,
+            fragments_df=df,
             gene_regions=gene_regions,
             exclude_chroms=exclude,
             min_fragments_per_cell=min_fragments_per_cell,
@@ -685,7 +706,8 @@ def make_gene_matrix(
 
     start_time = time.perf_counter()
     try:
-        matrix, cell_metadata, gene_metadata = _read_and_process(low_memory, exclude_chroms)
+        with async_memory_pool():
+            matrix, cell_metadata, gene_metadata = _read_and_process(low_memory, exclude_chroms)
     except (MemoryError, RuntimeError) as e:
         err_msg = str(e).lower()
         is_oom = "out of memory" in err_msg or "std::bad_alloc" in err_msg or "cudaerrormemoryallocation" in err_msg
@@ -694,7 +716,8 @@ def make_gene_matrix(
             if not low_memory:
                 logger.warning(f"CUDA Out of Memory. Retrying with low_memory=True: {e}")
                 _cleanup_memory()
-                matrix, cell_metadata, gene_metadata = _read_and_process(True, exclude_chroms)
+                with async_memory_pool():
+                    matrix, cell_metadata, gene_metadata = _read_and_process(True, exclude_chroms)
             else:
                 logger.error(f"CUDA Out of Memory even with low_memory=True: {e}")
                 raise e

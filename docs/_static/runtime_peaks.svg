@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 166" width="100%" style="max-width:760px" role="img" aria-labelledby="rt-peaks-title">
+  <title id="rt-peaks-title">Run time from the fragment files to the peak matrix: SnapATAC2 9 h 41 min, GATAC 1 h 06 min</title>
+  <style>
+    .rt-text  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-base, sans-serif); font-size: 13px; }
+    .rt-muted { fill: var(--pst-color-text-muted, #59636e); font-family: var(--pst-font-family-base, sans-serif); font-size: 12px; }
+    .rt-bold  { font-weight: 600; }
+    .rt-seg   { font-family: var(--pst-font-family-base, sans-serif); font-size: 11.5px; }
+    .rt-s1 { fill: #2a78d6; } .rt-i1 { fill: #fff; }
+    .rt-s2 { fill: #eb6834; } .rt-i2 { fill: #fff; }
+    .rt-s3 { fill: #1baf7a; } .rt-i3 { fill: #0b0b0b; }
+    .rt-s4 { fill: #eda100; } .rt-i4 { fill: #0b0b0b; }
+    .rt-s5 { fill: #e87ba4; } .rt-i5 { fill: #0b0b0b; }
+    .rt-s6 { fill: #008300; } .rt-i6 { fill: #fff; }
+    .rt-s7 { fill: #6250d6; } .rt-i7 { fill: #fff; }
+    html[data-theme="dark"] .rt-s1 { fill: #3987e5; } html[data-theme="dark"] .rt-i1 { fill: #fff; }
+    html[data-theme="dark"] .rt-s2 { fill: #d95926; } html[data-theme="dark"] .rt-i2 { fill: #fff; }
+    html[data-theme="dark"] .rt-s3 { fill: #199e70; } html[data-theme="dark"] .rt-i3 { fill: #fff; }
+    html[data-theme="dark"] .rt-s4 { fill: #c98500; } html[data-theme="dark"] .rt-i4 { fill: #0b0b0b; }
+    html[data-theme="dark"] .rt-s5 { fill: #d55181; } html[data-theme="dark"] .rt-i5 { fill: #fff; }
+    html[data-theme="dark"] .rt-s6 { fill: #008300; } html[data-theme="dark"] .rt-i6 { fill: #fff; }
+    html[data-theme="dark"] .rt-s7 { fill: #9085e9; } html[data-theme="dark"] .rt-i7 { fill: #fff; }
+  </style>
+  <rect x="100" y="8" width="12" height="12" rx="3" class="rt-s1"/>
+  <text x="118" y="18" class="rt-muted">Import</text>
+  <rect x="178.16" y="8" width="12" height="12" rx="3" class="rt-s2"/>
+  <text x="196.16" y="18" class="rt-muted">QC + filter</text>
+  <rect x="288.12" y="8" width="12" height="12" rx="3" class="rt-s3"/>
+  <text x="306.12" y="18" class="rt-muted">Tiles + selection</text>
+  <rect x="436.24" y="8" width="12" height="12" rx="3" class="rt-s4"/>
+  <text x="454.24" y="18" class="rt-muted">Embedding + clusters</text>
+  <rect x="603.44" y="8" width="12" height="12" rx="3" class="rt-s5"/>
+  <text x="621.44" y="18" class="rt-muted">Gene matrix</text>
+  <rect x="100" y="30" width="12" height="12" rx="3" class="rt-s6"/>
+  <text x="118" y="40" class="rt-muted">Peak calling</text>
+  <rect x="216.32" y="30" width="12" height="12" rx="3" class="rt-s7"/>
+  <text x="234.32" y="40" class="rt-muted">Peak matrix</text>
+  <text x="90" y="87.0" text-anchor="end" class="rt-text rt-bold">SnapATAC2</text>
+  <g><title>Import: SnapATAC2 1 h 18 min, GATAC 37 min (×2.1)</title>
+    <rect x="100.0" y="64" width="67.6" height="36" rx="3" class="rt-s1"/>
+  </g>
+  <g><title>QC + filter: SnapATAC2 9.3 min, GATAC 4.7 min (×2.0)</title>
+    <rect x="169.6" y="64" width="6.3" height="36" rx="3" class="rt-s2"/>
+  </g>
+  <g><title>Tiles + selection: SnapATAC2 42 min, GATAC 4.6 min (×9.3)</title>
+    <rect x="178.0" y="64" width="36.0" height="36" rx="3" class="rt-s3"/>
+  </g>
+  <g><title>Embedding + clusters: SnapATAC2 36 min, GATAC 35 s (×62.4)</title>
+    <rect x="216.0" y="64" width="30.5" height="36" rx="3" class="rt-s4"/>
+  </g>
+  <g><title>Gene matrix: SnapATAC2 21 min, GATAC 2.3 min (×8.9)</title>
+    <rect x="248.5" y="64" width="16.6" height="36" rx="3" class="rt-s5"/>
+  </g>
+  <g><title>Peak calling: SnapATAC2 6 h 20 min, GATAC 16 min (×24.3)</title>
+    <rect x="267.1" y="64" width="338.3" height="36" rx="3" class="rt-s6"/>
+    <text x="436.3" y="86.0" text-anchor="middle" class="rt-seg rt-i6">Peak calling 6 h 20 min</text>
+  </g>
+  <g><title>Peak matrix: SnapATAC2 14 min, GATAC 1.4 min (×10.0)</title>
+    <rect x="607.4" y="64" width="10.6" height="36" rx="3" class="rt-s7"/>
+  </g>
+  <text x="628.0" y="87.0" class="rt-text rt-bold">9 h 41 min</text>
+  <text x="90" y="137.0" text-anchor="end" class="rt-text rt-bold">GATAC</text>
+  <g><title>Import: GATAC 37 min, SnapATAC2 1 h 18 min (×2.1)</title>
+    <rect x="100.0" y="114" width="30.9" height="36" rx="3" class="rt-s1"/>
+  </g>
+  <g><title>QC + filter: GATAC 4.7 min, SnapATAC2 9.3 min (×2.0)</title>
+    <rect x="132.9" y="114" width="2.2" height="36" rx="3" class="rt-s2"/>
+  </g>
+  <g><title>Tiles + selection: GATAC 4.6 min, SnapATAC2 42 min (×9.3)</title>
+    <rect x="137.1" y="114" width="2.1" height="36" rx="3" class="rt-s3"/>
+  </g>
+  <g><title>Embedding + clusters: GATAC 35 s, SnapATAC2 36 min (×62.4)</title>
+    <rect x="141.1" y="114" width="1.0" height="36" rx="3" class="rt-s4"/>
+  </g>
+  <g><title>Gene matrix: GATAC 2.3 min, SnapATAC2 21 min (×8.9)</title>
+    <rect x="141.7" y="114" width="1.0" height="36" rx="3" class="rt-s5"/>
+  </g>
+  <g><title>Peak calling: GATAC 16 min, SnapATAC2 6 h 20 min (×24.3)</title>
+    <rect x="143.8" y="114" width="12.0" height="36" rx="3" class="rt-s6"/>
+  </g>
+  <g><title>Peak matrix: GATAC 1.4 min, SnapATAC2 14 min (×10.0)</title>
+    <rect x="157.8" y="114" width="1.0" height="36" rx="3" class="rt-s7"/>
+  </g>
+  <text x="167.1" y="137.0" class="rt-text rt-bold">1 h 06 min  ·  ×8.8 faster</text>
+</svg>

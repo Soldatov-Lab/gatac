@@ -164,6 +164,58 @@ The [tutorials](tutorials/index) run these steps on one sample.
 
 ---
 
+## Run time
+
+These steps were timed on a cohort of 79 samples (225 GB of gzipped
+fragment files, 530,592 cells after filtering), against SnapATAC2
+{cite:p}`Zhang2024` 2.9.0 (commit
+[`55dde65`](https://github.com/scverse/SnapATAC2/commit/55dde65eb0e487724794aaa275bf9792fcb90bfd))
+running the same steps. Each tool had 20 CPU cores, and GATAC one A100 GPU.
+Each tool called peaks on its own Leiden clusters. SnapATAC2's `tl.macs3`
+(MACS3 3.0.4) ran with 10 workers, as 20 ran out of memory: each worker
+holds the pileup of one cluster. Hover over a segment for both tools'
+times.
+
+::::{tab-set}
+
+:::{tab-item} To the clusters
+
+```{raw} html
+:file: _static/runtime_clustering.svg
+```
+
+:::
+
+:::{tab-item} To the peak matrix
+
+```{raw} html
+:file: _static/runtime_peaks.svg
+```
+
+:::
+
+::::
+
+| Stage | SnapATAC2 | GATAC | Speedup |
+|-------|-----------|-------|---------|
+| Import | 1 h 18 min | 37 min | ×2.1 |
+| QC + filter | 9.3 min | 4.7 min | ×2.0 |
+| Tiles + selection | 42 min | 4.6 min | ×9.3 |
+| Embedding + clusters | 36 min | 35 s | ×62 |
+| Gene matrix | 21 min | 2.3 min | ×8.9 |
+| Peak calling | 6 h 20 min | 16 min | ×24 |
+| Peak matrix | 14 min | 1.4 min | ×10 |
+
+Import, which writes the Parquet files, is about half of GATAC's time to the
+peak matrix: it decompresses the gzipped fragment files on the CPU. It is done
+once per sample, and every later step reads the Parquet files.
+For GATAC, "Tiles + selection" includes loading the tile matrix, and
+"Embedding + clusters" includes the kNN graph and Leiden clustering.
+Single-function comparisons on PBMC 5k, which can be rerun, are in
+[Reproducibility](reproducibility).
+
+---
+
 ## Fragment files
 
 Every step that reads fragments streams them from Parquet files to the

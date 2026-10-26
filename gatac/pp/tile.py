@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from .._cupy_compat import bincount
 from .._readers import read_metrics
 from ..io.fragments import FragmentFile
 from ._utils import async_memory_pool, cleanup_gpu_memory
@@ -250,7 +251,10 @@ def _add_tile_stats(stats: dict, cols, data, n_tiles: int, binarize: bool = Fals
     xp = cp.get_array_module(cols)
     data = xp.ones(len(cols), dtype=xp.float64) if binarize else data.astype(xp.float64)
     for k, w in (("n_cells", None), ("count", data), ("count_sq", data * data)):
-        add = xp.bincount(cols, weights=w, minlength=n_tiles)
+        if w is None and xp is cp:
+            add = bincount(cols, minlength=n_tiles)
+        else:
+            add = xp.bincount(cols, weights=w, minlength=n_tiles)
         stats[k] = add if k not in stats else stats[k] + add
 
 
@@ -283,7 +287,7 @@ def _csr_from_key_counts(
             _add_tile_stats(stats, cols, data, n_tiles, binarize)
         index_parts.append(cols.get())
         data_parts.append(data.astype(cp.uint16).get())
-        row_nnz[r0:r1] = cp.bincount(rows - r0, minlength=r1 - r0).get()
+        row_nnz[r0:r1] = bincount(rows - r0, minlength=r1 - r0).get()
     if not data_parts:
         return sp.csr_matrix((n_cells, n_tiles), dtype=np.uint16)
     nnz = int(row_nnz.sum())

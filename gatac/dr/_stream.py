@@ -19,6 +19,8 @@ import cupy as cp
 import numpy as np
 import scipy.sparse as sp
 
+from .._cupy_compat import bincount
+
 logger = logging.getLogger(__name__)
 
 _DTYPES = {np.dtype(np.uint8): "unsigned char", np.dtype(np.uint16): "unsigned short",
@@ -256,5 +258,5 @@ class StreamedCounts:
         """Number of stored entries per column."""
         df = cp.zeros(self.shape[1], dtype=cp.int64)
         for _, _, i in self._iter():
-            df += cp.bincount(i, minlength=self.shape[1])
+            df += bincount(i, minlength=self.shape[1])
         return df

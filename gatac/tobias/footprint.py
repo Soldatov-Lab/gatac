@@ -41,6 +41,7 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 
+from .._cupy_compat import bincount
 from .._readers import read_bed
 from ..io.fragments import FragmentFile
 
@@ -559,7 +560,7 @@ def _correct_chrom(out_regions: np.ndarray, cuts_fr, seq_d: cp.ndarray, model: d
         popt = cp.empty((n_win, 2))
         status = cp.empty(n_win, dtype=cp.int32)
         _launch(relu, n_win, (bias, unc, wstart, cp.int32(n_win), cp.int32(WINDOW), pred, popt, status))
-        stats[strand] = cp.asnumpy(cp.bincount(status, minlength=4))
+        stats[strand] = cp.asnumpy(bincount(status, minlength=4))
         slots = cp.zeros((lay.n, 10))
         slots[wstart[:, None] + cp.arange(WINDOW)[None, :], wslot[:, None]] = pred
         del pred, popt, status

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from numba import njit, prange
 
+from .._cupy_compat import bincount
 from .._readers import read_bed
 from ..io.fragments import FragmentFile
 from ..pp.genome import get_chrom_sizes
@@ -949,7 +950,7 @@ def _count_file_peaks(
         return row_nnz, np.zeros(0, np.int32), np.zeros(0, np.int32)
     cols_parts, data_parts = [], []
     for r0, r1, rows, cols, data in _iter_slabs(keys, counts, len(cells), n_peaks):
-        row_nnz[r0:r1] = cp.bincount(rows - r0, minlength=r1 - r0).get()
+        row_nnz[r0:r1] = bincount(rows - r0, minlength=r1 - r0).get()
         cols_parts.append(cols.get())
         data_parts.append(data.get())
     del keys, counts

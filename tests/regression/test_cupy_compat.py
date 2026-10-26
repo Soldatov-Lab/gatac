@@ -1,10 +1,27 @@
 """bincount workaround for the CuPy 14 CUB histogram crash, and the chunked host -> device copy."""
+import ast
+from pathlib import Path
+
 import cupy as cp
 import numpy as np
 import pytest
 
+import gatac
 import gatac._cupy_compat as compat
 from gatac._cupy_compat import bincount, to_device
+
+
+def test_no_unweighted_cupy_bincount():
+    # Unweighted cp.bincount takes the crashing CUB path; gatac code calls the wrapper instead
+    found = []
+    for path in Path(gatac.__file__).parent.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "bincount" and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in ("cp", "cupy", "xp")
+                    and not any(k.arg == "weights" for k in node.keywords)):
+                found.append(f"{path.name}:{node.lineno}")
+    assert not found, f"use gatac._cupy_compat.bincount: {found}"
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.int64])

@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from .._cupy_compat import bincount
 from ..io.fragments import FragmentFile
 from ._utils import async_memory_pool, cleanup_gpu_memory
 from .tile import (
@@ -303,7 +304,7 @@ def build_tile_matrix(
             for s0, s1, rows, cols, data in _iter_slabs(keys, counts, r1 - r0, n_tiles):
                 new_col = remap[cols]
                 keep = new_col >= 0
-                row_nnz[s0:s1] = cp.bincount(rows[keep] - s0, minlength=s1 - s0).get()
+                row_nnz[s0:s1] = bincount(rows[keep] - s0, minlength=s1 - s0).get()
                 cols_parts.append(new_col[keep].get())
                 kept = data[keep]
                 data_parts.append(

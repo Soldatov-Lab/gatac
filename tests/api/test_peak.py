@@ -228,6 +228,15 @@ def test_make_matrix_from_several_files_matches_single_file(peaks, split_parquet
     assert (got.X != peaks.X).nnz == 0
 
 
+def test_make_matrix_sums_a_cell_found_in_several_files(peaks, world, chrom_sizes):
+    """A list of files holding the same cells counts their fragments in every file."""
+    merged = ga.peak.merge(peaks.uns["gmacs"], chrom_sizes=chrom_sizes)
+    peaks.uns["peaks"] = merged
+    once = ga.peak.make_matrix(peaks, world["parquet"], genome=chrom_sizes, verbose=False)
+    twice = ga.peak.make_matrix(peaks, [world["parquet"], world["parquet"]], genome=chrom_sizes, verbose=False)
+    assert ((twice.X.astype(np.int64) - 2 * once.X.astype(np.int64)) != 0).nnz == 0
+
+
 # ------------------------------------------------------------------------ markers
 
 

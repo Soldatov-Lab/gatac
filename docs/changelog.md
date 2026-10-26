@@ -121,6 +121,13 @@
   file and options, the counts are cast to their dtype and the matrix is
   sorted on the GPU, and it runs under the stream-ordered memory pool. The
   output is unchanged.
+- `peak.make_matrix` keeps each batch's (cell, peak) counts on the GPU and
+  builds each file's rows there, as `make_tile_matrix` does; the matrix is
+  assembled once on the host, in its final dtype. It converted every file's
+  counts to a CSR matrix on the host and added it to the running total,
+  which grew slower with every file. All chromosomes of a batch are counted
+  at once, and it runs under the stream-ordered memory pool. The output is
+  unchanged.
 - `make_gene_matrix` returns the matrix without writing it when
   `output_path` is None, as `make_tile_matrix` does; it used to write
   `<input>_gene_matrix.h5ad`. `gatac gene` still writes there by default.

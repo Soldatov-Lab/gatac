@@ -23,7 +23,9 @@ from numba import njit, prange
 from .._readers import read_bed
 from ..io.fragments import FragmentFile
 from ..pp.genome import get_chrom_sizes
+from ..pp._utils import async_memory_pool, cleanup_gpu_memory
 from ..pp.gene import optimize_sparse_matrix_dtype
+from ..pp.tile import _iter_slabs
 from . import _macs
 
 logger = logging.getLogger(__name__)
@@ -831,229 +833,174 @@ def _expand_ranges(lo: cp.ndarray, hi: cp.ndarray) -> tuple[cp.ndarray, cp.ndarr
     return i, k - (ends - n)[i] + lo[i]
 
 
-def _count_fragments_in_peaks_gpu(
-    fragments_df: cudf.DataFrame,
-    peaks_by_chrom: dict,
-    cell_index: cp.ndarray,
-    chrom_names: list,
+def _peak_keys(peaks_df: pd.DataFrame, chroms: list) -> tuple:
+    """
+    The peaks on ``chroms`` as sorted int64 keys ``chrom << 32 | position``
+    of their starts and ends, ``chrom`` being the index in ``chroms``, with
+    their column in the matrix (their row in ``peaks_df``). Also returns the
+    widest peak and whether the peaks are disjoint.
+    """
+    code = pd.Series(np.arange(len(chroms), dtype=np.int64), index=chroms)
+    on = peaks_df['chrom'].isin(chroms).to_numpy()
+    chrom = code.reindex(peaks_df['chrom'].to_numpy()[on]).to_numpy() << 32
+    starts = cp.asarray(chrom | peaks_df['start'].to_numpy()[on].astype(np.int64))
+    ends = cp.asarray(chrom | peaks_df['end'].to_numpy()[on].astype(np.int64))
+    cols = cp.asarray(np.flatnonzero(on), dtype=cp.int64)
+    order = cp.argsort(starts)
+    starts, ends, cols = starts[order], ends[order], cols[order]
+    if len(starts) == 0:
+        return starts, ends, cols, 0, True
+    max_width = int((ends - starts).max())
+    disjoint = bool(cp.all(starts[1:] >= ends[:-1]))
+    return starts, ends, cols, max_width, disjoint
+
+
+def _peak_key_counts_gpu(
+    df: cudf.DataFrame,
+    peaks: tuple,
     n_peaks: int,
     counting_strategy: str = "paired-insertion",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[cp.ndarray, cp.ndarray]:
     """
-    Count fragment insertions overlapping with peaks using GPU-accelerated operations.
-    
-    Uses optimized searchsorted for O(N log M) overlap detection.
-    
-    Parameters
-    ----------
-    fragments_df : cudf.DataFrame
-        Fragments with 'chrom' (index into ``chrom_names``), 'start', 'end'
-        and 'cell' (index into ``cell_index``) columns
-    peaks_by_chrom : dict
-        Pre-grouped peaks dict: {chrom: (starts_cp, ends_cp, peak_indices_cp)}
-    cell_index : cp.ndarray
-        Output row (cell index) of each value of the 'cell' column
-    chrom_names : list of str
-        Chromosome names indexed by the 'chrom' column
-    n_peaks : int
-        Total number of peaks
-    counting_strategy : str
-        Counting strategy: 'paired-insertion' (default), 'insertion', or 'fragment'
-        
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray, np.ndarray]
-        (rows, cols, data) as numpy arrays for sparse matrix construction
+    Per (cell, peak) counts of one batch of fragments, kept on the GPU as
+    sorted int64 keys ``cell * n_peaks + peak`` and int32 counts.
+
+    ``df`` has the 'chrom', 'start', 'end' and 'cell' columns of
+    :meth:`FragmentFile.iter_batches`, ``peaks`` is :func:`_peak_keys` of
+    the same chromosomes. Positions are compared as keys
+    ``chrom << 32 | position``, so all chromosomes are counted at once.
     """
-    all_results = []
-    
-    # Add global fragment index column to preserve indices through chromosome filtering
-    fragments_df = fragments_df.reset_index(drop=True)
-    fragments_df['_global_frag_idx'] = cp.arange(len(fragments_df), dtype=cp.int64)
-    
-    # Process each chromosome
-    for ci in cp.unique(fragments_df['chrom'].values).get():
-        chrom = chrom_names[ci]
-        if chrom not in peaks_by_chrom:
-            continue
-            
-        chrom_frags = fragments_df[fragments_df['chrom'] == ci]
-        peak_starts, peak_ends, peak_indices = peaks_by_chrom[chrom]
-        
-        if len(chrom_frags) == 0:
-            continue
-        
-        # Get fragment arrays on GPU
-        frag_starts = chrom_frags['start'].to_cupy()
-        frag_ends = chrom_frags['end'].to_cupy()
-        global_frag_indices = chrom_frags['_global_frag_idx'].to_cupy()
-        
-        def emit(f_local, p_local):
-            if len(f_local) > 0:
-                all_results.append(cudf.DataFrame({
-                    'frag_idx': global_frag_indices[f_local],
-                    'peak_idx': peak_indices[p_local],
-                }))
+    peak_starts, peak_ends, peak_cols, max_width, disjoint = peaks
+    chrom = df['chrom'].values.astype(cp.int64) << 32
+    start = chrom | df['start'].values.astype(cp.int64)
+    end = chrom | df['end'].values.astype(cp.int64)
+    del chrom
 
-        # Peaks from peak.merge never overlap, so the peak holding a position
-        # is the last one starting at or before it. A peak_file may hold
-        # overlapping peaks: then every peak starting within the widest peak's
-        # width before the position is a candidate.
-        max_width = int((peak_ends - peak_starts).max())
-        disjoint = bool(cp.all(peak_starts[1:] >= peak_ends[:-1]))
+    if counting_strategy == "fragment":
+        # Frag overlaps peak if: frag_start < peak_end AND frag_end > peak_start
+        lo = cp.searchsorted(peak_starts, start - max_width, side='right')
+        hi = cp.searchsorted(peak_starts, end, side='left')
+        f, p = _expand_ranges(lo, hi)
+        keep = peak_ends[p] > start[f]
+        f, p = f[keep], p[keep]
+    elif disjoint:
+        # Insertions at start and end - 1. Peaks from peak.merge never
+        # overlap, so the peak holding a position is the last one starting
+        # at or before it
+        ins2 = end - 1
+        idx1 = cp.searchsorted(peak_starts, start, side='right') - 1
+        valid1 = (idx1 >= 0) & (start < peak_ends[idx1])
+        idx2 = cp.searchsorted(peak_starts, ins2, side='right') - 1
+        valid2 = (idx2 >= 0) & (ins2 < peak_ends[idx2])
+        if counting_strategy == "paired-insertion":
+            # Both insertions in one peak: count the fragment once
+            valid2 &= ~valid1 | (idx1 != idx2)
+        v1, v2 = cp.flatnonzero(valid1), cp.flatnonzero(valid2)
+        f, p = cp.concatenate([v1, v2]), cp.concatenate([idx1[v1], idx2[v2]])
+        del ins2, idx1, idx2, valid1, valid2, v1, v2
+    else:
+        # A peak_file may hold overlapping peaks: then every peak starting
+        # within the widest peak's width before the position is a candidate
+        fs, ps = [], []
+        for pos in (start, end - 1):
+            lo = cp.searchsorted(peak_starts, pos - max_width, side='right')
+            hi = cp.searchsorted(peak_starts, pos, side='right')
+            f, p = _expand_ranges(lo, hi)
+            keep = pos[f] < peak_ends[p]
+            fs.append(f[keep])
+            ps.append(p[keep])
+        f, p = cp.concatenate(fs), cp.concatenate(ps)
+        if counting_strategy == "paired-insertion":
+            # A fragment with both insertions in one peak counts once
+            pair = cp.unique(f * len(peak_starts) + p)
+            f, p = pair // len(peak_starts), pair % len(peak_starts)
+    del start, end
 
-        if counting_strategy == "fragment":
-            # Frag overlaps peak if: frag_start < peak_end AND frag_end > peak_start
-            lo = cp.searchsorted(peak_starts, frag_starts.astype(cp.int64) - max_width, side='right')
-            hi = cp.searchsorted(peak_starts, frag_ends, side='left')
-            f_local, p_local = _expand_ranges(lo, hi)
-            keep = peak_ends[p_local] > frag_starts[f_local]
-            emit(f_local[keep], p_local[keep])
-        else:
-            # Insertion-based counting (paired-insertion or insertion), at
-            # start and end - 1. Insertion at p is in peak if:
-            # peak_start <= p < peak_end
-            ins2_pos = frag_ends - 1
-            if disjoint:
-                idx1 = cp.searchsorted(peak_starts, frag_starts, side='right') - 1
-                valid1 = (idx1 >= 0) & (frag_starts < peak_ends[idx1])
-                idx2 = cp.searchsorted(peak_starts, ins2_pos, side='right') - 1
-                valid2 = (idx2 >= 0) & (ins2_pos < peak_ends[idx2])
-                if counting_strategy == "paired-insertion":
-                    # Both insertions in one peak: count the fragment once
-                    valid2 &= ~valid1 | (idx1 != idx2)
-                v1 = cp.where(valid1)[0]
-                v2 = cp.where(valid2)[0]
-                emit(v1, idx1[v1])
-                emit(v2, idx2[v2])
-            else:
-                for pos in (frag_starts, ins2_pos):
-                    lo = cp.searchsorted(peak_starts, pos.astype(cp.int64) - max_width, side='right')
-                    hi = cp.searchsorted(peak_starts, pos, side='right')
-                    f_local, p_local = _expand_ranges(lo, hi)
-                    keep = pos[f_local] < peak_ends[p_local]
-                    # paired-insertion: the drop_duplicates below counts a
-                    # fragment with both insertions in one peak once
-                    emit(f_local[keep], p_local[keep])
-        
-        mempool.free_all_blocks()
-    
-    if len(all_results) == 0:
-        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-    
-    # Concatenate all overlap results
-    all_overlaps = cudf.concat(all_results, ignore_index=True)
-    del all_results
-    
-    # Cell index of each overlapping fragment (frag_idx is the row in fragments_df)
-    frag_cells = fragments_df['cell'].values
-    all_overlaps['cell_idx'] = cell_index[frag_cells[all_overlaps['frag_idx'].values]]
-    
-    # For paired-insertion, count each (fragment, peak) pair once
-    if counting_strategy == "paired-insertion":
-        all_overlaps = all_overlaps.drop_duplicates(subset=['frag_idx', 'peak_idx'])
-    
-    # Aggregate by (cell_idx, peak_idx) using GPU groupby
-    counts = all_overlaps.groupby(['cell_idx', 'peak_idx']).size().reset_index(name='count')
-    
-    # Convert to numpy arrays
-    rows = counts['cell_idx'].to_pandas().values
-    cols = counts['peak_idx'].to_pandas().values
-    data = counts['count'].to_pandas().values
-    
-    del all_overlaps, counts, frag_cells
-    mempool.free_all_blocks()
-    
-    return rows, cols, data
+    key = df['cell'].values.astype(cp.int64)[f] * n_peaks + peak_cols[p]
+    del f, p
+    agg = cudf.DataFrame({'key': key}).groupby('key', sort=True).size()
+    return agg.index.values, agg.values.astype(cp.int32, copy=False)
 
 
-def _read_and_count_fragments_batched(
-    parquet_path: Path,
-    barcodes: set,
-    peaks_gpu: cudf.DataFrame,
-    barcode_to_idx: dict,
+def _count_file_peaks(
+    fragments: FragmentFile,
+    cells: list,
+    chroms: list,
+    peaks: tuple,
     n_peaks: int,
-    batch_size: int = 10,
-    counting_strategy: str = "paired-insertion",
-    filter_chromosomes: bool = True,
-    chrom_names: Optional[list[str]] = None,
+    batch_size: int,
+    counting_strategy: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Read fragments from parquet in batches and count insertions in peaks.
-    
-    Uses chunked row group reading to avoid OOM when processing large files.
-    
-    Parameters
-    ----------
-    parquet_path : Path
-        Path to the fragment parquet file
-    barcodes : set
-        Set of barcodes to include
-    peaks_gpu : cudf.DataFrame
-        Peaks DataFrame on GPU
-    barcode_to_idx : dict
-        Mapping from barcode to cell index
-    n_peaks : int
-        Total number of peaks
-    batch_size : int
-        Number of row groups to load at once
-    counting_strategy : str
-        Counting strategy: 'paired-insertion' (default), 'insertion', or 'fragment'
-    filter_chromosomes : bool
-        If True, only keep fragments from chromosomes present in `chrom_names` (default: True).
-    chrom_names : list[str], optional
-        List of allowed chromosome names for filtering.
-        
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray, np.ndarray]
-        (rows, cols, data) as numpy arrays for sparse matrix construction
+    The peak counts of ``cells`` in one fragment file, as the host CSR
+    components ``(row_nnz, cols, data)`` of its ``len(cells)`` rows, columns
+    sorted within each row. The counts of each batch stay on the GPU, and
+    the rows are summed and assembled there a slab of cells at a time.
     """
-    fragments = FragmentFile(parquet_path)
-    logger.debug(f"Reading {fragments.path.name}: {fragments.num_row_groups} row groups")
-    
-    # Output row of each barcode of this file (once)
-    cells = list(barcodes)
-    cell_index = cp.asarray([barcode_to_idx[b] for b in cells], dtype=cp.int64)
-    
-    # Pre-group peaks by chromosome (once)
-    peaks_by_chrom = {}
-    for chrom in peaks_gpu['chrom'].to_pandas().unique():
-        chrom_peaks = peaks_gpu[peaks_gpu['chrom'] == chrom]
-        peaks_by_chrom[chrom] = (
-            chrom_peaks['start'].to_cupy(),
-            chrom_peaks['end'].to_cupy(),
-            chrom_peaks['peak_idx'].to_cupy(),
-        )
-    
-    # Only fragments on chromosomes with peaks can overlap one
-    allowed = set(chrom_names) if filter_chromosomes and chrom_names is not None else None
-    chroms = [c for c in peaks_by_chrom if allowed is None or c in allowed]
-    
-    all_rows = []
-    all_cols = []
-    all_data = []
-    
-    # Process row groups in batches
-    for filtered in fragments.iter_batches(
-        ['chrom', 'start', 'end'], batch_size, chroms=chroms, cells=cells,
-    ):
-        if len(filtered) > 0:
-            rows, cols, data = _count_fragments_in_peaks_gpu(
-                filtered, peaks_by_chrom, cell_index, chroms, n_peaks, counting_strategy
-            )
-            all_rows.append(rows)
-            all_cols.append(cols)
-            all_data.append(data)
-        
-        del filtered
-        mempool.free_all_blocks()
-        pinned_mempool.free_all_blocks()
-    
-    # Concatenate all batches
-    if len(all_rows) > 0:
-        return np.concatenate(all_rows), np.concatenate(all_cols), np.concatenate(all_data)
-    return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+    keys, counts = [], []
+    for df in fragments.iter_batches(['chrom', 'start', 'end'], batch_size, chroms=chroms, cells=cells):
+        if len(df) > 0:
+            k, c = _peak_key_counts_gpu(df, peaks, n_peaks, counting_strategy)
+            keys.append(k)
+            counts.append(c)
+        del df
+    row_nnz = np.zeros(len(cells), dtype=np.int64)
+    if not keys:
+        return row_nnz, np.zeros(0, np.int32), np.zeros(0, np.int32)
+    cols_parts, data_parts = [], []
+    for r0, r1, rows, cols, data in _iter_slabs(keys, counts, len(cells), n_peaks):
+        row_nnz[r0:r1] = cp.bincount(rows - r0, minlength=r1 - r0).get()
+        cols_parts.append(cols.get())
+        data_parts.append(data.get())
+    del keys, counts
+    if not cols_parts:
+        return row_nnz, np.zeros(0, np.int32), np.zeros(0, np.int32)
+    return row_nnz, np.concatenate(cols_parts), np.concatenate(data_parts)
+
+
+def _assemble_rows(parts: list, n_cells: int, n_peaks: int):
+    """
+    The CSR matrix of per-file rows ``(rows, row_nnz, cols, data)``, ``rows``
+    being the sorted output rows of the file's cells, in the smallest count
+    dtype. A row given by several files is their sum.
+    """
+    import scipy.sparse as sp
+
+    hits = np.zeros(n_cells, dtype=np.int64)
+    for rows, *_ in parts:
+        hits[rows] += 1
+    if hits.max(initial=0) > 1:
+        # the same cell in several files (a list of files): sum them
+        rows = np.concatenate([np.repeat(r, n) for r, n, _, _ in parts])
+        X = sp.coo_matrix(
+            (np.concatenate([d for *_, d in parts]), (rows, np.concatenate([c for _, _, c, _ in parts]))),
+            shape=(n_cells, n_peaks),
+        ).tocsr()
+        return X.astype(optimize_sparse_matrix_dtype(int(X.data.max())), copy=False)
+
+    row_nnz = np.zeros(n_cells, dtype=np.int64)
+    for rows, n, _, _ in parts:
+        row_nnz[rows] = n
+    nnz = int(row_nnz.sum())
+    # one index dtype for both arrays, as scipy picks it
+    idx_dtype = np.int32 if max(nnz, n_peaks) <= np.iinfo(np.int32).max else np.int64
+    indptr = np.zeros(n_cells + 1, dtype=idx_dtype)
+    np.cumsum(row_nnz, out=indptr[1:])
+    max_count = max((int(d.max()) for *_, d in parts if len(d)), default=0)
+    data = np.empty(nnz, dtype=optimize_sparse_matrix_dtype(max_count) if nnz else np.int32)
+    indices = np.empty(nnz, dtype=idx_dtype)
+    for rows, n, c, d in parts:
+        # each file's rows go to their place in the matrix: one slice when
+        # they are consecutive (rows are sorted)
+        if rows[-1] - rows[0] + 1 == len(rows):
+            lo = int(indptr[rows[0]])
+            data[lo:lo + len(d)] = d
+            indices[lo:lo + len(c)] = c
+            continue
+        dest = np.repeat(indptr[rows] - (np.cumsum(n) - n), n) + np.arange(len(c))
+        data[dest] = d
+        indices[dest] = c
+    return sp.csr_matrix((data, indices, indptr), shape=(n_cells, n_peaks))
 
 
 def make_matrix(
@@ -1178,17 +1125,15 @@ def make_matrix(
     
     logger.info(f"Counting fragments in {len(peaks_df):,} peaks")
     
-    # Sort peaks and add index
+    # Sort peaks
     peaks_df = peaks_df.sort_values(['chrom', 'start']).reset_index(drop=True)
-    
-    # Convert peaks to cuDF for GPU processing
-    peaks_gpu = cudf.DataFrame(peaks_df)
-    peaks_gpu['peak_idx'] = cp.arange(len(peaks_gpu))
-    
-    # Build sparse matrix dimensions
     n_cells = len(adata.obs)
     n_peaks = len(peaks_df)
-    
+
+    # Only fragments on chromosomes with peaks can overlap one
+    allowed = set(chrom_names) if filter_chromosomes and chrom_names is not None else None
+    chroms = [c for c in pd.unique(peaks_df['chrom'].astype(str)) if allowed is None or c in allowed]
+
     # Create cell index mapping (barcode -> row index)
     barcode_to_idx = {cell: idx for idx, cell in enumerate(adata.obs.index)}
     all_barcodes = set(adata.obs.index)
@@ -1224,11 +1169,6 @@ def make_matrix(
             file_to_barcodes = {parquet_path: all_barcodes}
             logger.info("Processing single parquet file")
     
-    # Build CSR matrix incrementally to avoid OOM from holding COO + CSR simultaneously
-    # Initialize accumulator as None (will be created with first batch)
-    count_matrix = None
-    matrix_dtype = np.int32  # Will be refined later
-    
     # Process each parquet file
     n_files = len(parquet_files)
     if verbose == "tqdm" or verbose is True:
@@ -1239,82 +1179,54 @@ def make_matrix(
     
     import time
     start_time = time.time()
-    
-    for file_idx, parquet_file in enumerate(file_iter):
-        if not parquet_file.exists():
-            logger.warning(f"Parquet file not found: {parquet_file}")
-            continue
-        
-        barcodes_for_file = file_to_barcodes[parquet_file]
-        
-        if len(barcodes_for_file) == 0:
-            continue
-        
-        # Log progress if verbose="log"
-        if verbose == "log":
-            elapsed = time.time() - start_time
-            if file_idx > 0:
-                eta = elapsed / file_idx * (n_files - file_idx)
-                eta_str = f", ETA: {eta:.1f}s"
-            else:
-                eta_str = ""
-            print(
-                f"[{file_idx + 1}/{n_files}] Processing {parquet_file.name}: "
-                f"{len(barcodes_for_file):,} barcodes{eta_str}",
-                flush=True,
+
+    # Per file: the output rows of its cells and their peak counts
+    parts = []
+    with async_memory_pool():
+        peaks = _peak_keys(peaks_df, chroms)
+        for file_idx, parquet_file in enumerate(file_iter):
+            if not parquet_file.exists():
+                logger.warning(f"Parquet file not found: {parquet_file}")
+                continue
+
+            barcodes_for_file = file_to_barcodes[parquet_file]
+
+            if len(barcodes_for_file) == 0:
+                continue
+
+            # Log progress if verbose="log"
+            if verbose == "log":
+                elapsed = time.time() - start_time
+                if file_idx > 0:
+                    eta = elapsed / file_idx * (n_files - file_idx)
+                    eta_str = f", ETA: {eta:.1f}s"
+                else:
+                    eta_str = ""
+                print(
+                    f"[{file_idx + 1}/{n_files}] Processing {parquet_file.name}: "
+                    f"{len(barcodes_for_file):,} barcodes{eta_str}",
+                    flush=True,
+                )
+
+            logger.debug(f"Processing {parquet_file.name}: {len(barcodes_for_file):,} barcodes")
+
+            # The file's cells in matrix order
+            cells = sorted(barcodes_for_file, key=barcode_to_idx.__getitem__)
+            row_nnz, cols, data = _count_file_peaks(
+                FragmentFile(parquet_file), cells, chroms, peaks, n_peaks,
+                batch_size, counting_strategy,
             )
-        
-        logger.debug(f"Processing {parquet_file.name}: {len(barcodes_for_file):,} barcodes")
-        
-        # Read and count fragments in batches
-        rows, cols, data = _read_and_count_fragments_batched(
-            parquet_file,
-            barcodes_for_file,
-            peaks_gpu,
-            barcode_to_idx,
-            n_peaks,
-            batch_size=batch_size,
-            counting_strategy=counting_strategy,
-            filter_chromosomes=filter_chromosomes,
-            chrom_names=chrom_names,
-        )
-        
-        # Convert batch to CSR immediately and add to accumulator
-        # This avoids holding all COO data in memory until the end
-        if len(rows) > 0:
-            # Create CSR for this batch (coo -> csr aggregates duplicates)
-            batch_matrix = sp.coo_matrix(
-                (data, (rows, cols)),
-                shape=(n_cells, n_peaks),
-                dtype=np.int32,
-            ).tocsr()
-            
-            # Free the COO data immediately
-            del rows, cols, data
-            
-            if count_matrix is None:
-                count_matrix = batch_matrix
-            else:
-                # CSR addition is efficient and in-place friendly
-                count_matrix = count_matrix + batch_matrix
-            
-            del batch_matrix
-        
-        # Cleanup
-        gc.collect()
-        mempool.free_all_blocks()
-        pinned_mempool.free_all_blocks()
+            if len(cols) > 0:
+                rows = np.fromiter((barcode_to_idx[b] for b in cells), dtype=np.int64, count=len(cells))
+                # cells without a count here, as all of a list's cells are in other files
+                seen = row_nnz > 0
+                parts.append((rows[seen], row_nnz[seen], cols, data))
+        del peaks
+    cleanup_gpu_memory()
+
+    count_matrix = _assemble_rows(parts, n_cells, n_peaks)
+    del parts
     
-    # Handle empty case
-    if count_matrix is None:
-        count_matrix = sp.csr_matrix((n_cells, n_peaks), dtype=np.int32)
-    
-    # Optimize dtype to save memory
-    if count_matrix.nnz > 0:
-        max_count = int(count_matrix.data.max())
-        target_dtype = optimize_sparse_matrix_dtype(max_count)
-        if target_dtype != count_matrix.dtype:
-            count_matrix = count_matrix.astype(target_dtype)
     
     logger.info(f"Peak matrix: {n_cells:,} cells × {n_peaks:,} peaks")
     if n_cells * n_peaks > 0:

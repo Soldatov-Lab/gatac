@@ -160,8 +160,9 @@ def load_gene_annotation(
 
 
 @functools.lru_cache(maxsize=4)
-def _cached_gene_annotation(gtf_path: str, mtime_ns: int, **kwargs) -> pd.DataFrame:
-    """:func:`load_gene_annotation`, parsed once per file version and options.
+def _cached_gene_annotation(resolved: str, mtime_ns: int, gtf_path: str, **kwargs) -> pd.DataFrame:
+    """:func:`load_gene_annotation` of ``gtf_path``, parsed once per file
+    version (its ``resolved`` path and ``mtime_ns``) and options.
 
     Callers must not modify the returned table.
     """
@@ -672,6 +673,7 @@ def make_gene_matrix(
     gene_regions = _cached_gene_annotation(
         str(gene_anno.resolve()),
         gene_anno.stat().st_mtime_ns,
+        str(gene_anno),
         id_type=id_type,
         upstream=upstream,
         downstream=downstream,

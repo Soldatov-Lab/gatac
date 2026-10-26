@@ -220,6 +220,11 @@
 
 ### Fixed
 
+- `peak.call` and `peak.make_matrix` given a directory found none of the
+  files of a tile matrix built from several fragment files, whose
+  `source_file` holds the Parquet file name: they looked for
+  `<name>.parquet.parquet`, warned that each file was missing and returned no
+  peaks, or an empty matrix.
 - `dr.spectral` in chunks (any `chunk_size`, and by default on large
   datasets) replaced `adata.X` with the normalized float32 matrix when no
   feature subset was taken (`features=None`).

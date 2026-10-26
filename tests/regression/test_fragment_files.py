@@ -528,6 +528,33 @@ def test_peaks_run(data):
         assert res.X.nnz > 0
 
 
+def test_peaks_from_a_directory_of_samples(data, tmp_path):
+    """A tile matrix of several files finds each cell's fragments by its source_file."""
+    cells = _cells(data, 80)
+    d = tmp_path / "filtered"
+    d.mkdir()
+    paths = [ga.pp.filter_fragments(data["path"], d / f"{name}.parquet",
+                                    metrics=pd.DataFrame({"barcode": part}), chrom_sizes=CHROM_SIZES)
+             for name, part in (("s1", cells[::2]), ("s2", cells[1::2]))]
+    adata = ga.pp.make_tile_matrix(paths, **SCAN_KW)
+    assert set(adata.obs["source_file"]) == {"s1.parquet", "s2.parquet"}
+    adata.obs["group"] = np.where(np.arange(adata.n_obs) % 2, "a", "b")
+
+    kw = dict(genome=CHROM_SIZES, verbose=False)
+    by_dir = ga.peak.call(adata, "group", d, inplace=False, **kw)
+    by_file = ga.peak.call(adata, "group", data["path"], inplace=False, **kw)
+    for g in by_file:
+        pd.testing.assert_frame_equal(by_dir[g], by_file[g])
+
+    peak_file = tmp_path / "peaks.bed"
+    pd.concat(by_file.values())[["chrom", "start", "end"]].drop_duplicates().to_csv(
+        peak_file, sep="\t", header=False, index=False)
+    kw.update(peak_file=peak_file, use_rep=None)
+    X_dir = ga.peak.make_matrix(adata, d, **kw).X
+    X_file = ga.peak.make_matrix(adata, data["path"], **kw).X
+    assert X_dir.nnz > 0 and (X_dir != X_file).nnz == 0
+
+
 def test_footprint_cuts(data):
     from gatac.tobias.footprint import _load_cuts
     adata = _cells_adata(data)

@@ -41,6 +41,20 @@ pinned_mempool = cp.get_default_pinned_memory_pool()
 _HOST_BYTES_PER_FRAGMENT = 8
 
 
+def _source_parquet_name(source_file: str) -> str:
+    """
+    The fragment file of a ``source_file`` value: a Parquet file name, as
+    tile matrices of several files record it, is kept; an h5ad name maps
+    ``{sample}_tile.h5ad`` or ``{sample}.h5ad`` to ``{sample}.parquet``.
+    """
+    if source_file.endswith(".parquet"):
+        return source_file
+    name = source_file.replace(".h5ad", "")
+    if name.endswith("_tile"):
+        name = name[:-5]
+    return f"{name}.parquet"
+
+
 def _available_host_memory() -> int:
     """
     Bytes of host memory still available: the system's available memory,
@@ -314,20 +328,6 @@ def call(
     )
     chroms = sorted(chrom_sizes) if filter_chromosomes else None
 
-    def _h5ad_to_parquet_name(h5ad_name: str) -> str:
-        """
-        Convert h5ad filename to parquet filename.
-        
-        Maps {sample}_tile.h5ad -> {sample}.parquet
-        """
-        # Remove .h5ad extension
-        name = h5ad_name.replace('.h5ad', '')
-        # Remove _tile suffix if present
-        if name.endswith('_tile'):
-            name = name[:-5]
-        # Add .parquet extension
-        return f"{name}.parquet"
-
     # (file, cells, their groups) to read
     if parquet_path.is_dir():
         # Directory mode - use source_file obs
@@ -341,7 +341,7 @@ def call(
         logger.info(f"Using {len(source_files)} source files from source_file obs")
         sources = []
         for src_file in source_files:
-            src_path = parquet_path / _h5ad_to_parquet_name(src_file)
+            src_path = parquet_path / _source_parquet_name(src_file)
             if not src_path.exists():
                 logger.warning(f"Parquet file not found: {src_path}")
                 continue
@@ -1193,13 +1193,6 @@ def make_matrix(
     barcode_to_idx = {cell: idx for idx, cell in enumerate(adata.obs.index)}
     all_barcodes = set(adata.obs.index)
     
-    def _h5ad_to_parquet_name(h5ad_name: str) -> str:
-        """Convert h5ad filename to parquet filename."""
-        name = h5ad_name.replace('.h5ad', '')
-        if name.endswith('_tile'):
-            name = name[:-5]
-        return f"{name}.parquet"
-    
     # Determine parquet files to process
     if isinstance(parquet_path, list):
         # List of parquet files provided directly
@@ -1219,7 +1212,7 @@ def make_matrix(
             # Group barcodes by source file
             file_to_barcodes = defaultdict(set)
             for barcode, src_file in adata.obs['source_file'].items():
-                parquet_name = _h5ad_to_parquet_name(src_file)
+                parquet_name = _source_parquet_name(src_file)
                 parquet_file = parquet_path / parquet_name
                 file_to_barcodes[parquet_file].add(barcode)
             

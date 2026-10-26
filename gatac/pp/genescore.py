@@ -534,7 +534,7 @@ def gene_score_to_anndata(matrix, cell_metadata, gene_metadata):
 
 
 def make_gene_score_matrix(
-    input_parquet: str | Path,
+    input_parquet: str | Path | List[str | Path],
     gene_anno: str | Path,
     output_path: Optional[str | Path] = None,
     gene_model: Union[str, Callable] = "exp(-abs(x)/5000) + exp(-1)",
@@ -552,7 +552,6 @@ def make_gene_score_matrix(
     min_fragments_per_cell: int = 100,
     metrics: Optional[str | Path | pd.DataFrame | "cudf.DataFrame"] = None,
     filter_query: Optional[str] = None,
-    barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
     cell_batch_size: Optional[int] = None,
     gene_name_key: str = "gene_name",
@@ -566,10 +565,18 @@ def make_gene_score_matrix(
     Parameters
     ----------
     input_parquet
-        ATAC fragments parquet (columns: chrom, start, end, barcode, count).
+        Fragment parquet file, or several, which make one matrix: the cells
+        of each file in turn, with ``obs["source_file"]`` the file's name.
+        The files must not share cell names: give each sample its own
+        barcode prefix (:func:`gatac.io.set_barcode_prefix`).
     gene_anno
         GTF/GFF gene annotation, or a CSV with columns
         ``symbol, seqnames, start, end, strand``.
+    output_path
+        Output ``.h5ad``; for one file, ``<input>_gene_score_matrix.h5ad``
+        next to it by default. A matrix of several files is only returned
+        when it is None, and otherwise written as it is built, one file at
+        a time, and returned opened from the file in backed mode.
     gene_model
         ArchR ``geneModel``: an expression string in ``x`` (signed distance to
         TSS), or a Python callable ``f(x)->weight``.
@@ -595,14 +602,6 @@ def make_gene_score_matrix(
     AnnData of shape ``(cells, genes)`` with normalised gene scores.
     """
     from ..io.fragments import read_fragments_parquet
-    import scanpy as sc
-
-    input_parquet = Path(input_parquet)
-    if output_path is None:
-        output_path = input_parquet.with_suffix("").with_name(
-            input_parquet.stem + "_gene_score_matrix.h5ad")
-    else:
-        output_path = Path(output_path)
 
     gene_regions = load_gene_score_annotation(
         gene_anno,
@@ -620,43 +619,66 @@ def make_gene_score_matrix(
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
 
-    def _run(use_low_mem):
-        df = read_fragments_parquet(input_parquet, low_memory=use_low_mem)
-        df = df.sort_values("barcode")
-        _cleanup()
-        return create_gene_score_matrix_gpu(
-            fragments_df=df,
-            gene_regions=gene_regions,
-            geneModel=gene_model,
-            extend_upstream=extend_upstream,
-            extend_downstream=extend_downstream,
-            tile_size=tile_size,
-            ceiling=ceiling,
-            scale_to=scale_to,
-            use_gene_boundaries=use_gene_boundaries,
-            exclude_chroms=list(exclude_chroms) if exclude_chroms else [],
-            min_fragments_per_cell=min_fragments_per_cell,
-            cell_metadata=cell_metadata_input,
-            filter_query=filter_query,
-            cell_batch_size=cell_batch_size,
-        )
+    def _score(path: Path) -> "sc.AnnData":
+        """The gene score matrix of one fragment file."""
+        def _run(use_low_mem):
+            df = read_fragments_parquet(path, low_memory=use_low_mem)
+            df = df.sort_values("barcode")
+            _cleanup()
+            return create_gene_score_matrix_gpu(
+                fragments_df=df,
+                gene_regions=gene_regions,
+                geneModel=gene_model,
+                extend_upstream=extend_upstream,
+                extend_downstream=extend_downstream,
+                tile_size=tile_size,
+                ceiling=ceiling,
+                scale_to=scale_to,
+                use_gene_boundaries=use_gene_boundaries,
+                exclude_chroms=list(exclude_chroms) if exclude_chroms else [],
+                min_fragments_per_cell=min_fragments_per_cell,
+                cell_metadata=cell_metadata_input,
+                filter_query=filter_query,
+                cell_batch_size=cell_batch_size,
+            )
+
+        try:
+            matrix, cell_metadata, gene_metadata = _run(low_memory)
+        except (MemoryError, RuntimeError) as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("out of memory", "bad_alloc", "cudaerrormemoryallocation")) and not low_memory:
+                logger.warning(f"CUDA OOM; retrying with low_memory=True: {exc}")
+                _cleanup()
+                matrix, cell_metadata, gene_metadata = _run(True)
+            else:
+                raise
+
+        adata = gene_score_to_anndata(matrix, cell_metadata, gene_metadata)
+        return adata
 
     start = time.perf_counter()
-    try:
-        matrix, cell_metadata, gene_metadata = _run(low_memory)
-    except (MemoryError, RuntimeError) as exc:
-        msg = str(exc).lower()
-        if any(k in msg for k in ("out of memory", "bad_alloc", "cudaerrormemoryallocation")) and not low_memory:
-            logger.warning(f"CUDA OOM; retrying with low_memory=True: {exc}")
-            _cleanup()
-            matrix, cell_metadata, gene_metadata = _run(True)
-        else:
-            raise
+    if isinstance(input_parquet, (list, tuple)):
+        from ._combine import _check_distinct_cells, _file_names, combine_file_matrices
 
-    adata = gene_score_to_anndata(matrix, cell_metadata, gene_metadata)
-    if barcode_prefix:
-        adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
+        paths = [Path(p) for p in input_parquet]
+        names = _file_names(paths)
+        _check_distinct_cells(paths, names)
+        adata = combine_file_matrices(
+            (_score(path) for path in paths), names, output_path,
+        )
+        logger.info(
+            f"Gene score matrix of {len(paths)} files: {adata.shape[0]:,} cells x "
+            f"{adata.shape[1]:,} genes ({time.perf_counter() - start:.1f}s)")
+        return adata
 
+    input_parquet = Path(input_parquet)
+    if output_path is None:
+        output_path = input_parquet.with_suffix("").with_name(
+            input_parquet.stem + "_gene_score_matrix.h5ad")
+    else:
+        output_path = Path(output_path)
+
+    adata = _score(input_parquet)
     adata.write_h5ad(str(output_path))
     logger.info(
         f"Created {output_path.name}: {adata.shape[0]:,} cells x {adata.shape[1]:,} genes "

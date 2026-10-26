@@ -12,7 +12,9 @@ The ``bc_*`` columns are a per-barcode table aligned on the row number: row
 ``i`` holds barcode id ``i`` (its full original name, its number of fragments
 and its read count) and they are null after the last barcode. Barcode ids are
 ordered by decreasing fragment count. Chromosome names are in the footer
-(``gatac.chroms``), indexed by ``chrom_id``.
+(``gatac.chroms``), indexed by ``chrom_id``, and so is the sample's barcode
+prefix (``gatac.barcode_prefix``): readers put it in front of every stored
+name, which stays the name of the original fragments file.
 
 Files keep the order of the input fragments and are written with ZSTD,
 delta-encoded starts, and fragment lengths (``end - start``), barcode ids and
@@ -94,6 +96,10 @@ class FragmentFile:
         Chromosome names, indexed by ``chrom_id``.
     n_barcodes : int
         Number of barcodes (rows of the barcode table).
+    barcode_prefix : str
+        Prefix of every barcode name, from the file footer ("" if none). The
+        stored names are those of the original fragments file; every reader
+        but :meth:`to_tsv` gives them with the prefix.
     num_row_groups : int
 
     Examples
@@ -125,6 +131,7 @@ class FragmentFile:
             )
         self.chroms: List[str] = json.loads(kv[b"gatac.chroms"])
         self.n_barcodes = int(kv[b"gatac.n_barcodes"])
+        self.barcode_prefix: str = kv.get(b"gatac.barcode_prefix", b"").decode()
         self._barcodes = None
         self._barcode_index = None
 
@@ -143,14 +150,20 @@ class FragmentFile:
     @property
     def barcodes(self) -> np.ndarray:
         """
-        Barcode names as an object array indexed by barcode id (the stored
-        barcode table: ids by decreasing fragment count).
+        Barcode names, with the prefix, as an object array indexed by barcode
+        id (ids by decreasing fragment count).
         """
         if self._barcodes is None:
-            self._barcodes = self._barcode_table(["bc_name"])["bc_name"].to_numpy(
+            self._barcodes = self._prefixed(self._barcode_table(["bc_name"])["bc_name"]).to_numpy(
                 zero_copy_only=False
             )
         return self._barcodes
+
+    def _prefixed(self, names: pa.Array) -> pa.Array:
+        """Stored barcode names with :attr:`barcode_prefix` in front."""
+        if not self.barcode_prefix:
+            return names
+        return pc.binary_join_element_wise(self.barcode_prefix, names, "")
 
     def barcode_ids(self, barcodes: Sequence[str]) -> np.ndarray:
         """
@@ -174,11 +187,12 @@ class FragmentFile:
         return table.slice(0, self.n_barcodes).combine_chunks()
 
     def _gpu_barcodes(self) -> cudf.Series:
-        """Barcode names on the GPU, indexed by barcode id."""
+        """Barcode names, with the prefix, on the GPU, indexed by barcode id."""
         if self.n_barcodes == 0:
             return cudf.Series([], dtype="str")
         names = cudf.read_parquet(self.path, columns=["bc_name"], row_groups=self._barcode_row_groups())
-        return names["bc_name"].iloc[:self.n_barcodes]
+        names = names["bc_name"].iloc[:self.n_barcodes].reset_index(drop=True)
+        return self.barcode_prefix + names if self.barcode_prefix else names
 
     def barcode_counts(
         self,
@@ -207,7 +221,7 @@ class FragmentFile:
         if chroms is None and mito_chroms is None:
             t = self._barcode_table(["bc_name", "bc_n_unique", "bc_n_total"])
             return pd.DataFrame({
-                "barcode": t["bc_name"].to_numpy(zero_copy_only=False),
+                "barcode": self._prefixed(t["bc_name"]).to_numpy(zero_copy_only=False),
                 "n_unique": t["bc_n_unique"].to_numpy().astype(np.int64),
                 "n_total": t["bc_n_total"].to_numpy().astype(np.int64),
             })
@@ -432,9 +446,12 @@ class FragmentFile:
         Stream the file on the CPU as Arrow tables with the named columns (``chrom``, ``start``, ``end``, ``barcode``, ``count``),
         in file order (ids decoded back to names).
         """
+        return self._iter_arrow(batch_size, pa.array(self.barcodes, pa.string()))
+
+    def _iter_arrow(self, batch_size: int, barcode_names: pa.Array) -> Iterator[pa.Table]:
+        """:meth:`iter_arrow` with ``barcode_names`` as the names of the barcode ids."""
         pf = pq.ParquetFile(self.path)
         chrom_names = pa.array(self.chroms, pa.string())
-        barcode_names = pa.array(self.barcodes, pa.string())
         for b in pf.iter_batches(batch_size=batch_size, columns=list(FILE_SCHEMA.names[:5])):
             yield pa.table([
                 chrom_names.take(b.column("chrom_id")),
@@ -453,9 +470,9 @@ class FragmentFile:
         """
         Write the fragments back to a fragments TSV, in file order.
 
-        Rows are ``chrom, start, end, barcode, count`` with the stored barcode
-        names, including any ``barcode_prefix`` given to
-        :func:`gatac.io.make_parquet`. A path ending in ``.gz`` is written as
+        Rows are ``chrom, start, end, barcode, count`` with the barcode names
+        of the original fragments file, without the file's
+        :attr:`barcode_prefix`. A path ending in ``.gz`` is written as
         BGZF, the blocked gzip of ``bgzip``: any gzip reader opens it, and
         ``tabix -p bed`` indexes it when the fragments are sorted by position,
         as in a Cell Ranger file. Any other path is written uncompressed.
@@ -496,7 +513,8 @@ class FragmentFile:
             out = (_BgzfWriter(tmp_path, compresslevel) if output_path.suffix == ".gz"
                    else open(tmp_path, "wb"))
             with out:
-                for table in self.iter_arrow():
+                stored = self._barcode_table(["bc_name"])["bc_name"]
+                for table in self._iter_arrow(1_000_000, stored):
                     sink = pa.BufferOutputStream()
                     pa_csv.write_csv(table, sink, options)
                     out.write(sink.getvalue())
@@ -641,6 +659,7 @@ def write_fragments(
     chroms: Optional[Sequence[str]] = None,
     row_group_size: int = 1_000_000,
     barcode_stats: Optional[pd.DataFrame] = None,
+    barcode_prefix: Optional[str] = None,
 ) -> Path:
     """
     Write fragments to a GATAC fragment Parquet file.
@@ -662,6 +681,9 @@ def write_fragments(
     barcode_stats : pd.DataFrame, optional
         ``barcode``, ``n_unique``, ``n_total`` of the data
         being written, to skip the counting pass.
+    barcode_prefix : str, optional
+        Prefix of the barcode names, written to the footer; the names are
+        stored as given.
 
     Returns
     -------
@@ -671,14 +693,15 @@ def write_fragments(
     # Write next to the target and rename on success: no partial file on error
     tmp_path = output_path.with_name(output_path.name + ".tmp")
     try:
-        _write_fragments(batches, tmp_path, chroms, row_group_size, barcode_stats)
+        _write_fragments(batches, tmp_path, chroms, row_group_size, barcode_stats, barcode_prefix)
         os.replace(tmp_path, output_path)
     finally:
         tmp_path.unlink(missing_ok=True)
     return output_path
 
 
-def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats) -> None:
+def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats,
+                     barcode_prefix=None) -> None:
     """Body of :func:`write_fragments`, writing to ``output_path`` directly."""
     if barcode_stats is None:
         barcode_stats = _count_barcodes(batches())
@@ -752,12 +775,18 @@ def _write_fragments(batches, output_path, chroms, row_group_size, barcode_stats
                 f"{len(chrom_list) - n_given} chromosome(s) not in `chroms` were appended: "
                 f"{chrom_list[n_given:][:5]}"
             )
-        writer.add_key_value_metadata({
-            "gatac.format_version": FORMAT_VERSION,
-            "gatac.chroms": json.dumps(chrom_list),
-            "gatac.n_barcodes": str(n_bc),
-        })
+        writer.add_key_value_metadata(_footer(chrom_list, n_bc, barcode_prefix))
     logger.debug(f"Wrote {n:,} fragments, {n_bc:,} barcodes")
+
+
+def _footer(chroms: List[str], n_barcodes: int, barcode_prefix: Optional[str]) -> dict:
+    """The key-value metadata of a fragment file."""
+    return {
+        "gatac.format_version": FORMAT_VERSION,
+        "gatac.chroms": json.dumps(chroms),
+        "gatac.n_barcodes": str(n_barcodes),
+        "gatac.barcode_prefix": barcode_prefix or "",
+    }
 
 
 def _sort_barcode_stats(stats: pd.DataFrame) -> pd.DataFrame:
@@ -772,6 +801,7 @@ def _write_cells(
     chroms: Optional[Sequence[str]] = None,
     row_group_size: int = 1_000_000,
     row_groups_per_batch: int = 16,
+    barcode_prefix: Optional[str] = None,
 ) -> tuple[int, int]:
     """
     Write the fragments of some barcodes of ``fragments`` to a new fragment
@@ -779,9 +809,10 @@ def _write_cells(
     decoded to names, and the file is encoded and compressed by cuDF.
 
     ``cells`` holds ``barcode_id`` (in ``fragments``), ``barcode`` (the name
-    to write), and ``n_unique`` and ``n_total`` counted on ``chroms``, the
-    chromosomes to keep (None keeps all). The output keeps the input's
-    chromosome ids. Returns the numbers of fragments read and written.
+    to store, without ``barcode_prefix``, the output's prefix), and
+    ``n_unique`` and ``n_total`` counted on ``chroms``, the chromosomes to
+    keep (None keeps all). The output keeps the input's chromosome ids.
+    Returns the numbers of fragments read and written.
     """
     output_path = Path(output_path)
     stats = _sort_barcode_stats(cells)
@@ -794,7 +825,7 @@ def _write_cells(
     n_in = 0
     tmp_path = output_path.with_name(output_path.name + ".tmp")
     try:
-        writer = _GpuWriter(tmp_path, list(fragments.chroms), stats, row_group_size)
+        writer = _GpuWriter(tmp_path, list(fragments.chroms), stats, row_group_size, barcode_prefix)
         for rgs in fragments._row_group_batches(row_groups_per_batch):
             df = cudf.read_parquet(fragments.path, columns=ID_SCHEMA.names, row_groups=rgs)
             n_in += len(df)
@@ -821,8 +852,10 @@ class _GpuWriter:
     """
 
     def __init__(self, path: Path, chroms: List[str], stats: pd.DataFrame,
-                 row_group_size: int, rows_per_write: int = 16_000_000):
+                 row_group_size: int, barcode_prefix: Optional[str] = None,
+                 rows_per_write: int = 16_000_000):
         self.path, self.chroms, self.row_group_size = path, chroms, row_group_size
+        self.barcode_prefix = barcode_prefix
         self.rows_per_write = max(rows_per_write // row_group_size, 1) * row_group_size
         self.names = cudf.Series(stats["barcode"].to_numpy(dtype=object), dtype="str")
         self.n_unique = cudf.Series(stats["n_unique"].to_numpy().astype(np.uint32))
@@ -845,7 +878,7 @@ class _GpuWriter:
         if self.writer is None:
             # No fragment: the CPU writer writes the empty file
             _write_fragments(lambda: iter([]), self.path, self.chroms, self.row_group_size,
-                             _empty_counts(False))
+                             _empty_counts(False), self.barcode_prefix)
         else:
             self.writer.close([])
         if self.n < self.n_bc:
@@ -894,11 +927,7 @@ class _GpuWriter:
                 .compression(plc.io.types.CompressionType.ZSTD)
                 .stats_level(plc.io.types.StatisticsFreq.STATISTICS_COLUMN)
                 .row_group_size_rows(self.row_group_size)
-                .key_value_metadata([{
-                    "gatac.format_version": FORMAT_VERSION,
-                    "gatac.chroms": json.dumps(self.chroms),
-                    "gatac.n_barcodes": str(self.n_bc),
-                }])
+                .key_value_metadata([_footer(self.chroms, self.n_bc, self.barcode_prefix)])
                 .build())
 
 

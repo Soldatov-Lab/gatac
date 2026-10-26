@@ -15,7 +15,7 @@ gatac gene <input.parquet> -g <annotations.gtf>
            [--include-gene-body | --no-gene-body]
            [-m MIN_FRAGS] [-e CHROMS ...]
            [--metrics METRICS] [--filter QUERY]
-           [--barcode-prefix PREFIX] [--low-memory]
+           [--low-memory]
 ```
 
 ---
@@ -43,7 +43,6 @@ gatac gene <input.parquet> -g <annotations.gtf>
 | `-e`, `--exclude-chroms` | `chrM M` | Chromosomes to exclude |
 | `--metrics` | — | Metrics CSV for quality-based filtering |
 | `--filter` | — | Pandas `DataFrame.query` string applied to metrics |
-| `--barcode-prefix` | — | String prepended to barcodes |
 | `--low-memory` | off | Process one Parquet row-group at a time |
 
 ---

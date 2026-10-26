@@ -16,7 +16,9 @@
   and read counts) inside the file, ZSTD, delta-encoded starts and fragment
   lengths, barcode ids and counts as byte-stream split integers. All
   fragment readers go through the new `io.FragmentFile` and join cells and
-  chromosomes by integer lookups.
+  chromosomes by integer lookups. The sample's barcode prefix is stored once,
+  in the footer: readers name cells with it, and the barcode table keeps the
+  names of the original file.
   On a 484M-fragment library (RTX 5070): `compute_metrics` 51 s -> 9 s,
   `detect_doublets` 56 s -> 13 s, `peak.make_matrix` 14 s -> 6 s,
   `make_tile_matrix` 49 s -> 30 s (the rest is host-side matrix assembly). The
@@ -24,9 +26,28 @@
   quarter of the GPU memory. `make_parquet` parses the TSV once and encodes
   the next row group while the writer compresses the current one; on PBMC 5k
   (101M fragments, 6 cores) it takes 28 s and `filter_fragments` 13 s.
-- `make_parquet_batch` accepts one barcode prefix per input file.
-- `make_parquet_batch(file_prefix=...)` prefixes the output file names, one
-  prefix for all files or one per file. Inputs that would be written to the
+- `make_parquet_batch` accepts one barcode prefix per input file, and warns
+  when the files it wrote share cell names, which keeps them from being
+  combined into one matrix.
+- `io.set_barcode_prefix` / `gatac rename` set the barcode prefix of a
+  fragment file by rewriting its footer only, in place or into a copy, so
+  that samples converted without prefixes can be told apart before they are
+  combined, whatever the files' size.
+- `make_parquet_batch(file_prefix=...)` (`gatac convert --file-prefix`)
+  prefixes the output file names, one prefix for all files or one per file.
+  In both prefixes, `{sample}` stands for each file's sample name, the part
+  of the input paths that differs between the files (`io.sample_names`):
+  `gatac convert "runs/*/outs/atac_fragments.tsv.gz" --file-prefix
+  "{sample}_" --barcode-prefix "{sample}_"` names each Cell Ranger run's
+  file and cells after its directory. Each file's output and prefixes can
+  also be given one per file, the same way from the command line and from
+  Python: as lists in input order (`gatac convert a.tsv.gz b.tsv.gz -o
+  a.parquet b.parquet --barcode-prefix A_ B_`,
+  `make_parquet_batch(output_paths=[...], barcode_prefix=[...])`), or as a
+  sample sheet with `fragments`, `output` and `barcode_prefix` columns
+  (`gatac convert --samples samples.csv`,
+  `make_parquet_batch(samples="samples.csv")`). `gatac convert` reports
+  conversion errors as messages instead of tracebacks. Inputs that would be written to the
   same output path (Cell Ranger names every sample's file
   `atac_fragments.tsv.gz`) now raise instead of overwriting each other.
   Files are started largest first, so that the largest do not run alone at
@@ -42,8 +63,19 @@
   `pp.build_tile_matrix` reads the files again to build the matrix of the
   chosen tiles only, in memory or straight into an `.h5ad`. Cells can be
   dropped between the scan and the build.
+- `make_gene_matrix` and `make_gene_score_matrix` take a list of fragment
+  files too (`gatac gene` / `gatac genescore` several files, with `-o`) and
+  build one matrix of all their cells, named and tagged with
+  `obs["source_file"]` as the tile matrix's are. Given an output path, each
+  file's rows are written as they are built, so the combined matrix is never
+  held in memory; `gatac combine` is no longer needed after them.
+- A matrix of several fragment files (`make_tile_matrix`, `scan_tiles`,
+  `make_gene_matrix`, `make_gene_score_matrix`) needs distinct cell names
+  across the files: files that share names raise before any fragment is
+  read, with the files concerned and how to give each sample a prefix.
 - `io.to_tsv` / `io.FragmentFile.to_tsv` write a Parquet fragment file back to
-  a `fragments.tsv.gz` in file order, BGZF-compressed (tabix-indexable);
+  a `fragments.tsv.gz` in file order, with the original barcodes (without the
+  file's prefix), BGZF-compressed (tabix-indexable);
   `gatac convert` does the same for `.parquet` inputs. An existing output,
   such as the original fragments file, is only replaced with
   `overwrite=True` / `--overwrite`.
@@ -92,6 +124,15 @@
   stream-ordered memory pool unless another memory resource is set. It
   decoded every fragment's barcode to a string and wrote the files one at a
   time on one CPU thread.
+- Barcode prefixes are set on the fragment files only (`make_parquet`,
+  `filter_fragments`, `io.set_barcode_prefix`), so that every step names a
+  cell the same way. `make_tile_matrix`, `make_gene_matrix`,
+  `make_gene_score_matrix` and their commands no longer take
+  `barcode_prefix`: it renamed the matrix's cells but not the files', and
+  the peak steps then found none of those cells' fragments.
+  `filter_fragments(barcode_prefix=...)` sets the prefix of the output, one
+  for all files or one per file, and matches cells to the metrics on the
+  input's names; it added the prefix before matching.
 - `compute_metrics` takes a list of fragment files: the TSS table is loaded
   once and several files are processed at once, under the same memory pool,
   and their rows are concatenated in the order given. It no longer runs a

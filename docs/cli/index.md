@@ -20,6 +20,7 @@ Global option:
 :hidden:
 
 convert
+rename
 metrics
 filter
 doublets
@@ -40,6 +41,14 @@ combine
 :shadow: none
 
 Convert TSV.GZ fragment files to Parquet, and back.
+:::
+
+:::{grid-item-card} {fas}`tag` rename
+:link: rename
+:link-type: doc
+:shadow: none
+
+Set the barcode prefix of a fragment file (footer only).
 :::
 
 :::{grid-item-card} {fas}`chart-bar` metrics

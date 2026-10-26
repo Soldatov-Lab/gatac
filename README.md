@@ -28,6 +28,20 @@ uv sync --extra cuda12
 # Convert TSV.GZ to Parquet
 gatac convert fragments.tsv.gz
 
+# Several samples: name each sample's cells by sample (sample1_<barcode>),
+# so that they stay distinct in a combined matrix. {sample} is written as is:
+# gatac fills it in for each file (samples/s1.tsv.gz -> s1_, ...)
+gatac convert "samples/*.tsv.gz" --output-dir parquets/ --barcode-prefix "{sample}_"
+
+# Cell Ranger outputs, all named atac_fragments.tsv.gz: prefix the files too
+# ({sample} is then the run directory: runs/A/outs/... -> A_)
+gatac convert "runs/*/outs/atac_fragments.tsv.gz" --output-dir parquets/ \
+    --file-prefix "{sample}_" --barcode-prefix "{sample}_"
+
+# Set (or change) the barcode prefix of a converted file, in place: only the
+# file footer is rewritten, in milliseconds
+gatac rename sample1.parquet --barcode-prefix sample1_
+
 # Compute quality metrics (TSSe, etc.)
 gatac metrics fragments.parquet -g annotations.gtf -o fragments_metrics.csv
 
@@ -61,8 +75,13 @@ gatac genescore fragments.parquet -g annotations.gtf
 # Gene score with a custom gene model (function of distance x to the TSS)
 gatac genescore fragments.parquet -g annotations.gtf --gene-model "exp(-abs(x)/10000) + exp(-1)"
 
-# One tile matrix of several samples, most accessible tiles only
+# One tile matrix of several samples (each with its own barcode prefix),
+# most accessible tiles only
 gatac tile sample1.parquet sample2.parquet -g hg38 -n 500000 -o combined.h5ad
+
+# One gene matrix (or gene score matrix) of several samples
+gatac gene sample1.parquet sample2.parquet -g annotations.gtf -o genes.h5ad
+gatac genescore sample1.parquet sample2.parquet -g annotations.gtf -o gene_scores.h5ad
 
 # Merge h5ad files (file-by-file)
 gatac combine sample1.h5ad sample2.h5ad -o combined.h5ad
@@ -76,6 +95,9 @@ import gatac as ga
 # Convert to parquet
 ga.io.make_parquet("fragments.tsv.gz")
 
+# Name the sample's cells sample1_<barcode>, in place (footer only)
+ga.io.set_barcode_prefix("sample1.parquet", "sample1_")
+
 # Compute metrics
 metrics = ga.pp.compute_metrics("fragments.parquet", "annotations.gtf")
 
@@ -84,7 +106,6 @@ adata = ga.pp.make_tile_matrix(
     "fragments.parquet", 
     chrom_sizes="hg38", 
     min_fragments_per_cell=500,
-    barcode_prefix="Sample1_"
 )
 
 # Create tile matrix using pre-computed metrics for filtering
@@ -155,6 +176,13 @@ ga.pp.make_tile_matrix(
     chrom_sizes="hg38",
     n_features=500000,
     output_path="combined.h5ad"
+)
+
+# One gene matrix of several samples, written as it is built
+ga.pp.make_gene_matrix(
+    ["sample1.parquet", "sample2.parquet"],
+    gene_anno="annotations.gtf",
+    output_path="genes.h5ad"
 )
 
 # Merge multiple AnnData files

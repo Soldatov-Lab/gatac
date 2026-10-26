@@ -184,10 +184,10 @@ def combine(
         raise ValueError(
             f"Detected {n_dups:,} duplicate cell barcode(s) across the input files "
             f"(e.g. {dup_examples}). "
-            "Barcodes must be unique before combining. "
-            "Re-run the preceding processing steps with a per-sample `--barcode-prefix` "
-            "argument (e.g. `gatac convert sample.tsv.gz --barcode-prefix sample1`) "
-            "so that each sample's barcodes are namespaced and collisions are avoided."
+            "Barcodes must be unique before combining. Give each sample's fragment file "
+            "its own barcode prefix, which only rewrites the file's footer "
+            "(`gatac rename sample1.parquet --barcode-prefix sample1_`), and rebuild "
+            "its matrix."
         )
     else:
         combined_obs.index = combined_obs['barcode'].values

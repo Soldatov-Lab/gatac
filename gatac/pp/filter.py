@@ -28,7 +28,7 @@ def filter_fragments(
     min_fragments_per_cell: int = 100,
     filter_query: Optional[str] = None,
     barcode_column: str = "barcode",
-    barcode_prefix: Optional[str] = None,
+    barcode_prefix: Optional[str | List[str]] = None,
     row_groups_per_batch: int = 64,
     chrom_sizes: Optional[Union[dict, object, str]] = None,
     workers: int = 4,
@@ -58,8 +58,10 @@ def filter_fragments(
         Query string for filtering cells based on metrics.
     barcode_column : str, default "barcode"
         Name of the barcode column.
-    barcode_prefix : str, optional
-        Prefix to add to barcodes before filtering.
+    barcode_prefix : str or list of str, optional
+        Barcode prefix of the output, one for all files or one per file
+        (default: the input's); see :func:`gatac.io.set_barcode_prefix`.
+        Cells are matched to ``metrics`` on the input's names.
     row_groups_per_batch : int, default 64
         Unused; kept for backwards compatibility.
     chrom_sizes : dict, str, or genome object, optional
@@ -143,6 +145,12 @@ def filter_fragments(
         output_paths = [Path(p) for p in output_parquet]
         if len(output_paths) != len(input_paths):
             raise ValueError(f"Number of outputs ({len(output_paths)}) must match inputs ({len(input_paths)})")
+    if barcode_prefix is None or isinstance(barcode_prefix, str):
+        prefixes = [barcode_prefix] * len(input_paths)
+    else:
+        prefixes = list(barcode_prefix)
+        if len(prefixes) != len(input_paths):
+            raise ValueError(f"Number of barcode prefixes ({len(prefixes)}) must match inputs ({len(input_paths)})")
 
     # Load metrics if provided
     valid_barcodes = None
@@ -183,7 +191,7 @@ def filter_fragments(
                 valid_barcodes=valid_barcodes,
                 min_fragments_per_cell=min_fragments_per_cell,
                 barcode_column=barcode_column,
-                barcode_prefix=barcode_prefix,
+                barcode_prefix=prefixes[i],
                 row_groups_per_batch=row_groups_per_batch,
                 valid_chroms=valid_chroms,
             )
@@ -230,7 +238,7 @@ def _filter_single_file_streaming(
         Name of the barcode column of the metrics; fragments always use
         ``barcode``.
     barcode_prefix : str, optional
-        Prefix to add to barcodes.
+        Barcode prefix of the output; None keeps the input's.
     row_groups_per_batch : int
         Unused; kept for backwards compatibility.
     valid_chroms : set, optional
@@ -247,18 +255,20 @@ def _filter_single_file_streaming(
     counts = fragments._id_counts(chroms=chroms)
     if valid_barcodes is None:
         keep = (counts["n_unique"] >= min_fragments_per_cell).to_numpy()
+    # Cells are matched on the input's names; the output stores them without
+    # the prefix, which goes to its footer
     names = fragments._gpu_barcodes().take(cp.asarray(counts["barcode_id"].to_numpy()))
-    if barcode_prefix:
-        names = barcode_prefix + names
     if valid_barcodes is not None:
         keep = names.isin(valid_barcodes).values_host
     cells = counts[keep].copy()
-    cells["barcode"] = names[cp.asarray(keep)].to_arrow().to_numpy(zero_copy_only=False)
+    stored = names[cp.asarray(keep)].str.slice(len(fragments.barcode_prefix))
+    cells["barcode"] = stored.to_arrow().to_numpy(zero_copy_only=False)
     if valid_barcodes is None:
         logger.info(f"Found {len(cells):,} cells with >= {min_fragments_per_cell} fragments")
         if len(cells) == 0:
             raise ValueError(f"No cells passed the filtering criteria in {input_path}")
 
-    n_in, n_out = _write_cells(fragments, output_path, cells, chroms=chroms)
+    prefix = fragments.barcode_prefix if barcode_prefix is None else barcode_prefix
+    n_in, n_out = _write_cells(fragments, output_path, cells, chroms=chroms, barcode_prefix=prefix)
     logger.info(f"Filtered {input_path.name}: {n_in:,} -> {n_out:,} fragments "
                 f"({100 * n_out / max(n_in, 1):.1f}% retained), {len(cells):,} cells")

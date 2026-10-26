@@ -78,8 +78,10 @@ The [Overview](../overview.md) shows how these steps connect, through
 clustering and peak calling.
 
 ```bash
-# 1. Convert fragments
-gatac convert "samples/*.tsv.gz" --output-dir parquets/
+# 1. Convert fragments, cells named by sample (sample1_<barcode>):
+#    samples in one matrix must not share cell names
+#    ({sample} is written as is: gatac fills it in for each file, s1_, s2_, ...)
+gatac convert "samples/*.tsv.gz" --output-dir parquets/ --barcode-prefix "{sample}_"
 
 # 2. Compute metrics per sample
 for f in parquets/*.parquet; do
@@ -96,9 +98,18 @@ done
 # 4. One tile matrix of every sample, 500,000 most accessible tiles
 gatac tile filtered/*.parquet -g hg38 -n 500000 -o combined_tiles.h5ad
 
-# 5. Gene matrices are built per sample; combine merges them
-for f in filtered/*.parquet; do
-    gatac gene "$f" -g GRCh38.gtf.gz -o "genes/$(basename $f .parquet).h5ad"
+# 5. One gene matrix of every sample
+gatac gene filtered/*.parquet -g GRCh38.gtf.gz -o combined_genes.h5ad
+```
+
+`gatac tile`, `gatac gene` and `gatac genescore` build one matrix of
+several fragment files directly; `gatac combine` merges `.h5ad` files made
+separately. Either way, the cells of different samples must have distinct
+names. Files already converted without prefixes get them from
+[`gatac rename`](rename), in place:
+
+```bash
+for f in parquets/*.parquet; do
+    gatac rename "$f" --barcode-prefix "$(basename $f .parquet)_"
 done
-gatac combine genes/*.h5ad -o combined_genes.h5ad
 ```

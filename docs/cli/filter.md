@@ -35,7 +35,7 @@ gatac filter <input.parquet> [-o OUTPUT]
 | `-m`, `--min-fragments` | `100` | Minimum unique fragments per barcode |
 | `--filter` | — | Pandas `DataFrame.query` string on the metrics (e.g. `"tsse_score > 5"`) |
 | `-g`, `--genome` | — | Genome name (`hg38`, `mm10`, …) for chromosome allowlist filtering |
-| `--barcode-prefix` | — | String prepended to barcodes |
+| `--barcode-prefix` | input's | Barcode prefix of the output (see [`gatac rename`](rename)); cells are matched to `--metrics` on the input's names |
 | `--batch-size` | `64` | Unused (kept for compatibility) |
 
 ---
@@ -85,11 +85,14 @@ gatac filter pbmc.parquet -g hg38 -m 500 -o pbmc_filtered.parquet
 ### Batch filtering (glob)
 
 ```bash
-gatac filter "samples/*.parquet" \
-    --metrics "metrics/*.csv" \
-    --filter "tsse_score > 5" \
-    --output-dir filtered/
+gatac filter "samples/*.parquet" -g hg38 -m 500
+# → samples/<name>_filtered.parquet, each with its input's barcode prefix
 ```
+
+Given `--metrics`, one table applies to every file, matched on cell names,
+so the samples need distinct names (barcode prefixes). With one metrics
+file per sample, filter each sample in turn, as in the
+[Overview](../overview.md#example).
 
 ---
 

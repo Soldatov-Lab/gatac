@@ -533,7 +533,6 @@ def _make_tile_matrix_from_interval_matrix(
     metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     count_strategy: str = "unique",
-    barcode_prefix: Optional[str] = None,
 ):
     """Aggregate interval-like matrix features into fixed genomic tiles."""
     adata = _load_interval_adata(input_data)
@@ -670,9 +669,6 @@ def _make_tile_matrix_from_interval_matrix(
     _set_tile_stats(adata, stats, adata.n_obs)
     adata.uns['tile_input_kind'] = 'interval_matrix'
     adata.uns['tile_aggregation'] = 'sum_overlapping_features'
-
-    if barcode_prefix:
-        adata.obs_names = [f"{barcode_prefix}{barcode}" for barcode in adata.obs_names]
 
     if output_path is not None:
         adata.write_h5ad(str(output_path))
@@ -1006,7 +1002,6 @@ def make_tile_matrix(
     metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
     count_strategy: str = "unique",
-    barcode_prefix: Optional[str | List[str]] = None,
     low_memory: bool = False,
     row_groups_per_batch: int = 64,
     n_features: Optional[int] = None,
@@ -1028,7 +1023,8 @@ def make_tile_matrix(
     tiles are chosen from them (:func:`~gatac.pp.select_features`), and
     :func:`~gatac.pp.build_tile_matrix` reads the files again to build the
     matrix of those tiles only. Run these steps yourself to choose tiles
-    another way.
+    another way. The files must not share cell names: give each sample its
+    own barcode prefix (:func:`gatac.io.set_barcode_prefix`).
 
     Parameters
     ----------
@@ -1059,10 +1055,6 @@ def make_tile_matrix(
         - "count": Use PCR duplicate counts from the 'count' column
         - "binarize": Convert counts to binary (0/1) per tile
         (default: "unique")
-    barcode_prefix : str or list of str, optional
-        Prefix to add to barcodes; for a list of files, one for all or one
-        per file. Cell names repeated across files are made unique with
-        ``-1``, ``-2``, ...
     low_memory : bool
         Use smaller batch size for Parquet reading (default: False)
     row_groups_per_batch : int
@@ -1128,7 +1120,6 @@ def make_tile_matrix(
             input if combined else [input], chrom_sizes, tile_size=tile_size,
             min_fragments_per_cell=min_fragments_per_cell, exclude_chroms=exclude_chroms,
             metrics=metrics, filter_query=filter_query, count_strategy=count_strategy,
-            barcode_prefix=barcode_prefix,
             row_groups_per_batch=min(row_groups_per_batch, 8) if low_memory else row_groups_per_batch,
         )
         if n_features is not None:
@@ -1144,8 +1135,7 @@ def make_tile_matrix(
             input, output_path, chrom_sizes=chrom_sizes, tile_size=tile_size,
             min_fragments_per_cell=min_fragments_per_cell, exclude_chroms=exclude_chroms,
             metrics=metrics, filter_query=filter_query, count_strategy=count_strategy,
-            barcode_prefix=barcode_prefix, low_memory=low_memory,
-            row_groups_per_batch=row_groups_per_batch,
+            low_memory=low_memory, row_groups_per_batch=row_groups_per_batch,
         )
     cleanup_gpu_memory()
     return adata
@@ -1161,7 +1151,6 @@ def _make_tile_matrix_one(
     metrics,
     filter_query: Optional[str],
     count_strategy: str,
-    barcode_prefix: Optional[str],
     low_memory: bool,
     row_groups_per_batch: int,
 ) -> ad.AnnData:
@@ -1181,7 +1170,6 @@ def _make_tile_matrix_one(
             metrics=metrics,
             filter_query=filter_query,
             count_strategy=count_strategy,
-            barcode_prefix=barcode_prefix,
         )
 
     start_time = time.perf_counter()
@@ -1241,9 +1229,6 @@ def _make_tile_matrix_one(
 
     adata = tile_matrix_to_anndata(matrix, cell_meta_pd, tile_metadata)
     _set_tile_stats(adata, stats, n_cells)
-
-    if barcode_prefix:
-        adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
 
     # Save
     if resolved_output_path is not None:

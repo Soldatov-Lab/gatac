@@ -21,7 +21,7 @@ gatac genescore <input.parquet> -g <annotations.gtf>
                 [--ceiling N] [--gene-scale-factor F] [--scale-to F]
                 [-m MIN_FRAGS] [-e CHROMS ...]
                 [--metrics METRICS] [--filter QUERY]
-                [--barcode-prefix PREFIX] [--low-memory]
+                [--low-memory]
                 [--cell-batch-size N]
 ```
 
@@ -56,7 +56,6 @@ gatac genescore <input.parquet> -g <annotations.gtf>
 | `-e`, `--exclude-chroms` | `chrY chrM` | Chromosomes to exclude |
 | `--metrics` | — | Metrics CSV for quality-based filtering |
 | `--filter` | — | Pandas `DataFrame.query` string applied to metrics |
-| `--barcode-prefix` | — | String prepended to barcodes |
 | `--low-memory` | off | Process one Parquet row-group at a time |
 | `--cell-batch-size` | — | Process cells in column batches (lower GPU memory) |
 

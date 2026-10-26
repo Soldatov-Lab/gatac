@@ -103,13 +103,15 @@ def test_file_layout(data):
     # Row groups have the requested size
     rows = [ff._metadata.row_group(i).num_rows for i in range(ff.num_row_groups)]
     assert set(rows[:-1]) == {9_000}
-    keys = set(pq.ParquetFile(data["path"]).metadata.metadata)
-    assert {b"gatac.format_version", b"gatac.chroms", b"gatac.n_barcodes"} <= keys
+    meta = pq.ParquetFile(data["path"]).metadata.metadata
+    assert {b"gatac.format_version", b"gatac.chroms", b"gatac.n_barcodes"} <= set(meta)
+    # The prefix is in the footer only; the barcode table keeps the TSV's names
+    assert meta[b"gatac.barcode_prefix"] == b"S1_" and ff.barcode_prefix == "S1_"
     # cuDF reads the barcode table too (it reads DELTA_BYTE_ARRAY strings
     # written with a page index back as NUL bytes)
     import cudf
     names = cudf.read_parquet(data["path"], columns=["bc_name"])["bc_name"].dropna()
-    assert names.to_arrow().to_pylist() == list(ff.barcodes)
+    assert ["S1_" + n for n in names.to_arrow().to_pylist()] == list(ff.barcodes)
 
 
 def test_stored_columns_and_encodings(data):
@@ -201,8 +203,9 @@ def test_batch_prefixes_and_no_partial_file(data, tmp_path):
     assert not target.exists() and not list(tmp_path.glob("bad.parquet*"))
 
 
-def test_batch_same_file_names(data, tmp_path):
-    # Cell Ranger names every sample's file atac_fragments.tsv.gz
+def test_batch_same_file_names(data, tmp_path, caplog):
+    # Cell Ranger names every sample's file atac_fragments.tsv.gz; without
+    # barcode prefixes their cells share names, which is reported
     inputs = []
     for sample in ("A", "B"):
         (tmp_path / sample).mkdir()
@@ -215,15 +218,90 @@ def test_batch_same_file_names(data, tmp_path):
                                     file_prefix=["A_", "B_"])
     assert [p.name for p in outs] == ["A_atac_fragments.parquet", "B_atac_fragments.parquet"]
     assert all(p.exists() for p in outs)
+    assert "share 300 barcode names" in caplog.text
+
+
+def test_sample_names():
+    names = ga.io.sample_names
+    assert names(["samples/s1.tsv.gz", "samples/s2.tsv.gz"]) == ["s1", "s2"]
+    assert names(["runs/A/outs/atac_fragments.tsv.gz", "runs/B/outs/atac_fragments.tsv.gz"]) == ["A", "B"]
+    assert names(["r1/A/f.tsv.gz", "r1/B/f.tsv.gz", "r2/A/f.tsv.gz"]) == ["r1_A", "r1_B", "r2_A"]
+    assert names(["data/pbmc.bed.gz"]) == ["pbmc"]
+
+
+def test_convert_cli_sample_placeholders(data, tmp_path, monkeypatch):
+    """Cell Ranger outputs: {sample} names the output files and the cells after the run directory."""
+    from gatac import cli
+
+    for s in ("A", "B"):
+        (tmp_path / "runs" / s / "outs").mkdir(parents=True)
+        shutil.copy(data["tsv"], tmp_path / "runs" / s / "outs" / "atac_fragments.tsv.gz")
+    out = tmp_path / "parquets"
+
+    def convert(*options):
+        monkeypatch.setattr("sys.argv", ["gatac", "convert", str(tmp_path / "runs/*/outs/atac_fragments.tsv.gz"),
+                                         "--output-dir", str(out), "-j", "2", *options])
+        cli.main()
+
+    with pytest.raises(SystemExit):  # both would be written to parquets/atac_fragments.parquet
+        convert()
+    convert("--file-prefix", "{sample}_", "--barcode-prefix", "{sample}#")
+    paths = [out / f"{s}_atac_fragments.parquet" for s in ("A", "B")]
+    assert [FragmentFile(p).barcode_prefix for p in paths] == ["A#", "B#"]
+    assert ga.pp.scan_tiles(paths, **SCAN_KW).obs_names.is_unique
+
+
+def test_convert_names_per_file(data, tmp_path, monkeypatch):
+    """Per-file outputs and prefixes, as lists, a {sample} output or a sample sheet, from the CLI and Python."""
+    from gatac import cli
+
+    inputs = []
+    for s in ("s1", "s2"):
+        inputs.append(tmp_path / "samples" / f"{s}.tsv.gz")
+        inputs[-1].parent.mkdir(exist_ok=True)
+        shutil.copy(data["tsv"], inputs[-1])
+
+    def convert(*argv):
+        monkeypatch.setattr("sys.argv", ["gatac", "convert", *map(str, argv)])
+        cli.main()
+
+    def prefixes(paths):
+        return [FragmentFile(p).barcode_prefix for p in paths]
+
+    # Lists, in input order
+    outs = [tmp_path / "lists" / "patient1.parquet", tmp_path / "lists" / "patient2.parquet"]
+    convert(*inputs, "-o", *outs, "--barcode-prefix", "patient1_", "patient2_")
+    assert prefixes(outs) == ["patient1_", "patient2_"]
+    with pytest.raises(SystemExit):  # 2 inputs, 3 prefixes
+        convert(*inputs, "-o", *outs, "--barcode-prefix", "a_", "b_", "c_")
+
+    # One output with {sample}
+    convert(*inputs, "-o", tmp_path / "tpl" / "{sample}.parquet", "--barcode-prefix", "{sample}_")
+    assert prefixes([tmp_path / "tpl" / f"{s}.parquet" for s in ("s1", "s2")]) == ["s1_", "s2_"]
+
+    # A sample sheet; an empty cell takes the default
+    sheet = tmp_path / "samples.csv"
+    sheet.write_text("fragments,output,barcode_prefix\n"
+                     f"{inputs[0]},{tmp_path / 'sheet' / 'p1.parquet'},P1_\n"
+                     f"{inputs[1]},{tmp_path / 'sheet' / 'p2.parquet'},\n")
+    convert("--samples", sheet)
+    assert prefixes([tmp_path / "sheet" / "p1.parquet", tmp_path / "sheet" / "p2.parquet"]) == ["P1_", ""]
+    got = ga.io.make_parquet_batch(samples=pd.DataFrame({"fragments": inputs, "barcode_prefix": ["X_", "Y_"]}),
+                                   output_dir=tmp_path / "frame")
+    assert [p.name for p in got] == ["s1.parquet", "s2.parquet"] and prefixes(got) == ["X_", "Y_"]
+    with pytest.raises(ValueError, match="sample sheet"):
+        ga.io.make_parquet_batch(samples=pd.DataFrame({"file": inputs}))
 
 
 def test_to_tsv_round_trip(data, tmp_path):
+    """The TSV is the original one: barcodes without the file's prefix."""
     cols = list(data["df"].columns)
     gz = ga.io.to_tsv(data["path"], tmp_path / "frags.tsv.gz")
     plain = FragmentFile(data["path"]).to_tsv(tmp_path / "frags.tsv")
+    original = pd.read_csv(data["tsv"], sep="\t", header=None, names=cols, comment="#")
     for out in (gz, plain):
         got = pd.read_csv(out, sep="\t", header=None, names=cols)
-        pd.testing.assert_frame_equal(got, data["df"], check_dtype=False)
+        pd.testing.assert_frame_equal(got, original, check_dtype=False)
     raw = gz.read_bytes()
     assert gzip.decompress(raw) == plain.read_bytes()
     assert raw[12:14] == b"BC" and raw.endswith(bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000"))
@@ -314,20 +392,24 @@ def test_filter_writes_the_same_layout(data):
 
 
 def test_filter_several_files_prefix_and_no_cell(data):
-    """Files filtered at once; a file with no kept cell gives an empty file."""
+    """Files filtered at once, each given its prefix; a file with no kept cell gives an empty file."""
     other = data["dir"] / "other.parquet"
     shutil.copy(data["path"], other)
     cells = _cells(data, 20)
-    metrics = pd.DataFrame({"barcode": ["X_" + c for c in cells]})
+    # Cells are matched on the input's names, then take the new prefix
+    metrics = pd.DataFrame({"barcode": cells})
     outs = [data["dir"] / "f1.parquet", data["dir"] / "f2.parquet"]
     ga.pp.filter_fragments([data["path"], other], outs, metrics=metrics,
-                           barcode_prefix="X_", chrom_sizes=CHROM_SIZES)
+                           barcode_prefix=["X_", "Y_"], chrom_sizes=CHROM_SIZES)
     a = pa.concat_tables(FragmentFile(outs[0]).iter_arrow()).to_pandas()
-    assert set(a["barcode"]) == set(metrics["barcode"])
+    assert set(a["barcode"]) == {"X_" + c.removeprefix("S1_") for c in cells}
     ref = data["df"]
     assert len(a) == (ref["chrom"].isin(CHROM_SIZES) & ref["barcode"].isin(cells)).sum()
-    assert pa.concat_tables(FragmentFile(outs[1]).iter_arrow()).equals(
-        pa.concat_tables(FragmentFile(outs[0]).iter_arrow()))
+    b = pa.concat_tables(FragmentFile(outs[1]).iter_arrow()).to_pandas()
+    pd.testing.assert_frame_equal(b, a.assign(barcode="Y_" + a["barcode"].str[2:]))
+    # Without barcode_prefix the output keeps the input's
+    assert FragmentFile(ga.pp.filter_fragments(
+        outs[1], data["dir"] / "f4.parquet", min_fragments_per_cell=1)).barcode_prefix == "Y_"
     # No cell of the metrics in this file
     out = ga.pp.filter_fragments(data["path"], data["dir"] / "f3.parquet",
                                  metrics=pd.DataFrame({"barcode": ["nope"]}))
@@ -356,10 +438,68 @@ def test_tile_matrix_independent_of_batching(data, strategy):
 
 @pytest.fixture
 def two_samples(data, tmp_path):
-    """Two fragment files whose cells share names (one's cells are a subset of the other's)."""
+    """Two fragment files of the same barcodes (one's are a subset of the other's), with their own prefixes."""
     small = ga.pp.filter_fragments(data["path"], tmp_path / "small.parquet", metrics=pd.DataFrame(
-        {"barcode": _cells(data, 20)}), chrom_sizes=CHROM_SIZES)
-    return [small, data["path"]]
+        {"barcode": _cells(data, 20)}), chrom_sizes=CHROM_SIZES, barcode_prefix="A_")
+    return [small, ga.io.set_barcode_prefix(data["path"], "B_", output_path=tmp_path / "big.parquet")]
+
+
+def test_set_barcode_prefix(data, tmp_path):
+    """Only the footer changes; every reader sees the new names, to_tsv the original ones."""
+    copy = tmp_path / "copy.parquet"
+    shutil.copy(data["path"], copy)
+    before = copy.read_bytes()
+    ga.io.set_barcode_prefix(copy, "new#")
+    after = copy.read_bytes()
+    n = len(before) - 8 - int.from_bytes(before[-8:-4], "little")
+    assert after[:n] == before[:n]
+    ff = FragmentFile(copy)
+    assert ff.barcode_prefix == "new#"
+    assert list(ff.barcodes) == ["new#" + b.removeprefix("S1_") for b in FragmentFile(data["path"]).barcodes]
+    # pyarrow keeps the other footer keys, cuDF and DuckDB read the data
+    meta = pq.ParquetFile(copy).metadata.metadata
+    assert {k: v for k, v in meta.items() if k != b"gatac.barcode_prefix"} == {
+        k: v for k, v in pq.ParquetFile(data["path"]).metadata.metadata.items() if k != b"gatac.barcode_prefix"}
+    assert pa.concat_tables(ff.iter_arrow()).drop(["barcode"]).equals(
+        pa.concat_tables(FragmentFile(data["path"]).iter_arrow()).drop(["barcode"]))
+    assert ff.read_categorical(["start"])["start"].to_numpy().tolist() == data["df"]["start"].tolist()
+    with duckdb.connect() as con:
+        ff.register(con)
+        assert con.execute("SELECT count(*) FROM fragments WHERE barcode LIKE 'new#%'").fetchone()[0] == len(data["df"])
+    tsv = [ga.io.to_tsv(p, tmp_path / f"{i}.tsv").read_bytes() for i, p in enumerate((copy, data["path"]))]
+    assert tsv[0] == tsv[1]
+    # A renamed copy leaves the input as it was; "" removes the prefix
+    bare = ga.io.set_barcode_prefix(copy, "", output_path=tmp_path / "bare.parquet")
+    assert FragmentFile(copy).barcode_prefix == "new#"
+    assert list(FragmentFile(bare).barcodes) == [b.removeprefix("new#") for b in ff.barcodes]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_footer_key_values_round_trip(tmp_path):
+    """Lists of 15 or more keys take the long list header."""
+    from gatac.io._footer import update_key_value_metadata
+
+    path = tmp_path / "t.parquet"
+    pq.write_table(pa.table({"x": [1, 2, 3]}), path)
+    many = {f"k{i}": "v" * i for i in range(20)}
+    update_key_value_metadata(path, many)
+    meta = pq.ParquetFile(path).metadata.metadata
+    assert {k.decode(): v.decode() for k, v in meta.items() if k.startswith(b"k")} == many
+    assert b"ARROW:schema" in meta and pq.read_table(path)["x"].to_pylist() == [1, 2, 3]
+
+
+def test_shared_cell_names_are_refused(data, tmp_path):
+    """Combining files whose cells share names raises, before any work, with the fix."""
+    other = tmp_path / "other.parquet"
+    shutil.copy(data["path"], other)
+    for make in (lambda p: ga.pp.scan_tiles(p, **SCAN_KW),
+                 lambda p: ga.pp.make_gene_matrix(p, data["gtf"]),
+                 lambda p: ga.pp.make_gene_score_matrix(p, data["gtf"])):
+        with pytest.raises(ValueError, match="gatac rename"):
+            make([data["path"], other])
+    ga.io.set_barcode_prefix(other, "S2_")
+    assert ga.pp.scan_tiles([data["path"], other], **SCAN_KW).obs_names.is_unique
+
 
 
 SCAN_KW = dict(chrom_sizes=CHROM_SIZES, tile_size=50_000, min_fragments_per_cell=50)
@@ -377,8 +517,7 @@ def test_scan_tiles_matches_the_tile_matrices(two_samples, strategy):
     np.testing.assert_array_equal(tiles.var["count_sq"], np.asarray(X.multiply(X).sum(axis=0)).ravel())
     assert list(tiles.var_names) == list(one[0].var_names)
     names = [n for o in one for n in o.obs_names]
-    assert len(set(names)) < len(names) and tiles.obs_names.is_unique
-    assert list(tiles.obs["barcode"]) == names
+    assert list(tiles.obs_names) == names and list(tiles.obs["barcode"]) == names
     np.testing.assert_array_equal(tiles.obs["n_unique"], np.concatenate([o.obs["n_unique"] for o in one]))
     assert list(tiles.obs["source_file"]) == [p.name for p, o in zip(two_samples, one) for _ in range(o.n_obs)]
 
@@ -502,6 +641,57 @@ def test_gene_matrices_barcode_only_metrics(data, fn):
     assert set(sel.obs_names) == set(cells)
     ref = full[sel.obs_names, sel.var_names]
     assert (sp.csr_matrix(sel.X) != sp.csr_matrix(ref.X)).nnz == 0
+
+
+@pytest.mark.parametrize("fn", ["gene", "genescore"])
+def test_gene_matrices_of_several_files(two_samples, data, fn, tmp_path):
+    """A list of files makes the per-file matrices' rows, in memory or written as built."""
+    make = ga.pp.make_gene_matrix if fn == "gene" else ga.pp.make_gene_score_matrix
+    kw = dict(min_fragments_per_cell=50)
+    one = [make(p, data["gtf"], output_path=tmp_path / f"one{i}.h5ad", **kw)
+           for i, p in enumerate(two_samples)]
+    full = sp.vstack([sp.csr_matrix(o.X) for o in one]).tocsr()
+
+    both = make(two_samples, data["gtf"], **kw)
+    assert (sp.csr_matrix(both.X) != full).nnz == 0
+    assert list(both.var_names) == list(one[0].var_names)
+    assert list(both.obs_names) == [n for o in one for n in o.obs_names]
+    assert list(both.obs["source_file"]) == [p.name for p, o in zip(two_samples, one) for _ in range(o.n_obs)]
+
+    # written as built
+    written = make(two_samples, data["gtf"], output_path=tmp_path / "both.h5ad", **kw)
+    assert written.isbacked and list(written.obs_names) == list(both.obs_names)
+    X = written.X.to_memory()
+    assert X.dtype == both.X.dtype and (X != full).nnz == 0
+    assert list(written.var_names) == list(both.var_names)
+    written.file.close()
+
+
+def test_combine_file_matrices_widens_and_checks_features(tmp_path):
+    from gatac.pp._combine import combine_file_matrices
+
+    def part(prefix, dtype, top):
+        names = [f"{prefix}c1", f"{prefix}c2"]
+        return ad.AnnData(sp.csr_matrix(np.array([[0, 1, 0], [top, 0, 2]], dtype=dtype)),
+                          obs=pd.DataFrame({"barcode": names}, index=names),
+                          var=pd.DataFrame(index=["g1", "g2", "g3"]))
+
+    parts = [part(p, dtype, top)
+             for p, dtype, top in (("a_", np.uint8, 200), ("b_", np.uint16, 60_000), ("c_", np.int32, 100_000))]
+    expected = sp.vstack([p.X for p in parts]).tocsr()
+    for out in (None, tmp_path / "c.h5ad"):
+        res = combine_file_matrices(iter(parts), ["a", "b", "c"], out)
+        X = res.X.to_memory() if res.isbacked else res.X
+        assert X.dtype == np.int32 and (X != expected).nnz == 0
+        assert list(res.obs_names) == ["a_c1", "a_c2", "b_c1", "b_c2", "c_c1", "c_c2"]
+        assert list(res.obs["source_file"]) == list("aabbcc")
+        if res.isbacked:
+            res.file.close()
+    other = ad.AnnData(sp.csr_matrix((1, 2)), var=pd.DataFrame(index=["g1", "x"]))
+    with pytest.raises(ValueError, match="other features"):
+        combine_file_matrices([parts[0], other], ["a", "b"])
+    with pytest.raises(ValueError, match=r"2 cell names are in more than one of the files \['a', 'c'\]"):
+        combine_file_matrices([parts[0], parts[1], part("a_", np.uint8, 1)], ["a", "b", "c"])
 
 
 def _cells_adata(data):

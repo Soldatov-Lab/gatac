@@ -21,7 +21,7 @@ tile can be several times larger than the selected one, too large to load;
 gatac tile <input.parquet|input.h5ad|input.h5> [input.parquet ...] -g <genome|chr_sizes>
            [-o OUTPUT] [-t TILE_SIZE] [-m MIN_FRAGS] [-n N_FEATURES]
            [-e CHROMS ...] [--metrics METRICS] [--filter QUERY]
-           [--count-strategy STRATEGY] [--barcode-prefix PREFIX]
+           [--count-strategy STRATEGY]
            [--low-memory]
 ```
 
@@ -48,7 +48,6 @@ gatac tile <input.parquet|input.h5ad|input.h5> [input.parquet ...] -g <genome|ch
 | `--metrics` | — | Metrics CSV for quality-based cell filtering |
 | `--filter` | — | Pandas `DataFrame.query` string applied to metrics |
 | `--count-strategy` | `unique` | Counting strategy: `unique`, `count`, or `binarize` |
-| `--barcode-prefix` | — | String prepended to barcodes |
 | `--low-memory` | off | Enable low-memory (single row-group) mode |
 
 ---
@@ -163,8 +162,9 @@ gatac tile sample1.parquet sample2.parquet sample3.parquet -g hg38 \
 ```
 
 The tiles are chosen on the cells of all samples together, and no
-per-sample matrix is written. Cell names repeated across files are made
-unique (`-1`, `-2`, ...); `--barcode-prefix` prefixes them all. Filter the
+per-sample matrix is written. The samples must not share cell names: give
+each its own barcode prefix first ([`gatac rename`](rename)), or the command
+stops with an error naming the files concerned. Filter the
 cells of each sample first (`gatac filter`), since `--metrics` applies the
 same table to every file.
 

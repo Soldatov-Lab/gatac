@@ -16,6 +16,67 @@ from .fragments import NAMED_SCHEMA, FragmentFile, write_fragments
 
 logger = logging.getLogger(__name__)
 
+SAMPLE = "{sample}"
+
+
+def _stem(path: Path) -> str:
+    """The name of the Parquet file of a fragments file, without ``.parquet``."""
+    return path.with_suffix('').with_suffix('.parquet').stem
+
+
+def sample_names(paths: Sequence[str | Path]) -> list[str]:
+    """
+    A sample name for each fragments file: the parts of the paths that
+    differ between the files, compared from the file name up and joined
+    with ``_``; a single file's name without its extensions.
+
+    Examples
+    --------
+    >>> sample_names(["samples/s1.tsv.gz", "samples/s2.tsv.gz"])
+    ['s1', 's2']
+    >>> sample_names(["runs/A/outs/atac_fragments.tsv.gz",
+    ...               "runs/B/outs/atac_fragments.tsv.gz"])
+    ['A', 'B']
+    """
+    paths = [Path(p).resolve() for p in paths]
+    parts = [(_stem(p), *reversed(p.parent.parts)) for p in paths]
+    if len(parts) == 1:
+        return [parts[0][0]]
+    depth = max(len(x) for x in parts)
+    parts = [x + ("",) * (depth - len(x)) for x in parts]
+    differ = [k for k in range(depth) if len({x[k] for x in parts}) > 1]
+    names = ["_".join(x[k] for k in reversed(differ) if x[k]) for x in parts]
+    if len(set(names)) != len(names):
+        raise ValueError(f"The input paths do not give distinct sample names: {names}")
+    return names
+
+
+def _fill(value: Optional[str], sample: str) -> Optional[str]:
+    """``value`` with ``{sample}`` replaced by the sample name."""
+    return value.replace(SAMPLE, sample) if value else value
+
+
+def _read_sample_sheet(samples) -> tuple[list[str], Optional[list[str]], Optional[list[str]]]:
+    """Input files, and output paths and barcode prefixes if given, of a sample sheet."""
+    import pandas as pd
+
+    if isinstance(samples, pd.DataFrame):
+        sheet = samples.fillna("").astype(str)
+    else:
+        sheet = pd.read_csv(samples, dtype=str, keep_default_na=False)
+    sheet.columns = [c.strip() for c in sheet.columns]
+    unknown = set(sheet.columns) - {"fragments", "output", "barcode_prefix"}
+    if "fragments" not in sheet.columns or unknown:
+        raise ValueError(
+            "A sample sheet has a fragments column, and optionally output and "
+            f"barcode_prefix; got {list(sheet.columns)}"
+        )
+
+    def column(name):
+        return [v.strip() for v in sheet[name]] if name in sheet.columns else None
+
+    return column("fragments"), column("output"), column("barcode_prefix")
+
 
 def make_parquet(
     input_path: str | Path,
@@ -47,7 +108,12 @@ def make_parquet(
     separator : str
         Column separator (default: tab)
     barcode_prefix : str, optional
-        Prefix to prepend to barcodes (e.g. "sample1#")
+        Prefix of the sample's barcodes (e.g. "sample1_"), so that cells keep
+        distinct names across samples. ``{sample}`` in it is replaced by the
+        input's name without its extensions (``"{sample}_"``). It is stored
+        once, in the file footer, and every reader puts it in front of the
+        barcode names; the names themselves are stored as in the input,
+        which :func:`to_tsv` writes back.
     row_group_size : int
         Number of rows per Parquet row group (default: 1_000_000).
         Larger groups reduce GPU kernel-launch overhead when streaming
@@ -65,7 +131,7 @@ def make_parquet(
     >>> import gatac as ga
     >>> out = ga.io.make_parquet("pbmc.tsv.gz")
     >>> # Or with a sample-specific barcode prefix
-    >>> out = ga.io.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1#")
+    >>> out = ga.io.make_parquet("pbmc.tsv.gz", barcode_prefix="sample1_")
     """
     input_path = Path(input_path)
     if output_path is None:
@@ -75,18 +141,15 @@ def make_parquet(
     if output_path.resolve() == input_path.resolve():
         raise ValueError(f"output_path must differ from the input: {output_path}")
 
+    barcode_prefix = _fill(barcode_prefix, _stem(input_path))
     logger.info(f"Converting {input_path.name} to Parquet")
 
-    if barcode_prefix:
-        barcode_expr = f"'{barcode_prefix}' || column3"
-    else:
-        barcode_expr = "column3"
     query = f"""
         SELECT
             column0          AS chrom,
             column1::UINTEGER AS start,
             column2::UINTEGER AS "end",
-            {barcode_expr}   AS barcode,
+            column3          AS barcode,
             column4::USMALLINT AS count
         FROM read_csv(
             '{input_path}',
@@ -119,6 +182,7 @@ def make_parquet(
         write_fragments(
             batches, output_path,
             row_group_size=row_group_size, barcode_stats=barcode_stats,
+            barcode_prefix=barcode_prefix,
         )
     finally:
         stage.unlink(missing_ok=True)
@@ -128,13 +192,15 @@ def make_parquet(
 
 
 def make_parquet_batch(
-    input_paths: list[str | Path],
+    input_paths: Optional[list[str | Path]] = None,
     output_dir: Optional[str | Path] = None,
     workers: Optional[int] = None,
     separator: str = '\t',
     barcode_prefix: Optional[str | Sequence[str]] = None,
     row_group_size: int = 1_000_000,
     file_prefix: Optional[str | Sequence[str]] = None,
+    output_paths: Optional[str | Sequence[str | Path]] = None,
+    samples: "Optional[str | Path | pd.DataFrame]" = None,
 ) -> list[Path]:
     """
     Convert multiple ATAC fragment TSV.GZ files to Parquet in parallel.
@@ -143,10 +209,16 @@ def make_parquet_batch(
     use all available CPU cores across files simultaneously. Files are
     started largest first, so that the largest do not run alone at the end.
 
+    ``barcode_prefix``, ``file_prefix`` and ``output_paths`` each take one
+    value for all files, where ``{sample}`` stands for each file's sample
+    name (:func:`sample_names`), or a list with one value per input file,
+    in the order of ``input_paths``. A sample sheet (``samples``) gives the
+    same per-file values as a table instead.
+
     Parameters
     ----------
-    input_paths : list of str or Path
-        Paths to input .tsv.gz (or .bed.gz) files.
+    input_paths : list of str or Path, optional
+        Paths to input .tsv.gz (or .bed.gz) files; or give ``samples``.
     output_dir : str or Path, optional
         Directory for output Parquet files.  If None, each output is
         placed in the same directory as its input.
@@ -157,14 +229,29 @@ def make_parquet_batch(
         Column separator forwarded to :func:`make_parquet`.
     barcode_prefix : str or list of str, optional
         Prefix forwarded to :func:`make_parquet`: one for all files, or one
-        per input file.
+        per input file. ``{sample}`` in it is replaced by each file's sample
+        name (:func:`sample_names`): ``"{sample}_"`` names the cells of
+        ``samples/s1.tsv.gz`` ``s1_<barcode>``. Files whose cells share
+        names are reported, as they cannot be combined into one matrix
+        until each has its own prefix (:func:`set_barcode_prefix`).
     row_group_size : int
         Row-group size forwarded to :func:`make_parquet`.
     file_prefix : str or list of str, optional
         Prepended to each output file name: one for all files, or one per
-        input file. Cell Ranger names every sample's file
-        ``atac_fragments.tsv.gz``, so with *output_dir* the outputs collide
-        unless each gets its own prefix.
+        input file, with ``{sample}`` as in ``barcode_prefix``. Cell Ranger
+        names every sample's file ``atac_fragments.tsv.gz``, so with
+        *output_dir* the outputs collide unless each gets its own prefix,
+        e.g. ``"{sample}_"``.
+    output_paths : str or list of str, optional
+        The output files themselves, instead of ``output_dir`` and
+        ``file_prefix``: one path with ``{sample}`` (e.g.
+        ``"parquets/{sample}.parquet"``), or one path per input file.
+    samples : str, Path or pandas.DataFrame, optional
+        A sample sheet, as a CSV file or a DataFrame, with one row per input
+        file: ``fragments`` (the input file), and optionally ``output`` and
+        ``barcode_prefix``, which replace ``output_paths`` and
+        ``barcode_prefix``. Empty cells take the defaults. Relative paths
+        are relative to the working directory.
 
     Returns
     -------
@@ -182,55 +269,81 @@ def make_parquet_batch(
     Examples
     --------
     >>> import gatac as ga
-    >>> # Convert multiple samples in parallel
+    >>> # Convert multiple samples in parallel, then give each its prefix
     >>> paths = ga.io.make_parquet_batch(
     ...     ["sampleA.tsv.gz", "sampleB.tsv.gz"],
     ...     output_dir="parquet/",
     ... )
-    >>> # With per-sample barcode prefixes (must match input order)
+    >>> for path, prefix in zip(paths, ["A_", "B_"]):
+    ...     ga.io.set_barcode_prefix(path, prefix)
+    >>> # Or with per-sample barcode prefixes (must match input order)
     >>> paths = ga.io.make_parquet_batch(
     ...     ["sampleA.tsv.gz", "sampleB.tsv.gz"],
     ...     barcode_prefix=["A_", "B_"],
     ... )
     >>> # Cell Ranger outputs, all named atac_fragments.tsv.gz: prefix the
-    >>> # output files and the barcodes with the sample
+    >>> # output files and the barcodes with the sample, A and B here
     >>> paths = ga.io.make_parquet_batch(
     ...     ["A/outs/atac_fragments.tsv.gz", "B/outs/atac_fragments.tsv.gz"],
     ...     output_dir="parquet/",
-    ...     file_prefix=["A_", "B_"],
-    ...     barcode_prefix=["A_", "B_"],
+    ...     file_prefix="{sample}_",
+    ...     barcode_prefix="{sample}_",
+    ... )  # parquet/A_atac_fragments.parquet, cells A_<barcode>, ...
+    >>> # Your own names, one per file, as lists or as a sample sheet
+    >>> paths = ga.io.make_parquet_batch(
+    ...     ["A/outs/atac_fragments.tsv.gz", "B/outs/atac_fragments.tsv.gz"],
+    ...     output_paths=["parquet/patient1.parquet", "parquet/patient2.parquet"],
+    ...     barcode_prefix=["patient1_", "patient2_"],
     ... )
+    >>> paths = ga.io.make_parquet_batch(samples="samples.csv")
     """
+    if samples is not None:
+        if input_paths is not None:
+            raise ValueError("Give input_paths or samples, not both")
+        input_paths, sheet_outputs, sheet_prefixes = _read_sample_sheet(samples)
+        if sheet_outputs is not None:
+            output_paths = sheet_outputs
+        if sheet_prefixes is not None:
+            barcode_prefix = sheet_prefixes
+    if not input_paths:
+        raise ValueError("No input files given")
     input_paths = [Path(p) for p in input_paths]
 
     def per_file(value, what):
-        if isinstance(value, str) or value is None:
-            return [value or ""] * len(input_paths)
-        values = list(value)
+        if isinstance(value, (str, Path)) or value is None:
+            return [str(value) if value else ""] * len(input_paths)
+        values = [str(v) if v else "" for v in value]
         if len(values) != len(input_paths):
             raise ValueError(f"{len(values)} {what} for {len(input_paths)} input files")
         return values
 
-    prefixes = [p or None for p in per_file(barcode_prefix, "barcode prefixes")]
-    file_prefixes = per_file(file_prefix, "file prefixes")
+    names = sample_names(input_paths)
+    prefixes = [_fill(p, s) or None
+                for p, s in zip(per_file(barcode_prefix, "barcode prefixes"), names)]
+    file_prefixes = [_fill(p, s) for p, s in zip(per_file(file_prefix, "file prefixes"), names)]
+    outputs = [_fill(o, s) for o, s in zip(per_file(output_paths, "output paths"), names)]
 
     # Next to each input unless output_dir is given, as make_parquet does
     output_paths = [
+        Path(o) if o else
         (Path(output_dir) if output_dir is not None else p.parent)
         / (fp + p.with_suffix('').with_suffix('.parquet').name)
-        for p, fp in zip(input_paths, file_prefixes)
+        for p, fp, o in zip(input_paths, file_prefixes, outputs)
     ]
     seen: dict[Path, Path] = {}
     for inp, out in zip(input_paths, output_paths):
         key = out.resolve()
         if key in seen:
             raise ValueError(
-                f"{seen[key]} and {inp} would both be written to {out}; "
-                "give each file its own file_prefix"
+                f"{seen[key]} and {inp} would both be written to {out}; give each file "
+                'its own output, e.g. file_prefix="{sample}_" (--file-prefix) or '
+                'output_paths="parquets/{sample}.parquet" (-o)'
             )
         seen[key] = inp
-    if output_dir is not None:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    for out in output_paths:
+        out.parent.mkdir(parents=True, exist_ok=True)
+    if len(input_paths) == 1:
+        return [make_parquet(input_paths[0], output_paths[0], separator, prefixes[0], row_group_size)]
 
     n_workers = min(
         len(input_paths),
@@ -263,6 +376,7 @@ def make_parquet_batch(
             i = future_to_idx[future]
             results[i] = future.result()  # propagate worker exceptions
 
+    _warn_shared_barcodes(results)
     return results  # type: ignore[return-value]
 
 
@@ -312,3 +426,78 @@ def to_tsv(
     )
     logger.info(f"Created {Path(output_path).name}")
     return output_path
+
+
+def set_barcode_prefix(
+    path: str | Path,
+    barcode_prefix: str,
+    output_path: Optional[str | Path] = None,
+) -> Path:
+    """
+    Set the barcode prefix of a GATAC Parquet fragment file.
+
+    The prefix is stored once, in the file footer, and every reader puts it
+    in front of the barcode names, so only the footer is rewritten: the
+    file is renamed in place in milliseconds, whatever its size. Use it to
+    give each sample's cells distinct names before combining files that
+    were converted without prefixes.
+
+    Parameters
+    ----------
+    path : str or Path
+        Fragment Parquet file written by :func:`make_parquet`.
+    barcode_prefix : str
+        The new prefix, which replaces the file's; ``""`` removes it.
+    output_path : str or Path, optional
+        Write a copy with the new prefix instead of changing ``path``.
+
+    Returns
+    -------
+    Path
+        The renamed file.
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.io.set_barcode_prefix("sampleA.parquet", "A_")
+    >>> ga.io.FragmentFile("sampleA.parquet").barcodes[:2]
+    array(['A_AAACGAAAGACTCGGT-1', 'A_AAACGAAAGTGAGCTA-1'], dtype=object)
+    """
+    import shutil
+
+    from ._footer import update_key_value_metadata
+
+    path = Path(path)
+    FragmentFile(path)  # a GATAC fragment file
+    if output_path is not None:
+        output_path = Path(output_path)
+        if output_path.resolve() == path.resolve():
+            raise ValueError(f"output_path must differ from the input: {output_path}")
+        tmp_path = output_path.with_name(output_path.name + ".tmp")
+        try:
+            shutil.copyfile(path, tmp_path)
+            update_key_value_metadata(tmp_path, {"gatac.barcode_prefix": barcode_prefix})
+            os.replace(tmp_path, output_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        path = output_path
+    else:
+        update_key_value_metadata(path, {"gatac.barcode_prefix": barcode_prefix})
+    logger.info(f"Barcode prefix of {path.name}: {barcode_prefix!r}")
+    return path
+
+
+def _warn_shared_barcodes(paths: Sequence[Path]) -> None:
+    """Warn if files share cell names, which keeps them from being combined."""
+    seen: dict[str, str] = {}
+    for p in paths:
+        names = set(FragmentFile(p).barcodes)
+        for other, other_names in seen.items():
+            n = len(names & other_names)
+            if n:
+                logger.warning(
+                    f"{other} and {p.name} share {n:,} barcode names; give each sample its own "
+                    "prefix before building a matrix of several files (gatac rename)"
+                )
+                return
+        seen[p.name] = names

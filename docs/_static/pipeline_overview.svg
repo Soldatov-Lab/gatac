@@ -91,7 +91,7 @@
   <rect x="590" y="340" width="150" height="76" rx="6" class="cf-val"/>
   <text x="665" y="362" text-anchor="middle" class="cf-text cf-bold">Gene matrix</text>
   <text x="665" y="382" text-anchor="middle" class="cf-code">gatac gene</text>
-  <text x="665" y="400" text-anchor="middle" class="cf-muted">per sample + combine</text>
+  <text x="665" y="400" text-anchor="middle" class="cf-muted">one matrix, all samples</text>
 
   <line x1="350" y1="434" x2="350" y2="478" class="cf-line" marker-end="url(#cf-pipe-a)"/>
 

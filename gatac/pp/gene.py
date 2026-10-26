@@ -569,7 +569,7 @@ def gene_matrix_to_anndata(
 
 
 def make_gene_matrix(
-    input_parquet: str | Path,
+    input_parquet: str | Path | List[str | Path],
     gene_anno: str | Path,
     output_path: Optional[str | Path] = None,
     id_type: Literal["gene", "transcript"] = "gene",
@@ -580,7 +580,6 @@ def make_gene_matrix(
     exclude_chroms: Optional[list] = None,
     metrics: Optional[str | Path | pd.DataFrame | cudf.DataFrame] = None,
     filter_query: Optional[str] = None,
-    barcode_prefix: Optional[str] = None,
     low_memory: bool = False,
     cell_batch_size: int = 500,
     gene_name_key: str = "gene_name",
@@ -599,12 +598,17 @@ def make_gene_matrix(
 
     Parameters
     ----------
-    input_parquet : str or Path
-        Path to input parquet file containing ATAC fragments
+    input_parquet : str, Path, or list
+        Fragment parquet file, or several, which make one matrix: the cells
+        of each file in turn, with ``obs["source_file"]`` the file's name.
+        The files must not share cell names: give each sample its own
+        barcode prefix (:func:`gatac.io.set_barcode_prefix`).
     gene_anno : str or Path
         Path to GTF/GFF gene annotation file.
     output_path : str or Path, optional
         Path for output .h5ad file. If None, the matrix is only returned.
+        A matrix of several files is written as it is built, one file at a
+        time, and returned opened from the file in backed mode.
     id_type : str
         "gene" or "transcript" - which feature type to use (default: "gene").
         As in SnapATAC2, genes are named and counted by gene name: genes
@@ -626,8 +630,6 @@ def make_gene_matrix(
         :func:`gatac.pp.compute_metrics`, or a CSV file of it.
     filter_query : str, optional
         Query string for filtering cells based on metrics (e.g. "tsse_score > 5").
-    barcode_prefix : str, optional
-        Prefix to add to barcodes
     low_memory : bool
         Use low memory mode for Parquet reading (default: False)
     cell_batch_size : int
@@ -658,10 +660,42 @@ def make_gene_matrix(
     ...     downstream=0,
     ...     include_gene_body=True,
     ... )
+    >>> # Several samples in one matrix, written as it is built
+    >>> adata_gene = ga.pp.make_gene_matrix(
+    ...     ["sample1.parquet", "sample2.parquet"],
+    ...     gene_anno="GRCh38.gtf.gz",
+    ...     output_path="genes.h5ad",
+    ... )
     """
 
     from ..io.fragments import read_fragments_parquet
     import scanpy as sc
+
+    if isinstance(input_parquet, (list, tuple)):
+        from ._combine import _check_distinct_cells, _file_names, combine_file_matrices
+
+        paths = [Path(p) for p in input_parquet]
+        names = _file_names(paths)
+        _check_distinct_cells(paths, names)
+        metrics = read_metrics(metrics, gpu=True)
+        start_time = time.perf_counter()
+        parts = (
+            make_gene_matrix(
+                path, gene_anno, id_type=id_type, upstream=upstream, downstream=downstream,
+                include_gene_body=include_gene_body,
+                min_fragments_per_cell=min_fragments_per_cell, exclude_chroms=exclude_chroms,
+                metrics=metrics, filter_query=filter_query,
+                low_memory=low_memory, gene_name_key=gene_name_key, gene_id_key=gene_id_key,
+                transcript_name_key=transcript_name_key, transcript_id_key=transcript_id_key,
+            )
+            for path in paths
+        )
+        adata = combine_file_matrices(parts, names, output_path)
+        logger.info(
+            f"Gene matrix of {len(paths)} files: {adata.n_obs:,} cells × {adata.n_vars:,} genes "
+            f"({time.perf_counter() - start_time:.1f}s)"
+        )
+        return adata
 
     input_parquet = Path(input_parquet)
     gene_anno = Path(gene_anno)
@@ -728,9 +762,6 @@ def make_gene_matrix(
 
     # Convert to AnnData
     adata = gene_matrix_to_anndata(matrix, cell_metadata, gene_metadata)
-    
-    if barcode_prefix:
-        adata.obs_names = [f"{barcode_prefix}{b}" for b in adata.obs_names]
 
     total_time = time.perf_counter() - start_time
     if output_path is not None:

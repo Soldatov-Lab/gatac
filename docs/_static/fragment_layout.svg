@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 556" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-layout-title">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 580" width="100%" style="max-width:760px" role="img" aria-labelledby="cf-layout-title">
   <title id="cf-layout-title">From fragments.tsv.gz to a GATAC Parquet file</title>
   <style>
     .cf-text  { fill: var(--pst-color-text-base, #1f2328); font-family: var(--pst-font-family-base, sans-serif); font-size: 13px; }
@@ -41,7 +41,7 @@
   <text x="392" y="174" class="cf-muted">names become integer ids; the names are stored once</text>
 
   <!-- the parquet file -->
-  <rect x="20" y="186" width="720" height="360" rx="8" class="cf-file"/>
+  <rect x="20" y="186" width="720" height="384" rx="8" class="cf-file"/>
   <text x="36" y="208" class="cf-text"><tspan class="cf-bold">pbmc.parquet</tspan><tspan class="cf-muted" dx="8">delta: signed values (+34, −79) are the change from the row above · split: bytes stored by position</tspan></text>
 
   <!-- row group 0 -->
@@ -79,7 +79,8 @@
   <text x="48" y="448" class="cf-muted">row groups 1 … N · 1,000,000 fragments each, ZSTD · bc_* columns all null (almost no space)</text>
 
   <!-- footer -->
-  <rect x="36" y="474" width="688" height="60" rx="6" class="cf-foot"/>
+  <rect x="36" y="474" width="688" height="84" rx="6" class="cf-foot"/>
   <text x="48" y="495" class="cf-text cf-bold">footer (key-value metadata, not compressed)</text>
   <text x="48" y="519" class="cf-mono" style="font-size:10.5px">gatac.format_version = 1 · gatac.chroms = ["chr1", "chr2", …] · gatac.n_barcodes = 3</text>
+  <text x="48" y="543" class="cf-mono" style="font-size:10.5px">gatac.barcode_prefix = "pbmc_"<tspan class="cf-muted" dx="12">cell names: prefix + bc_name (pbmc_TTGCATGA-1) · gatac rename edits only this</tspan></text>
 </svg>

@@ -19,11 +19,39 @@ analyses.
 ### 1. Fragment files to Parquet
 
 `gatac convert` ({func}`gatac.io.make_parquet_batch`) writes one Parquet
-file per `fragments.tsv.gz`, with an optional prefix on the barcodes so that
-cells stay unique across samples. Chromosomes and barcodes are stored as
+file per `fragments.tsv.gz`. Chromosomes and barcodes are stored as
 integer ids, with their names stored once per file, so that the GPU never
 handles strings while streaming fragments; see
 [Fragment files](#fragment-files).
+
+A cell's name is its barcode preceded by the sample's **barcode prefix**,
+and every later step names it so: the QC metrics, the filtered files, the
+matrices and the peak steps, which find a cell's fragments by its name.
+The prefix is stored once, in the file's footer, and the barcodes
+themselves stay those of the `fragments.tsv.gz`, which `gatac convert`
+writes back from the Parquet file. The prefix is given when converting,
+where `{sample}`, written as is, is replaced by each file's sample name, the
+part of the input paths that differs between the files:
+
+```bash
+gatac convert "samples/*.tsv.gz" --output-dir parquets/ --barcode-prefix "{sample}_"
+# samples/s1.tsv.gz → parquets/s1.parquet, cells s1_<barcode>
+# samples/s2.tsv.gz → parquets/s2.parquet, cells s2_<barcode>
+```
+
+or set at any time afterwards with `gatac rename`
+({func}`gatac.io.set_barcode_prefix`), which rewrites the footer only and
+takes milliseconds:
+
+```bash
+gatac rename parquets/s1.parquet --barcode-prefix s1_
+```
+
+- One sample needs no prefix.
+- Samples that go into one matrix must not share cell names, as 10x
+  samples from the same barcode whitelist do: give each its own prefix,
+  e.g. `sample1_`. Building a matrix of samples that share names stops
+  with an error before any work.
 
 ### 2. QC and filtering
 
@@ -78,9 +106,11 @@ merged peaks, from the filtered files. The peak matrix is the input of
 ### Gene matrix
 
 `gatac gene` ({func}`gatac.pp.make_gene_matrix`) counts insertions over
-promoters and gene bodies, one filtered file at a time; `gatac combine`
-({func}`gatac.pp.combine`) merges the samples. It gives gene activity for
-annotating the clusters.
+promoters and gene bodies; given several filtered files, it builds one
+matrix of all the samples, with `obs["source_file"]` as for the tile
+matrix. It gives gene activity for annotating the clusters. `gatac
+genescore` ({func}`gatac.pp.make_gene_score_matrix`) gives ArchR's gene
+scores in the same way.
 
 ---
 
@@ -89,8 +119,9 @@ annotating the clusters.
 Steps 1 to 3 and the gene matrix with the CLI:
 
 ```bash
-# 1. Convert fragments
-gatac convert "samples/*.tsv.gz" --output-dir parquets/
+# 1. Convert fragments, cells named by sample (sample1_<barcode>)
+#    ({sample} is written as is: gatac fills it in for each file, s1_, s2_, ...)
+gatac convert "samples/*.tsv.gz" --output-dir parquets/ --barcode-prefix "{sample}_"
 
 # 2. QC metrics, then the cells passing QC, per sample
 for f in parquets/*.parquet; do
@@ -103,11 +134,8 @@ done
 # 3. One tile matrix of every sample, 500,000 most accessible tiles
 gatac tile filtered/*.parquet -g hg38 -n 500000 -o tiles.h5ad
 
-# Gene matrices per sample, merged
-for f in filtered/*.parquet; do
-    gatac gene "$f" -g GRCh38.gtf.gz -o "genes/$(basename $f .parquet).h5ad"
-done
-gatac combine genes/*.h5ad -o genes.h5ad
+# One gene matrix of every sample
+gatac gene filtered/*.parquet -g GRCh38.gtf.gz -o genes.h5ad
 ```
 
 Steps 4 to 6 in Python:

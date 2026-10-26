@@ -4,6 +4,8 @@ GATAC Command Line Interface.
 Usage:
     gatac convert <input.tsv.gz> [output.parquet]
     gatac convert <input.parquet> [output.tsv.gz]
+    gatac convert --samples <samples.csv> [--output-dir dir]
+    gatac rename <input.parquet> --barcode-prefix <prefix> [-o output.parquet]
     gatac tile <input.parquet|input.h5ad|input.h5> [input2.parquet ...] [-o output] [-t tile_size] [-m min_frags] [-n n_features]
     gatac gene <input.parquet> -g <annotations.gtf> [-o output]
     gatac combine <input.h5ad> [input2.h5ad ...] -o <output.h5ad>
@@ -30,7 +32,11 @@ def setup_logging(verbose: bool = False):
 def convert_command(args):
     """Handle 'gatac convert' subcommand."""
     import glob
-    from .io.convert import make_parquet, make_parquet_batch, to_tsv
+    from .io.convert import make_parquet_batch, to_tsv
+
+    if args.samples and args.input:
+        logging.error("Give input files or --samples, not both")
+        sys.exit(1)
 
     # Expand inputs - support glob patterns
     input_paths = []
@@ -49,7 +55,7 @@ def convert_command(args):
             logging.error(f"Input file not found: {p}")
             sys.exit(1)
 
-    if len(input_paths) == 0:
+    if len(input_paths) == 0 and not args.samples:
         logging.error("No input files found")
         sys.exit(1)
 
@@ -59,15 +65,15 @@ def convert_command(args):
         if not all(is_parquet):
             logging.error("Inputs mix .parquet and TSV files; convert one direction at a time")
             sys.exit(1)
-        if args.barcode_prefix:
-            logging.error("--barcode-prefix applies to TSV inputs only")
+        if args.barcode_prefix or args.file_prefix:
+            logging.error("--barcode-prefix and --file-prefix apply to TSV inputs only")
             sys.exit(1)
-        if args.output and len(input_paths) > 1:
-            logging.error("Use --output-dir instead of --output when converting multiple files")
+        if args.output and len(args.output) != len(input_paths):
+            logging.error("Give one --output per input file, or use --output-dir")
             sys.exit(1)
-        for p in input_paths:
+        for i, p in enumerate(input_paths):
             if args.output:
-                output_path = Path(args.output)
+                output_path = Path(args.output[i])
             elif args.output_dir:
                 Path(args.output_dir).mkdir(parents=True, exist_ok=True)
                 output_path = Path(args.output_dir) / p.with_suffix('.tsv.gz').name
@@ -79,32 +85,38 @@ def convert_command(args):
             to_tsv(p, output_path, overwrite=args.overwrite)
         return
 
-    if len(input_paths) == 1:
-        if args.output_dir:
-            output_path = Path(args.output_dir) / input_paths[0].with_suffix('').with_suffix('.parquet').name
-        else:
-            output_path = args.output if args.output else None
-        make_parquet(
-            input_paths[0],
-            output_path,
-            barcode_prefix=args.barcode_prefix,
-        )
-    else:
-        if args.output:
-            logging.error("Use --output-dir instead of --output when converting multiple files")
-            sys.exit(1)
+    def one_or_each(values):
+        """One value for all files, or the list of one per file."""
+        return values[0] if values and len(values) == 1 else values
+
+    try:
         make_parquet_batch(
-            input_paths,
+            input_paths or None,
             output_dir=args.output_dir,
             workers=args.workers,
-            barcode_prefix=args.barcode_prefix,
+            barcode_prefix=one_or_each(args.barcode_prefix),
+            file_prefix=one_or_each(args.file_prefix),
+            output_paths=one_or_each(args.output),
+            samples=args.samples,
         )
+    except (ValueError, OSError) as e:
+        logging.error(str(e))
+        sys.exit(1)
 
 
-def tile_command(args):
-    """Handle 'gatac tile' subcommand."""
-    from .pp.tile import make_tile_matrix
+def rename_command(args):
+    """Set the barcode prefix of a fragment Parquet file."""
+    from .io.convert import set_barcode_prefix
 
+    try:
+        set_barcode_prefix(args.input, args.barcode_prefix, output_path=args.output)
+    except (ValueError, OSError) as e:
+        logging.error(str(e))
+        sys.exit(1)
+
+
+def _input_files(args) -> list[Path]:
+    """The command's input files, which must exist; --output is required for several."""
     input_paths = [Path(p) for p in args.input]
     for p in input_paths:
         if not p.exists():
@@ -113,6 +125,14 @@ def tile_command(args):
     if len(input_paths) > 1 and args.output is None:
         logging.error("--output is required when combining several files")
         sys.exit(1)
+    return input_paths
+
+
+def tile_command(args):
+    """Handle 'gatac tile' subcommand."""
+    from .pp.tile import make_tile_matrix
+
+    input_paths = _input_files(args)
     input_path = input_paths[0]
 
     # Resolve genome if it's a file
@@ -147,7 +167,6 @@ def tile_command(args):
             metrics=args.metrics,
             filter_query=args.filter_query,
             count_strategy=args.count_strategy,
-            barcode_prefix=args.barcode_prefix,
             low_memory=args.low_memory,
             n_features=args.n_features,
         )
@@ -233,12 +252,10 @@ def gene_command(args):
     """Handle 'gatac gene' subcommand."""
     from .pp.gene import make_gene_matrix
 
-    input_path = Path(args.input)
+    input_paths = _input_files(args)
+    input_path = input_paths[0]
     gtf_path = Path(args.gtf)
-    
-    if not input_path.exists():
-        logging.error(f"Input file not found: {input_path}")
-        sys.exit(1)
+
     if not gtf_path.exists():
         logging.error(f"GTF file not found: {gtf_path}")
         sys.exit(1)
@@ -251,7 +268,7 @@ def gene_command(args):
             )
 
         make_gene_matrix(
-            input_parquet=input_path,
+            input_parquet=input_paths if len(input_paths) > 1 else input_path,
             gene_anno=gtf_path,
             output_path=output_path,
             id_type=args.id_type,
@@ -262,7 +279,6 @@ def gene_command(args):
             exclude_chroms=args.exclude_chroms,
             metrics=args.metrics,
             filter_query=args.filter_query,
-            barcode_prefix=args.barcode_prefix,
             low_memory=args.low_memory,
         )
     except ValueError as e:
@@ -277,19 +293,16 @@ def genescore_command(args):
     """Handle 'gatac genescore' subcommand."""
     from .pp.genescore import make_gene_score_matrix
 
-    input_path = Path(args.input)
+    input_paths = _input_files(args)
     anno_path = Path(args.gtf)
 
-    if not input_path.exists():
-        logging.error(f"Input file not found: {input_path}")
-        sys.exit(1)
     if not anno_path.exists():
         logging.error(f"Gene annotation file not found: {anno_path}")
         sys.exit(1)
 
     try:
         make_gene_score_matrix(
-            input_parquet=input_path,
+            input_parquet=input_paths if len(input_paths) > 1 else input_paths[0],
             gene_anno=anno_path,
             output_path=args.output,
             gene_model=args.gene_model,
@@ -307,7 +320,6 @@ def genescore_command(args):
             min_fragments_per_cell=args.min_fragments,
             metrics=args.metrics,
             filter_query=args.filter_query,
-            barcode_prefix=args.barcode_prefix,
             low_memory=args.low_memory,
             cell_batch_size=args.cell_batch_size,
         )
@@ -442,13 +454,20 @@ def main():
     )
     convert_parser.add_argument(
         'input',
-        nargs='+',
+        nargs='*',
         help='Input .tsv.gz file(s) or glob pattern (e.g. "samples/*.tsv.gz"); '
              '.parquet inputs are written back to .tsv.gz'
     )
     convert_parser.add_argument(
+        '--samples',
+        help='Sample sheet (CSV) instead of input files: a fragments column, and '
+             'optionally output and barcode_prefix columns, one row per file'
+    )
+    convert_parser.add_argument(
         '-o', '--output',
-        help='Output .parquet file, or .tsv.gz / .tsv for a .parquet input (single-file mode only)'
+        nargs='+',
+        help='Output .parquet file(s), or .tsv.gz / .tsv for .parquet inputs: one per '
+             'input file, or one with {sample} (e.g. "parquets/{sample}.parquet")'
     )
     convert_parser.add_argument(
         '--output-dir',
@@ -462,7 +481,18 @@ def main():
     )
     convert_parser.add_argument(
         '--barcode-prefix',
-        help='Prefix to add to barcodes'
+        nargs='+',
+        help='Barcode prefix of the cells, stored in the file footer (see gatac rename): '
+             'one per input file, or one for all where {sample} is replaced by each '
+             'file\'s sample name, the part of the input paths that differs between the '
+             'files (e.g. "{sample}_")'
+    )
+    convert_parser.add_argument(
+        '--file-prefix',
+        nargs='+',
+        help='Prefix of the output file names: one per input file, or one with '
+             '{sample} as in --barcode-prefix (e.g. "{sample}_" for Cell Ranger '
+             'outputs, all named atac_fragments.tsv.gz)'
     )
     convert_parser.add_argument(
         '--overwrite',
@@ -470,6 +500,24 @@ def main():
         help='Replace existing .tsv.gz / .tsv outputs of .parquet inputs'
     )
     convert_parser.set_defaults(func=convert_command)
+
+    # Rename subcommand
+    rename_parser = subparsers.add_parser(
+        'rename',
+        help='Set the barcode prefix of a fragment Parquet file (rewrites the footer only)',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    rename_parser.add_argument('input', help='Fragment .parquet file, changed in place')
+    rename_parser.add_argument(
+        '--barcode-prefix',
+        required=True,
+        help='New barcode prefix, which replaces the file\'s; "" removes it'
+    )
+    rename_parser.add_argument(
+        '-o', '--output',
+        help='Write a copy with the new prefix instead of changing the input'
+    )
+    rename_parser.set_defaults(func=rename_command)
 
     # Tile subcommand
     tile_parser = subparsers.add_parser(
@@ -518,10 +566,6 @@ def main():
         '--filter',
         dest='filter_query',
         help='Filtering query string (e.g., "tsse_score > 5")'
-    )
-    tile_parser.add_argument(
-        '--barcode-prefix',
-        help='Prefix to add to barcodes'
     )
     tile_parser.add_argument(
         '--low-memory',
@@ -636,7 +680,8 @@ def main():
     )
     filter_parser.add_argument(
         '--barcode-prefix',
-        help='Prefix to add to barcodes before filtering'
+        help="Barcode prefix of the output (default: the input's); cells are matched "
+             "to --metrics on the input's names"
     )
     filter_parser.add_argument(
         '--batch-size',
@@ -654,7 +699,8 @@ def main():
     )
     gene_parser.add_argument(
         'input',
-        help='Input .parquet file'
+        nargs='+',
+        help='Input fragments .parquet file; several make one combined matrix'
     )
     gene_parser.add_argument(
         '-g', '--gtf',
@@ -716,10 +762,6 @@ def main():
         help='Filtering query string (e.g., "tsse_score > 5")'
     )
     gene_parser.add_argument(
-        '--barcode-prefix',
-        help='Prefix to add to barcodes'
-    )
-    gene_parser.add_argument(
         '--low-memory',
         action='store_true',
         help='Use low memory mode for Parquet reading'
@@ -732,7 +774,10 @@ def main():
         help='Generate ArchR-style distance-weighted gene activity score matrix',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    genescore_parser.add_argument('input', help='Input .parquet file')
+    genescore_parser.add_argument(
+        'input', nargs='+',
+        help='Input fragments .parquet file; several make one combined matrix'
+    )
     genescore_parser.add_argument(
         '-g', '--gtf', required=True,
         help='GTF/GFF annotation, or CSV with columns symbol,seqnames,start,end,strand'
@@ -774,7 +819,6 @@ def main():
     genescore_parser.add_argument('--metrics', help='CSV of quality metrics for filtering')
     genescore_parser.add_argument('--filter', dest='filter_query',
                                   help='Filtering query string (e.g., "tsse_score > 5")')
-    genescore_parser.add_argument('--barcode-prefix', help='Prefix to add to barcodes')
     genescore_parser.add_argument('--low-memory', action='store_true',
                                   help='Use low memory mode for Parquet reading')
     genescore_parser.add_argument('--cell-batch-size', type=int, default=None,

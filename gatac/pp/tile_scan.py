@@ -27,6 +27,7 @@ import scipy.sparse as sp
 
 from .._cupy_compat import bincount
 from ..io.fragments import FragmentFile
+from ._combine import _check_distinct_cells, _combined_obs, _file_names
 from ._utils import async_memory_pool, cleanup_gpu_memory
 from .tile import (
     _add_tile_stats,
@@ -43,20 +44,6 @@ logger = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
 
-def _make_unique(names: pd.Index) -> pd.Index:
-    """Suffix repeated names ``-1``, ``-2``, ... in order."""
-    seen: dict[str, int] = {}
-    out = []
-    for x in names:
-        if x in seen:
-            seen[x] += 1
-            out.append(f"{x}-{seen[x]}")
-        else:
-            seen[x] = 0
-            out.append(x)
-    return pd.Index(out)
-
-
 def scan_tiles(
     fragments: PathLike | List[PathLike],
     chrom_sizes: dict[str, int] | str,
@@ -66,7 +53,6 @@ def scan_tiles(
     metrics=None,
     filter_query: Optional[str] = None,
     count_strategy: str = "unique",
-    barcode_prefix: Optional[str | List[str]] = None,
     row_groups_per_batch: int = 64,
     output_path: Optional[PathLike] = None,
 ) -> ad.AnnData:
@@ -89,10 +75,9 @@ def scan_tiles(
         Chromosome sizes, or a genome name (e.g. ``"hg38"``).
     tile_size, min_fragments_per_cell, exclude_chroms, metrics, filter_query, count_strategy
         As in :func:`~gatac.pp.make_tile_matrix`. ``metrics`` applies to
-        every file, matched on the barcodes as stored in the files.
-    barcode_prefix : str or list of str, optional
-        Prefix of the cell names, one for all files or one per file. Names
-        repeated across files are made unique with ``-1``, ``-2``, ...
+        every file, matched on the cell names. Files must not share cell
+        names: give each sample its own barcode prefix
+        (:func:`gatac.io.set_barcode_prefix`).
     row_groups_per_batch : int
         Parquet row groups per GPU batch (default 64).
     output_path : str or Path, optional
@@ -103,7 +88,7 @@ def scan_tiles(
     AnnData
         ``n_cells × n_tiles`` with ``X`` None.
 
-        - ``obs``: ``barcode`` (as stored in the fragment file),
+        - ``obs``: ``barcode`` (the cell name, with the file's prefix),
           ``source_file`` (the file's name), ``n_unique`` and the metrics'
           other columns. Cells are grouped by file, in the order given.
         - ``var``: ``chrom``, ``start``, ``end``, and the tile's statistics
@@ -136,22 +121,8 @@ def scan_tiles(
     if count_strategy not in ("unique", "count", "binarize"):
         raise ValueError(f"Unknown count_strategy {count_strategy!r}")
     paths = [Path(fragments)] if isinstance(fragments, (str, Path)) else [Path(p) for p in fragments]
-    if not paths:
-        raise ValueError("No fragment files given")
-    names = [p.name for p in paths]
-    if len(set(names)) != len(names):
-        raise ValueError(
-            "Fragment files must have distinct names, which identify each cell's file "
-            "(see make_parquet_batch(file_prefix=...))"
-        )
-    if barcode_prefix is None or isinstance(barcode_prefix, str):
-        prefixes = [barcode_prefix or ""] * len(paths)
-    else:
-        prefixes = list(barcode_prefix)
-        if len(prefixes) != len(paths):
-            raise ValueError(
-                f"Number of barcode prefixes ({len(prefixes)}) must match files ({len(paths)})"
-            )
+    names = _file_names(paths)
+    _check_distinct_cells(paths, names)
 
     all_chroms, included_chroms = _included_chroms(chrom_sizes, exclude_chroms)
     tile_metadata, chrom_offset_df, n_tiles = _cached_tile_metadata(
@@ -164,7 +135,7 @@ def scan_tiles(
     obs_parts = []
     start_time = time.perf_counter()
     with async_memory_pool():
-        for path, name, prefix in zip(paths, names, prefixes):
+        for path, name in zip(paths, names):
             fragments_file = FragmentFile(path)
             cells = _tile_cells(fragments_file, all_chroms, cell_meta_extra, min_fragments_per_cell)
             keys, counts = _stream_key_counts(
@@ -174,19 +145,13 @@ def scan_tiles(
             for _, _, _, cols, data in _iter_slabs(keys, counts, len(cells), n_tiles):
                 _add_tile_stats(stats, cols, data, n_tiles, count_strategy == "binarize")
             del keys, counts
-            cells.index = pd.Index(prefix + cells["barcode"])
+            cells.index = pd.Index(cells["barcode"])
             cells.insert(1, "source_file", name)
             obs_parts.append(cells)
             logger.info(f"Scanned {name}: {len(cells):,} cells")
     cleanup_gpu_memory()
 
-    obs = pd.concat(obs_parts)
-    if not obs.index.is_unique:
-        logger.warning(
-            f"Detected {obs.index.duplicated().sum():,} duplicate cell names. Making them unique."
-        )
-        obs.index = _make_unique(obs.index)
-    obs["source_file"] = pd.Categorical(obs["source_file"], categories=names)
+    obs = _combined_obs(obs_parts, names)
 
     tiles = ad.AnnData(obs=obs, var=tile_metadata.copy())
     _set_tile_stats(tiles, stats, len(obs))

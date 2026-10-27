@@ -52,7 +52,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 from ._gpu import ChunkedMatrix, _to_gpu_csr
 
 logger = logging.getLogger(__name__)

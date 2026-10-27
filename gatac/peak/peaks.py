@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 from numba import njit, prange
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 from .._readers import read_bed
 from ..io.fragments import FragmentFile
 from ..pp.genome import get_chrom_sizes

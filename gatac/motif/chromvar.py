@@ -21,7 +21,8 @@ from scipy.sparse import csr_matrix as scipy_csr_matrix
 from tqdm.auto import tqdm, trange
 
 from ._bias_matching import compute_bias_knn_indices, normalize_bias_matrix
-from .motif import DNAMotif, _encode_sequences_batch, _open_fasta
+from ..io.fasta import Fasta
+from .motif import DNAMotif, _encode_sequences_batch
 
 logger = logging.getLogger(__name__)
 
@@ -108,20 +109,8 @@ def _compute_gc_content_gpu(
     n_peaks = len(peak_regions)
 
     # --- 1. Fetch all sequences (CPU / I/O bound) ---
-    sequences: list[str] = []
-    with _open_fasta(genome_fasta) as genome:
-        for region in tqdm(peak_regions, desc="Fetching sequences for GC content"):
-            try:
-                chrom, coords = region.split(":")
-                start, end = int(coords.split("-")[0]), int(coords.split("-")[1])
-                if coordinate_system == "1-based":
-                    seq = str(genome[chrom][start - 1 : end].seq).upper()
-                else:
-                    seq = str(genome[chrom][start:end].seq).upper()
-                sequences.append(seq)
-            except Exception as e:
-                logger.warning(f"Failed to fetch {region}: {e}")
-                sequences.append("")
+    with Fasta(genome_fasta) as genome:
+        sequences = [s.upper() for s in genome.fetch(peak_regions, one_based=coordinate_system == "1-based")]
 
     lengths = np.array([len(s) for s in sequences], dtype=np.int32)
     gc_content = np.zeros(n_peaks, dtype=np.float32)
@@ -208,15 +197,11 @@ def compute_peak_bias(
     # CpG density: sequential (requires per-sequence string scan)
     if add_cpg_density:
         cpg_density = np.zeros(n_peaks, dtype=np.float32)
-        with _open_fasta(genome_fasta) as genome:
-            for i, region in enumerate(tqdm(peak_regions, desc="Computing CpG density")):
-                try:
-                    chrom, coords = region.split(":")
-                    start, end = int(coords.split("-")[0]), int(coords.split("-")[1])
-                    seq = str(genome[chrom][start:end].seq).upper()
-                    cpg_density[i] = seq.count("CG") / len(seq) if len(seq) > 0 else 0.0
-                except Exception as e:
-                    logger.warning(f"Failed to process {region}: {e}")
+        with Fasta(genome_fasta) as genome:
+            sequences = genome.fetch(peak_regions)
+        for i, seq in enumerate(tqdm(sequences, desc="Computing CpG density")):
+            seq = seq.upper()
+            cpg_density[i] = seq.count("CG") / len(seq) if len(seq) > 0 else 0.0
         adata.var["cpg_density"] = cpg_density
         logger.info("Added 'cpg_density' to adata.var")
 
@@ -585,30 +570,10 @@ def scan(
     
     # Fetch all sequences first (on CPU)
     logger.info("Fetching sequences from genome...")
-    with _open_fasta(genome_fasta) as genome:
-        sequences = []
-        for region in tqdm(peak_regions, desc="Fetching sequences"):
-            try:
-                chrom, coords = region.split(":")
-                start, end = coords.split("-")
-                start, end = int(start), int(end)
-                
-                # Handle coordinate system conversion
-                if coordinate_system == "0-based":
-                    # BED format: 0-based, half-open [start, end)
-                    # pyfaidx uses 0-based indexing, so use directly
-                    seq = str(genome[chrom][start:end].seq)
-                elif coordinate_system == "1-based":
-                    # R/GenomicRanges: 1-based, closed [start, end]
-                    # Convert to 0-based for pyfaidx
-                    seq = str(genome[chrom][start-1:end].seq)
-                else:
-                    raise ValueError(f"Unknown coordinate_system: {coordinate_system}")
-                
-                sequences.append(seq)
-            except Exception as e:
-                logger.warning(f"Failed to fetch sequence for {region}: {e}")
-                sequences.append("")
+    if coordinate_system not in ("0-based", "1-based"):
+        raise ValueError(f"Unknown coordinate_system: {coordinate_system}")
+    with Fasta(genome_fasta) as genome:
+        sequences = genome.fetch(peak_regions, one_based=coordinate_system == "1-based")
     
     # Resolve background probabilities
     if isinstance(bg, str):

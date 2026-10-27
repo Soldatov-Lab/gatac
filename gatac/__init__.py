@@ -9,11 +9,16 @@ Public API:
     - motif: Motif enrichment and chromVAR
     - tobias: TOBIAS footprinting and differential TF binding
     - pl: Plotting
+    - gpu: GPU helpers for code built on GATAC
+
+Installed extensions (packages with a ``gatac.ext`` entry point) are reached
+as ``gatac.<name>``, imported on first use; see :func:`extensions`.
 """
 
 import logging
 import os
 import sys
+from importlib.metadata import EntryPoint, entry_points
 
 # Disable tqdm progress bars when not running in an interactive terminal
 # (e.g. when called from Snakemake), to keep logs clean.
@@ -32,9 +37,50 @@ from . import peak
 from . import motif
 from . import tobias
 from . import pl
+from . import gpu
 
 __version__ = "0.1.0"
-__all__ = ["io", "pp", "dr", "peak", "motif", "tobias", "pl", "set_verbosity"]
+__all__ = ["io", "pp", "dr", "peak", "motif", "tobias", "pl", "gpu", "extensions", "set_verbosity"]
+
+
+# ---------------------------------------------------------------------------
+# Extensions
+# ---------------------------------------------------------------------------
+# A package extends GATAC by declaring an entry point in the "gatac.ext"
+# group, e.g. in its pyproject.toml:
+#
+#     [project.entry-points."gatac.ext"]
+#     chromafold = "gatac_chromafold"
+#
+# and ``gatac.chromafold`` then imports gatac_chromafold on first access.
+# Core names always win: an extension cannot replace gatac.io, gatac.pp, ...
+
+
+def extensions() -> dict[str, EntryPoint]:
+    """
+    Installed GATAC extensions, by the name they are reached at (``gatac.<name>``).
+
+    Examples
+    --------
+    >>> import gatac as ga
+    >>> ga.extensions()
+    {'chromafold': EntryPoint(name='chromafold', value='gatac_chromafold', group='gatac.ext')}
+    """
+    return {ep.name: ep for ep in entry_points(group="gatac.ext")}
+
+
+def __getattr__(name: str):
+    ep = extensions().get(name) if not name.startswith("_") else None
+    if ep is None:
+        raise AttributeError(f"module 'gatac' has no attribute {name!r}")
+    module = ep.load()
+    globals()[name] = module
+    return module
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(extensions()))
+
 
 # ---------------------------------------------------------------------------
 # Package-level logging

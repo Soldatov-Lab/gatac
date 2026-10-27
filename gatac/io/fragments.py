@@ -45,7 +45,7 @@ import pyarrow.compute as pc
 import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 
 logger = logging.getLogger(__name__)
 

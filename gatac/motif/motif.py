@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, Optional, Union
 
@@ -22,6 +20,7 @@ import numpy as np
 import pandas as pd
 from numba import njit
 
+from ..io.fasta import Fasta
 from ._bias_matching import sample_bias_matched_indices
 
 logger = logging.getLogger(__name__)
@@ -29,82 +28,6 @@ logger = logging.getLogger(__name__)
 # CuPy memory pools for efficient memory management
 mempool = cp.get_default_memory_pool()
 pinned_mempool = cp.get_default_pinned_memory_pool()
-
-
-# =============================================================================
-# FASTA Handling with gzip support
-# =============================================================================
-
-
-@contextmanager
-def _open_fasta(fasta_path: Union[str, Path]):
-    """
-    Open a FASTA file, handling gzip compression if needed.
-    
-    pyfaidx doesn't support regular gzip, only BGZF. This helper
-    decompresses gzip files using rapidgzip to a temporary file.
-    
-    Parameters
-    ----------
-    fasta_path : str or Path
-        Path to FASTA file (supports .fa, .fasta, .fa.gz, .fasta.gz)
-        
-    Yields
-    ------
-    pyfaidx.Fasta
-        Opened FASTA object
-    """
-    from pyfaidx import Fasta
-    
-    fasta_path = Path(fasta_path)
-    
-    if str(fasta_path).endswith('.gz'):
-        # Decompress gzip file to temporary location
-        import shutil
-        try:
-            import rapidgzip
-            _use_rapidgzip = True
-        except ImportError:
-            import gzip
-            _use_rapidgzip = False
-        
-        logger.info(f"Decompressing {fasta_path.name}...")
-        
-        # Create temp file with same base name for pyfaidx indexing
-        temp_dir = tempfile.mkdtemp(prefix="gatac_fasta_")
-        temp_fasta = Path(temp_dir) / fasta_path.name.replace('.gz', '')
-        
-        try:
-            if _use_rapidgzip:
-                # Parallel decompression with rapidgzip
-                with rapidgzip.open(str(fasta_path)) as f_in:
-                    with open(temp_fasta, 'wb') as f_out:
-                        while True:
-                            chunk = f_in.read(64 * 1024 * 1024)
-                            if not chunk:
-                                break
-                            f_out.write(chunk)
-            else:
-                with gzip.open(str(fasta_path), 'rb') as f_in:
-                    with open(temp_fasta, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-            
-            logger.info(f"Decompressed to {temp_fasta}")
-            
-            # Open with pyfaidx (will create .fai index)
-            genome = Fasta(str(temp_fasta), one_based_attributes=False)
-            yield genome
-            
-        finally:
-            # Cleanup temp files
-            try:
-                shutil.rmtree(temp_dir)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup temp dir {temp_dir}: {e}")
-    else:
-        # Uncompressed FASTA - open directly
-        genome = Fasta(str(fasta_path), one_based_attributes=False)
-        yield genome
 
 
 def _ordered_unique_regions(region_groups: list[list[str]]) -> list[str]:
@@ -127,21 +50,8 @@ def _fetch_region_sequences(
 ) -> list[str]:
     """Fetch region sequences from a FASTA file."""
     logger.info(f"Fetching {len(regions)} sequences...")
-
-    sequences = []
-    with _open_fasta(genome_fasta) as genome:
-        for region in regions:
-            try:
-                chrom, coords = region.split(":")
-                start, end = coords.split("-")
-                start, end = int(start), int(end)
-                seq = str(genome[chrom][start:end].seq)
-                sequences.append(seq)
-            except Exception as e:
-                logger.warning(f"Failed to fetch sequence for {region}: {e}")
-                sequences.append("")
-
-    return sequences
+    with Fasta(genome_fasta) as genome:
+        return genome.fetch(regions)
 
 
 def _compute_gc_content_from_sequences(sequences: list[str]) -> np.ndarray:

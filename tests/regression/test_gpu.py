@@ -1,4 +1,4 @@
-"""bincount workaround for the CuPy 14 CUB histogram crash, and the chunked host -> device copy."""
+"""gatac.gpu: bincount workaround for the CuPy 14 CUB histogram crash, and the chunked host -> device copy."""
 import ast
 from pathlib import Path
 
@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 import gatac
-import gatac._cupy_compat as compat
-from gatac._cupy_compat import bincount, to_device
+import gatac.gpu
+from gatac.gpu import bincount, to_device
 
 
 def test_no_unweighted_cupy_bincount():
@@ -21,7 +21,7 @@ def test_no_unweighted_cupy_bincount():
                     and node.func.value.id in ("cp", "cupy", "xp")
                     and not any(k.arg == "weights" for k in node.keywords)):
                 found.append(f"{path.name}:{node.lineno}")
-    assert not found, f"use gatac._cupy_compat.bincount: {found}"
+    assert not found, f"use gatac.gpu.bincount: {found}"
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.int64])
@@ -47,7 +47,7 @@ def test_bincount_edge_cases():
 @pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int16, np.int64, np.bool_])
 def test_to_device_matches_asarray(dtype, monkeypatch):
     # a small chunk size exercises the chunked path, including a partial last chunk
-    monkeypatch.setattr(compat, "_H2D_CHUNK", 1000)
+    monkeypatch.setattr(gatac.gpu, "_H2D_CHUNK", 1000)
     rng = np.random.default_rng(1)
     for shape in [(0,), (7,), (12_345,), (301, 7)]:
         h = (rng.random(shape) * 1000).astype(dtype)
@@ -57,7 +57,7 @@ def test_to_device_matches_asarray(dtype, monkeypatch):
 
 
 def test_to_device_views_casts_and_device_input(monkeypatch):
-    monkeypatch.setattr(compat, "_H2D_CHUNK", 1000)
+    monkeypatch.setattr(gatac.gpu, "_H2D_CHUNK", 1000)
     h = np.arange(20_000, dtype=np.int32).reshape(200, 100)
     assert np.array_equal(to_device(h[:, ::3]).get(), h[:, ::3])        # non-contiguous view
     d = to_device(h, cp.int64)

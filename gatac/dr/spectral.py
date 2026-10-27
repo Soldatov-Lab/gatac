@@ -43,7 +43,7 @@ import numpy as np
 import scipy.sparse as sp
 from anndata import AnnData
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 from ._gpu import (
     _launch_1d,
     _row_norms_sq_kernel,

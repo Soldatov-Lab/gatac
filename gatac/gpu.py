@@ -1,5 +1,6 @@
 """
-Workarounds for CuPy and CUDA driver behaviours that GATAC hits at genome scale.
+GPU helpers for code built on GATAC: workarounds for CuPy and CUDA driver
+behaviours that GATAC hits at genome scale.
 
 ``cupy.bincount`` without weights dispatches to CUB's histogram when the CUB
 accelerator is enabled (the default). In CuPy 14.0.1 that path raises

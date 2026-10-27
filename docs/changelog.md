@@ -4,6 +4,17 @@
 
 ### Added
 
+- Extensions: packages that declare a `gatac.ext` entry point are reached as
+  `gatac.<name>` (imported on first use, listed by `gatac.extensions()`), and
+  a `gatac.cli` entry point adds their commands to `gatac`. The new
+  Extensions page lists the public API to build on and the AnnData keys GATAC
+  reads and writes.
+- `io.Fasta`, the genome reader of every function that reads sequence
+  (motif enrichment and scanning, chromVAR, TOBIAS), replaces the per-region
+  pyfaidx loops: same sequences, about 1.7x faster on 119k peaks, and
+  gzipped FASTA files now work for `tobias.footprint` / `bindetect_sites`
+  too. `io.read_bed`, `io.read_gtf` and `io.read_metrics` are public, and the
+  CuPy workarounds (`bincount`, `to_device`) are public as `gatac.gpu`.
 - TOBIAS footprinting on the GPU in `gatac.tobias`: `footprint` (Tn5 bias
   correction and footprint scores per pseudobulk, from the fragments parquet),
   `bindetect` and `bindetect_sites` (differential TF binding), and the

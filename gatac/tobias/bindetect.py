@@ -45,8 +45,9 @@ import numba
 import numpy as np
 import pandas as pd
 
-from .._cupy_compat import to_device
-from .footprint import FootprintTracks, _fai, _region_bytes
+from ..gpu import to_device
+from ..io.fasta import Fasta
+from .footprint import FootprintTracks
 
 logger = logging.getLogger(__name__)
 
@@ -833,8 +834,8 @@ def bindetect_sites(
         if not isinstance(peaks, FootprintTracks):
             raise ValueError("genome_fasta is required unless peaks are FootprintTracks")
         genome_fasta = peaks.params["genome_fasta"]
-    fasta = Path(genome_fasta)
-    fai = _fai(fasta)
+    fa = Fasta(genome_fasta)
+    fai = fa.index
     pk = _merged_peaks(peaks, fai, tobias_compat)
 
     # ---- merged peaks in loc_sort order; concatenated layout with one N after each peak ----
@@ -856,7 +857,7 @@ def bindetect_sites(
             raise ValueError(f"peaks beyond the end of {c}")
         lens = reg_len[sel]
         within = np.arange(lens.sum()) - np.repeat(np.cumsum(lens) - lens, lens)
-        raw[np.repeat(rstart[sel], lens) + within] = _region_bytes(fasta, fai, c, reg_s[sel], reg_e[sel])
+        raw[np.repeat(rstart[sel], lens) + within] = fa.region_bytes(c, reg_s[sel], reg_e[sel])
     lut = np.full(256, 4, np.uint8)
     for ch, v in zip(b"ACGTacgt", [0, 1, 2, 3, 0, 1, 2, 3]):
         lut[ch] = v
@@ -872,6 +873,7 @@ def bindetect_sites(
         gcs.append(float(cs[rstart[i1 - 1] + reg_len[i1 - 1]] - cs[rstart[i0]]) / float(reg_len[i0:i1].sum()))
     gc = np.mean(gcs)
     del raw, w, cs
+    fa.close()
     T["layout"] = time.perf_counter() - t0
 
     # ---- motifs ----

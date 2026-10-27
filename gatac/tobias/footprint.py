@@ -41,8 +41,9 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 from .._readers import read_bed
+from ..io.fasta import Fasta
 from ..io.fragments import FragmentFile
 
 if TYPE_CHECKING:
@@ -67,48 +68,6 @@ _LUT = np.full(256, 4, dtype=np.uint8)
 for _ch, _v in zip(b"ATCGatcg", [0, 1, 2, 3, 0, 1, 2, 3]):
     _LUT[_ch] = _v
 _COMP = np.array([1, 0, 3, 2, 4], dtype=np.uint8)
-
-
-# =============================================================================
-# Genome access
-# =============================================================================
-
-
-def _fai(fasta: Union[str, Path]) -> dict[str, tuple[int, int, int, int]]:
-    """``{chrom: (length, byte offset, bases per line, bytes per line)}``; builds the .fai if missing."""
-    fasta = Path(fasta)
-    if str(fasta).endswith(".gz"):
-        raise ValueError("footprinting needs an uncompressed, indexable FASTA")
-    fai = Path(str(fasta) + ".fai")
-    if not fai.exists():
-        from pyfaidx import Fasta
-
-        Fasta(str(fasta))
-    out = {}
-    for line in open(fai):
-        f = line.split("\t")
-        out[f[0]] = (int(f[1]), int(f[2]), int(f[3]), int(f[4]))
-    return out
-
-
-def _chrom_bytes(fasta: Union[str, Path], fai: dict, chrom: str) -> np.ndarray:
-    """Raw sequence bytes of one chromosome (newlines removed)."""
-    length, off, lb, lw = fai[chrom]
-    n_bytes = (length // lb) * lw + length % lb
-    blk = np.asarray(np.memmap(fasta, dtype=np.uint8, mode="r", offset=off, shape=(n_bytes,)))
-    if lw == lb:
-        return blk.copy()
-    return blk[(blk != 10) & (blk != 13)][:length]
-
-
-def _region_bytes(fasta, fai: dict, chrom: str, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
-    """Concatenated raw bytes of ``[start, end)`` intervals on one chromosome."""
-    _, off, lb, lw = fai[chrom]
-    lens = ends - starts
-    within = np.arange(lens.sum()) - np.repeat(np.cumsum(lens) - lens, lens)
-    gpos = np.repeat(starts, lens) + within
-    mm = np.memmap(fasta, dtype=np.uint8, mode="r")
-    return np.asarray(mm[off + (gpos // lb) * lw + gpos % lb])
 
 
 # =============================================================================
@@ -807,7 +766,8 @@ def footprint(
         GATAC fragments parquet (``chrom``, ``start``, ``end``, ``barcode``);
         barcodes must match ``adata.obs_names``.
     genome_fasta : str or Path
-        Uncompressed genome FASTA (indexed, or writable to build the ``.fai``).
+        Genome FASTA, read with :class:`gatac.io.Fasta` (gzipped files are decompressed
+        to a temporary copy; the ``.fai`` is built next to the file if missing).
     groups : sequence of str, optional
         Groups to process (default: all, in category order).
     peaks : None, BED path, DataFrame or sequence of ``chrom:start-end``
@@ -869,8 +829,8 @@ def footprint(
             raise ValueError(f"group {g!r} has no cells")
         barcode_groups.update(dict.fromkeys(bcs.astype(str), gi))
 
-    fasta = Path(genome_fasta)
-    fai = _fai(fasta)
+    fa = Fasta(genome_fasta)
+    fai = fa.index
     pk = _peaks_from_input(peaks, adata)
     pk = pk[pk["chrom"].isin(fai)]
     if chromosomes is not None:
@@ -897,7 +857,7 @@ def footprint(
     reads_peaks = np.zeros(n_g, np.int64)
     reads_nonpeaks = np.zeros(n_g, np.int64)
     for c in tqdm(chroms, desc="Bias model", disable=not verbose):
-        seq_d = cp.asarray(_LUT[_chrom_bytes(fasta, fai, c)])
+        seq_d = cp.asarray(_LUT[fa.chrom(c)])
         for g in range(n_g):
             for strand in cuts[g][c]:
                 reads_peaks[g] += _count_in(strand, regions[c]["peaks"])
@@ -924,7 +884,7 @@ def footprint(
     fit_stats = np.zeros((n_g, 4), np.int64)
     want = tuple(set(keep_tracks) | {"corrected"})
     for c in tqdm(chroms, desc="Correct + footprint", disable=not verbose):
-        seq_d = cp.asarray(_LUT[_chrom_bytes(fasta, fai, c)])
+        seq_d = cp.asarray(_LUT[fa.chrom(c)])
         out_reg = regions[c]["output"]
         sl_c, sl_f = corr_lay.chrom_slice(c), fp_lay.chrom_slice(c)
         gpos = cp.asarray(corr_lay.positions(c))
@@ -944,6 +904,7 @@ def footprint(
             del dense
         del seq_d, gpos
         cp.get_default_memory_pool().free_all_blocks()
+    fa.close()
     T["correct_footprint"] = time.perf_counter() - t0
     logger.info("footprint timings: " + ", ".join(f"{k} {v:.1f}s" for k, v in T.items()))
 
@@ -963,5 +924,5 @@ def footprint(
         stats=stats,
         bias_models={g: models[i] for i, g in enumerate(groups)},
         params=dict(groupby=groupby, read_length=rl, tobias_compat=tobias_compat,
-                    deduplicate=deduplicate, genome_fasta=str(fasta), timings=T),
+                    deduplicate=deduplicate, genome_fasta=str(genome_fasta), timings=T),
     )

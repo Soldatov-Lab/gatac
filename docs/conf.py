@@ -98,7 +98,6 @@ autodoc_mock_imports = [
     "cuml",
     "cupyx",
     "rmm",
-    "pyfaidx",
     "MOODS",
 ]
 

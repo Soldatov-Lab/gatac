@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 from ..io.fragments import FragmentFile
 
 if TYPE_CHECKING:

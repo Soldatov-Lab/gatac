@@ -3,7 +3,9 @@
 The `gatac.io` namespace converts raw fragment TSV.GZ files to GATAC's Parquet
 fragment format, reads them back, and converts them back to TSV. Every GATAC function that reads fragments
 goes through `FragmentFile`; the format itself is described
-[below](#parquet-fragment-format).
+[below](#parquet-fragment-format). Every function that reads genome sequence
+goes through `Fasta`, and the BED, GTF and cell metrics readers are the ones
+behind every GATAC argument taking such a file.
 
 ```{eval-rst}
 .. currentmodule:: gatac.io
@@ -19,6 +21,10 @@ goes through `FragmentFile`; the format itself is described
    to_tsv
    FragmentFile
    read_fragments_parquet
+   Fasta
+   read_bed
+   read_gtf
+   read_metrics
 ```
 
 ---

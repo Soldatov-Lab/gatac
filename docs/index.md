@@ -8,6 +8,7 @@ overview
 tutorials/index
 changelog
 contributing
+extensions
 ```
 
 ```{toctree}

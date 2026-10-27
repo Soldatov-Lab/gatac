@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 from ..io.fragments import FragmentFile
 from ._combine import _check_distinct_cells, _combined_obs, _file_names
 from ._utils import async_memory_pool, cleanup_gpu_memory

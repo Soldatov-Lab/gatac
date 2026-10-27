@@ -17,6 +17,7 @@ Usage:
 import argparse
 import logging
 import sys
+from importlib.metadata import entry_points
 from pathlib import Path
 
 
@@ -891,6 +892,15 @@ def main():
         help='Ignored; kept for backwards compatibility (overlap detection runs on the GPU)'
     )
     doublets_parser.set_defaults(func=doublets_command)
+
+    # Subcommands of installed extensions: entry points in the "gatac.cli" group
+    # name a function that adds its parsers to ``subparsers`` (see Extensions in the docs)
+    for ep in entry_points(group="gatac.cli"):
+        try:
+            ep.load()(subparsers)
+        except Exception as e:
+            print(f"WARNING: gatac extension {ep.name!r} ({ep.value}) could not add its "
+                  f"commands: {e}", file=sys.stderr)
 
     args = parser.parse_args()
     setup_logging(args.verbose)

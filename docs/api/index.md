@@ -15,6 +15,7 @@ peak
 motif
 tobias
 plotting
+gpu
 ```
 
 ::::{grid} 1 1 3 3
@@ -75,6 +76,14 @@ TOBIAS on the GPU: bias-corrected footprints and differential TF binding.
 :shadow: none
 
 Fragment size distribution, QC metrics, and motif enrichment plots.
+:::
+
+:::{grid-item-card} {fas}`microchip` GPU helpers — `gatac.gpu`
+:link: gpu
+:link-type: doc
+:shadow: none
+
+Genome-scale CuPy workarounds, for code built on GATAC.
 :::
 
 ::::

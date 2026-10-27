@@ -12,7 +12,7 @@ import cupyx.scipy.sparse as cusp
 import numpy as np
 import scipy.sparse as sp
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 
 logger = logging.getLogger(__name__)
 

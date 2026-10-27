@@ -36,7 +36,7 @@ import pandas as pd
 import scipy.stats as stats
 import statsmodels.api as sm
 
-from .._cupy_compat import bincount
+from ..gpu import bincount
 from .._readers import read_bed
 from ._utils import cleanup_gpu_memory
 from ..io.fragments import FragmentFile

@@ -13,7 +13,10 @@
   (motif enrichment and scanning, chromVAR, TOBIAS), replaces the per-region
   pyfaidx loops: same sequences, about 1.7x faster on 119k peaks, and
   gzipped FASTA files now work for `tobias.footprint` / `bindetect_sites`
-  too. `io.read_bed`, `io.read_gtf` and `io.read_metrics` are public, and the
+  too. A gzipped FASTA is decompressed once per process instead of on every
+  call (`chromvar` decompressed and indexed hg19 twice, `enrichment_regression`
+  once per batch, ~30 s each), and a missing `.fai` is built with NumPy
+  (GRCh38 in 4 s instead of 18 s), so pyfaidx is no longer a dependency. `io.read_bed`, `io.read_gtf` and `io.read_metrics` are public, and the
   CuPy workarounds (`bincount`, `to_device`) are public as `gatac.gpu`.
 - TOBIAS footprinting on the GPU in `gatac.tobias`: `footprint` (Tn5 bias
   correction and footprint scores per pseudobulk, from the fragments parquet),
